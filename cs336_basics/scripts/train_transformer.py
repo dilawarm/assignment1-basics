@@ -370,6 +370,11 @@ class Trainer:
             self.device = torch.device(self.config.device)
 
         if self.device.type == "cuda":
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
             if self.config.use_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
@@ -379,9 +384,16 @@ class Trainer:
                 torch.backends.cuda.enable_flash_sdp(True)
                 print("Enabled FlashAttention backend")
 
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            print("Enabled memory-efficient attention")
+
             gpu_name = torch.cuda.get_device_name()
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
             print(f"Using GPU: {gpu_name} ({gpu_memory:.1f} GB)")
+
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"Initial GPU memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
 
     def _setup_model(self) -> None:
         """Setup model with performance optimizations."""
@@ -408,10 +420,20 @@ class Trainer:
 
         if self.config.compile_model and self.device.type == "cuda":
             try:
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                print("Compiling model... This may take a few minutes and use significant memory initially.")
                 self.model = torch.compile(self.model, mode="max-autotune", backend=self.config.torch_compile_backend)
                 print(f"Model compiled with {self.config.torch_compile_backend} backend for optimized execution")
+
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
             except Exception as e:
                 print(f"Model compilation failed: {e}")
+                print("Falling back to non-compiled model...")
+                self.config.compile_model = False
 
     def _setup_optimizer(self) -> None:
         """Setup optimized optimizer based on configuration."""
