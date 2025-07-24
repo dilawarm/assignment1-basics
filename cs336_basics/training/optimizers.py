@@ -161,28 +161,46 @@ class Muon(Optimizer):
             Orthogonalized matrix
         """
         if torch.isnan(X).any() or torch.isinf(X).any():
+            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning identity")
             return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype)
 
         norm = torch.norm(X, p="fro")
         if norm < 1e-8:
             return X
 
-        X = X / (norm + 1e-8)
+        X = X / (norm + 1e-10)
 
-        for _ in range(num_iters):
+        X = torch.clamp(X, min=-5.0, max=5.0)
+
+        for i in range(num_iters):
             X_squared = torch.matmul(X, X.transpose(-2, -1))
+
+            reg_strength = 1e-6
+            X_squared = X_squared + reg_strength * torch.eye(X_squared.shape[-1], device=X.device, dtype=X.dtype)
+
             X_cubed = torch.matmul(X_squared, X)
 
             if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
+                print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
                 break
 
             X_new = (3 * X - X_cubed) / 2
 
-            if torch.norm(X_new - X, p="fro") < 1e-6:
+            X_new = torch.clamp(X_new, min=-10.0, max=10.0)
+
+            if torch.norm(X_new - X, p="fro") < 1e-5:
                 X = X_new
                 break
 
             X = X_new
+
+            if torch.norm(X, p="fro") > 20.0:
+                print(f"WARNING: Newton-Schulz values becoming too large at iteration {i}, applying correction")
+                X = X / torch.norm(X, p="fro") * 2.0
+
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            print("WARNING: NaN/Inf in final Newton-Schulz result, returning scaled identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
 
         return X
 
@@ -358,7 +376,7 @@ class MixedOptimizer(Optimizer):
     @torch.no_grad()
     def step(self, closure=None, param_names=None):
         """
-        Perform a single optimization step with mixed optimizers.
+        Perform a single optimization step with mixed optimizers and enhanced stability.
 
         Args:
             closure: A closure that reevaluates the model and returns the loss
@@ -374,25 +392,37 @@ class MixedOptimizer(Optimizer):
                 if p.grad is None:
                     continue
 
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    print("WARNING: NaN/Inf gradients detected in MixedOptimizer, skipping parameter update")
+                    continue
+
                 param_name = param_names.get(p, "") if param_names else ""
                 category = self.categorize_parameter(param_name, p)
 
                 if category == "embedding":
-                    lr = group["embedding_lr"]
+                    lr = group.get("embedding_lr", group.get("adamw_lr", 1e-3))
                     optimizer_type = "adamw"
                 elif category == "lm_head":
-                    lr = group["lm_head_lr"]
+                    lr = group.get("lm_head_lr", group.get("adamw_lr", 1e-3))
                     optimizer_type = "adamw"
                 elif category == "adamw":
-                    lr = group["adamw_lr"]
+                    lr = group.get("adamw_lr", 1e-3)
                     optimizer_type = "adamw"
                 else:
-                    lr = group["muon_lr"]
+                    lr = group.get("muon_lr", 1e-3)
                     optimizer_type = "muon"
+
+                if lr <= 0 or not torch.isfinite(torch.tensor(lr)):
+                    print(f"WARNING: Invalid learning rate {lr} for parameter {param_name}, using fallback")
+                    lr = 1e-4
 
                 grad = p.grad
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
+
+                grad_norm = torch.norm(grad)
+                if grad_norm > 10.0:
+                    grad = grad * (10.0 / grad_norm)
 
                 state = self.state[p]
 
@@ -404,7 +434,7 @@ class MixedOptimizer(Optimizer):
         return loss
 
     def _apply_muon_step(self, param, grad, state, group, lr):
-        """Apply Muon optimization step."""
+        """Apply Muon optimization step with enhanced numerical stability."""
         if group["weight_decay"] > 0:
             param.mul_(1 - lr * group["weight_decay"])
 
@@ -415,10 +445,17 @@ class MixedOptimizer(Optimizer):
         momentum_buffer = state["momentum_buffer"]
         state["step"] += 1
 
-        momentum_buffer.mul_(group["muon_momentum"]).add_(grad, alpha=1 - group["muon_momentum"])
+        momentum = group.get("muon_momentum", 0.95)
+        momentum_buffer.mul_(momentum).add_(grad, alpha=1 - momentum)
+
+        if torch.isnan(momentum_buffer).any() or torch.isinf(momentum_buffer).any():
+            print("WARNING: NaN/Inf in momentum buffer, resetting")
+            momentum_buffer.zero_()
 
         if len(param.shape) >= 2:
-            muon = Muon([param], lr=lr, momentum=group["muon_momentum"], ns_iters=group["ns_iters"], eps=group["eps"])
+            muon = Muon(
+                [param], lr=lr, momentum=momentum, ns_iters=group.get("ns_iters", 5), eps=group.get("eps", 1e-8)
+            )
 
             muon.state[param] = state
 
@@ -428,17 +465,29 @@ class MixedOptimizer(Optimizer):
             else:
                 momentum_flat = momentum_buffer
 
-            ortho_momentum = muon.newton_schulz_orthogonalize(momentum_flat, group["ns_iters"])
+            try:
+                ortho_momentum = muon.newton_schulz_orthogonalize(momentum_flat, group.get("ns_iters", 5))
+            except Exception as e:
+                print(f"WARNING: Newton-Schulz failed: {e}, using scaled momentum")
+                ortho_momentum = momentum_flat * 0.1
 
             dim_scaling = muon.get_dimension_scaling(original_shape)
             momentum_norm = torch.norm(momentum_flat, p="fro")
 
-            if momentum_norm > group["eps"]:
-                scaling = dim_scaling / (momentum_norm + group["eps"])
+            eps = group.get("eps", 1e-8)
+            if momentum_norm > eps:
+                scaling = dim_scaling / (momentum_norm + eps)
+
+                scaling = torch.clamp(scaling, min=1e-6, max=100.0)
+
                 update = ortho_momentum * scaling
 
                 if len(param.shape) > 2:
                     update = update.reshape(original_shape)
+
+                update_norm = torch.norm(update)
+                if update_norm > 1.0:
+                    update = update * (1.0 / update_norm)
 
                 param.add_(update, alpha=-lr)
         else:

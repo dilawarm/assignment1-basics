@@ -580,7 +580,12 @@ class Trainer:
         current_lr = self.get_lr(self.step)
 
         if self.config.optimizer == "muon_adamw":
-            pass
+            for group in self.optimizer.param_groups:
+                base_lr_ratio = current_lr / self.config.learning_rate
+                group["muon_lr"] = self.config.muon_lr * base_lr_ratio
+                group["adamw_lr"] = self.config.adamw_lr * base_lr_ratio
+                group["embedding_lr"] = self.config.embedding_lr * base_lr_ratio
+                group["lm_head_lr"] = self.config.lm_head_lr * base_lr_ratio
         else:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = current_lr
@@ -596,6 +601,10 @@ class Trainer:
                     loss = cross_entropy(logits, targets)
                     loss = loss / self.config.gradient_accumulation_steps
 
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"ERROR: NaN/Inf loss detected at step {self.step}! Stopping training.")
+                    return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
+
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
                 else:
@@ -604,9 +613,24 @@ class Trainer:
                 logits = self.model(inputs)
                 loss = cross_entropy(logits, targets)
                 loss = loss / self.config.gradient_accumulation_steps
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"ERROR: NaN/Inf loss detected at step {self.step}! Stopping training.")
+                    return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
+
                 loss.backward()
 
             total_loss += loss.item()
+
+        has_nan_grad = False
+        for param in self.original_model.parameters():
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                has_nan_grad = True
+                break
+
+        if has_nan_grad:
+            print(f"ERROR: NaN/Inf gradients detected at step {self.step}! Stopping training.")
+            return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
 
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
@@ -708,6 +732,12 @@ class Trainer:
                 break
 
             metrics = self.train_step()
+
+            if metrics.get("training_stopped", False):
+                print("Training stopped due to NaN/Inf values. Saving emergency checkpoint...")
+                emergency_checkpoint = Path(self.config.checkpoint_dir) / f"emergency_checkpoint_step_{self.step}.pt"
+                self.save_checkpoint(str(emergency_checkpoint))
+                break
 
             step_time = time.time() - step_start_time
             elapsed_hours = elapsed_time / 3600

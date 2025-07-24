@@ -132,8 +132,12 @@ class FFN(nn.Module):
             Output tensor of the same shape as input
         """
         hidden = self.w1(x)
+
         activated = torch.relu(hidden)
+        activated = torch.clamp(activated, max=10.0)
         squared = activated * activated
+        squared = torch.clamp(squared, max=100.0)
+
         output = self.w2(squared)
 
         return output
