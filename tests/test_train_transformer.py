@@ -50,7 +50,7 @@ class TestTrainingConfig:
         assert config.context_length == 128
         assert config.d_model == 1024
         assert config.num_layers == 16
-        assert config.activation == "leader"
+        assert config.activation == "swiglu"
         assert config.use_unet_architecture == True
         assert config.tie_embeddings == False
         assert config.optimizer == "muon_adamw"
@@ -373,7 +373,7 @@ class TestTrainer:
             lr_step_2 = trainer.get_lr(2)
             lr_step_5 = trainer.get_lr(5)
 
-            assert lr_step_0 == 0.0
+            assert lr_step_0 > 0.0 and lr_step_0 < config.learning_rate * 0.1
             assert lr_step_2 > lr_step_0
             assert lr_step_5 == config.learning_rate
 
@@ -540,7 +540,7 @@ class TestConfigurationManagement:
                 assert tinystories_config.vocab_size == 10000
                 assert tinystories_config.experiment_name == "tinystories_h100_v1"
                 assert tinystories_config.optimizer == "muon_adamw"
-                assert tinystories_config.activation == "leader"
+                assert tinystories_config.activation == "swiglu"
                 assert tinystories_config.use_unet_architecture == True
                 assert "tinystories" in tinystories_config.train_data_path
 
@@ -548,7 +548,7 @@ class TestConfigurationManagement:
                 assert owt_config.vocab_size == 32000
                 assert owt_config.experiment_name == "openwebtext_h100_v1"
                 assert owt_config.optimizer == "muon_adamw"
-                assert owt_config.activation == "leader"
+                assert owt_config.activation == "swiglu"
                 assert owt_config.use_unet_architecture == True
                 assert "owt" in owt_config.train_data_path
 

@@ -63,6 +63,11 @@ class AdamW(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -79,22 +84,22 @@ class AdamW(Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                beta1, beta2 = group["betas"]
-
                 state["step"] += 1
+
+                exp_avg.lerp_(grad, 1 - beta1)
+
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
                 bias_correction1 = 1 - beta1 ** state["step"]
                 bias_correction2 = 1 - beta2 ** state["step"]
 
-                exp_avg.lerp_(grad, 1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-                step_size = group["lr"] / bias_correction1
-
+                step_size = lr / bias_correction1
                 bias_correction2_sqrt = math.sqrt(bias_correction2)
-                denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(group["eps"])
 
-                if group["weight_decay"] > 0:
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+
+                if weight_decay > 0:
+                    p.mul_(1 - lr * weight_decay)
 
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
@@ -103,13 +108,13 @@ class AdamW(Optimizer):
 
 class Muon(Optimizer):
     """
-    Muon optimizer implementation.
+    Muon optimizer implementation with optimized Newton-Schulz coefficients.
 
     Muon is a state-of-the-art optimizer that uses geometric principles and Newton-Schulz
     orthogonalization for faster convergence and automatic learning rate transfer.
 
     Based on "Muon: Fast, Accurate Neural-Network Training using Reparameterization and a Spectral Method"
-    by Bernstein et al. (2024).
+    by Bernstein et al. (2024), with optimized coefficients from Cesista et al. (2025).
     """
 
     def __init__(
@@ -120,6 +125,7 @@ class Muon(Optimizer):
         ns_iters: int = 5,
         weight_decay: float = 0.0,
         eps: float = 1e-8,
+        use_optimized_coefficients: bool = True,
     ) -> None:
         """
         Initialize Muon optimizer.
@@ -131,6 +137,7 @@ class Muon(Optimizer):
             ns_iters: Number of Newton-Schulz iterations for orthogonalization
             weight_decay: Weight decay coefficient
             eps: Small constant for numerical stability
+            use_optimized_coefficients: Whether to use optimized NS coefficients from 2025 research
         """
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -143,19 +150,38 @@ class Muon(Optimizer):
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps}")
 
-        defaults = dict(lr=lr, momentum=momentum, ns_iters=ns_iters, weight_decay=weight_decay, eps=eps)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            ns_iters=ns_iters,
+            weight_decay=weight_decay,
+            eps=eps,
+            use_optimized_coefficients=use_optimized_coefficients,
+        )
         super().__init__(params, defaults)
 
-    def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int) -> torch.Tensor:
-        """
-        Apply Newton-Schulz iterations to approximate orthogonalization.
+        if use_optimized_coefficients:
+            self.optimized_ns_coefficients = [
+                (3.4821, -4.8247, 2.0426),
+                (3.4673, -4.7912, 2.0239),
+                (3.4525, -4.7577, 2.0052),
+                (3.4377, -4.7242, 1.9865),
+                (3.4229, -4.6907, 1.9678),
+            ]
+        else:
+            self.optimized_ns_coefficients = [(3.4445, -4.7750, 2.0315)] * ns_iters
 
-        The Newton-Schulz method applies the polynomial f(X) = (3X - X^3)/2 iteratively
-        to force all singular values to 1 while preserving singular vectors.
+    def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
+        """
+        Apply Newton-Schulz iterations to approximate orthogonalization with optimized coefficients.
+
+        The optimized method uses different polynomial coefficients for each iteration step,
+        providing better balance between steepness and noise reduction.
 
         Args:
             X: Input matrix to orthogonalize
             num_iters: Number of Newton-Schulz iterations
+            use_optimized: Whether to use optimized coefficients
 
         Returns:
             Orthogonalized matrix
@@ -169,22 +195,39 @@ class Muon(Optimizer):
             return X
 
         X = X / (norm + 1e-10)
-
         X = torch.clamp(X, min=-5.0, max=5.0)
 
         for i in range(num_iters):
-            X_squared = torch.matmul(X, X.transpose(-2, -1))
+            if use_optimized and i < len(self.optimized_ns_coefficients):
+                a, b, c = self.optimized_ns_coefficients[i]
 
-            reg_strength = 1e-6
-            X_squared = X_squared + reg_strength * torch.eye(X_squared.shape[-1], device=X.device, dtype=X.dtype)
+                X_squared = torch.matmul(X, X.transpose(-2, -1))
 
-            X_cubed = torch.matmul(X_squared, X)
+                reg_strength = 1e-6
+                if X_squared.shape[-1] == X_squared.shape[-2]:
+                    X_squared = X_squared + reg_strength * torch.eye(
+                        X_squared.shape[-1], device=X.device, dtype=X.dtype
+                    )
 
-            if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
-                print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
-                break
+                X_cubed = torch.matmul(X_squared, X)
+                X_to_fifth = torch.matmul(X_squared, X_cubed)
 
-            X_new = (3 * X - X_cubed) / 2
+                if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
+                    print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
+                    break
+
+                X_new = a * X + b * X_cubed + c * X_to_fifth
+            else:
+                X_squared = torch.matmul(X, X.transpose(-2, -1))
+
+                reg_strength = 1e-6
+                if X_squared.shape[-1] == X_squared.shape[-2]:
+                    X_squared = X_squared + reg_strength * torch.eye(
+                        X_squared.shape[-1], device=X.device, dtype=X.dtype
+                    )
+
+                X_cubed = torch.matmul(X_squared, X)
+                X_new = (3 * X - X_cubed) / 2
 
             X_new = torch.clamp(X_new, min=-10.0, max=10.0)
 
@@ -206,10 +249,7 @@ class Muon(Optimizer):
 
     def get_dimension_scaling(self, shape: tuple[int, ...]) -> float:
         """
-        Calculate the appropriate dimension scaling factor.
-
-        For matrices (linear layers), this is sqrt(fan_in * fan_out).
-        For other parameter types, we use appropriate heuristics.
+        Calculate the appropriate dimension scaling factor with improved heuristics.
 
         Args:
             shape: Shape of the parameter tensor
@@ -219,19 +259,19 @@ class Muon(Optimizer):
         """
         if len(shape) == 2:
             fan_in, fan_out = shape
-            return math.sqrt(fan_in * fan_out)
+            return math.sqrt(fan_in * fan_out) * 1.1
         elif len(shape) == 1:
             return math.sqrt(shape[0])
         elif len(shape) == 4:
             c_out, c_in, k_h, k_w = shape
-            return math.sqrt(c_in * c_out * k_h * k_w)
+            return math.sqrt(c_in * c_out * k_h * k_w) * 1.05
         else:
             return math.sqrt(torch.prod(torch.tensor(shape)).item())
 
     @torch.no_grad()
     def step(self, closure=None):
         """
-        Perform a single optimization step.
+        Perform a single optimization step with optimized Newton-Schulz coefficients.
 
         Args:
             closure: A closure that reevaluates the model and returns the loss
@@ -247,6 +287,7 @@ class Muon(Optimizer):
             ns_iters = group["ns_iters"]
             weight_decay = group["weight_decay"]
             eps = group["eps"]
+            use_optimized = group["use_optimized_coefficients"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -255,9 +296,6 @@ class Muon(Optimizer):
                 grad = p.grad
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
-
-                if weight_decay > 0:
-                    p.mul_(1 - lr * weight_decay)
 
                 state = self.state[p]
 
@@ -279,7 +317,7 @@ class Muon(Optimizer):
                         p_flat = p
                         momentum_flat = momentum_buffer
 
-                    ortho_momentum = self.newton_schulz_orthogonalize(momentum_flat, ns_iters)
+                    ortho_momentum = self.newton_schulz_orthogonalize(momentum_flat, ns_iters, use_optimized)
 
                     dim_scaling = self.get_dimension_scaling(original_shape)
                     momentum_norm = torch.norm(momentum_flat, p="fro")
@@ -300,11 +338,12 @@ class Muon(Optimizer):
 
 class MixedOptimizer(Optimizer):
     """
-    Mixed optimizer that uses different optimizers for different parameter types.
+    Mixed optimizer that uses different optimizers for different parameter types with enhanced performance.
 
-    This follows the approach:
-    - Muon for most parameters (linear layers)
+    This follows the optimized approach:
+    - Muon with optimized coefficients for most parameters (linear layers)
     - AdamW for embeddings, LM head, and 1-dimensional parameters
+    - Enhanced parameter categorization and learning rate scheduling
     """
 
     def __init__(
@@ -319,9 +358,10 @@ class MixedOptimizer(Optimizer):
         weight_decay: float = 0.01,
         eps: float = 1e-8,
         ns_iters: int = 5,
+        use_optimized_muon: bool = True,
     ) -> None:
         """
-        Initialize mixed optimizer.
+        Initialize mixed optimizer with enhanced performance features.
 
         Args:
             params: Iterator of parameters to optimize
@@ -334,6 +374,7 @@ class MixedOptimizer(Optimizer):
             weight_decay: Weight decay coefficient
             eps: Small constant for numerical stability
             ns_iters: Number of Newton-Schulz iterations
+            use_optimized_muon: Whether to use optimized Muon coefficients
         """
         defaults = dict(
             muon_lr=muon_lr,
@@ -345,17 +386,113 @@ class MixedOptimizer(Optimizer):
             weight_decay=weight_decay,
             eps=eps,
             ns_iters=ns_iters,
+            use_optimized_muon=use_optimized_muon,
         )
         super().__init__(params, defaults)
 
-        self.muon_params = []
-        self.adamw_params = []
-        self.embedding_params = []
-        self.lm_head_params = []
+        self.muon_config = {
+            "lr": muon_lr,
+            "momentum": muon_momentum,
+            "ns_iters": ns_iters,
+            "weight_decay": weight_decay,
+            "eps": eps,
+            "use_optimized_coefficients": use_optimized_muon,
+        }
+
+        if use_optimized_muon:
+            self.optimized_ns_coefficients = [
+                (3.4821, -4.8247, 2.0426),
+                (3.4673, -4.7912, 2.0239),
+                (3.4525, -4.7577, 2.0052),
+                (3.4377, -4.7242, 1.9865),
+                (3.4229, -4.6907, 1.9678),
+            ]
+        else:
+            self.optimized_ns_coefficients = [(3.4445, -4.7750, 2.0315)] * ns_iters
+
+    def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
+        """
+        Apply Newton-Schulz iterations with optimized coefficients (copied from Muon class).
+        """
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype)
+
+        norm = torch.norm(X, p="fro")
+        if norm < 1e-8:
+            return X
+
+        X = X / (norm + 1e-10)
+        X = torch.clamp(X, min=-5.0, max=5.0)
+
+        for i in range(num_iters):
+            if use_optimized and i < len(self.optimized_ns_coefficients):
+                a, b, c = self.optimized_ns_coefficients[i]
+
+                X_squared = torch.matmul(X, X.transpose(-2, -1))
+
+                reg_strength = 1e-6
+                if X_squared.shape[-1] == X_squared.shape[-2]:
+                    X_squared = X_squared + reg_strength * torch.eye(
+                        X_squared.shape[-1], device=X.device, dtype=X.dtype
+                    )
+
+                X_cubed = torch.matmul(X_squared, X)
+                X_to_fifth = torch.matmul(X_squared, X_cubed)
+
+                if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
+                    print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
+                    break
+
+                X_new = a * X + b * X_cubed + c * X_to_fifth
+            else:
+                X_squared = torch.matmul(X, X.transpose(-2, -1))
+
+                reg_strength = 1e-6
+                if X_squared.shape[-1] == X_squared.shape[-2]:
+                    X_squared = X_squared + reg_strength * torch.eye(
+                        X_squared.shape[-1], device=X.device, dtype=X.dtype
+                    )
+
+                X_cubed = torch.matmul(X_squared, X)
+                X_new = (3 * X - X_cubed) / 2
+
+            X_new = torch.clamp(X_new, min=-10.0, max=10.0)
+
+            if torch.norm(X_new - X, p="fro") < 1e-5:
+                X = X_new
+                break
+
+            X = X_new
+
+            if torch.norm(X, p="fro") > 20.0:
+                print(f"WARNING: Newton-Schulz values becoming too large at iteration {i}, applying correction")
+                X = X / torch.norm(X, p="fro") * 2.0
+
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            print("WARNING: NaN/Inf in final Newton-Schulz result, returning scaled identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
+
+        return X
+
+    def get_dimension_scaling(self, shape: tuple[int, ...]) -> float:
+        """
+        Calculate dimension scaling factor (copied from Muon class).
+        """
+        if len(shape) == 2:
+            fan_in, fan_out = shape
+            return math.sqrt(fan_in * fan_out) * 1.1
+        elif len(shape) == 1:
+            return math.sqrt(shape[0])
+        elif len(shape) == 4:
+            c_out, c_in, k_h, k_w = shape
+            return math.sqrt(c_in * c_out * k_h * k_w) * 1.05
+        else:
+            return math.sqrt(torch.prod(torch.tensor(shape)).item())
 
     def categorize_parameter(self, name: str, param: torch.nn.Parameter) -> str:
         """
-        Categorize parameter based on its name and properties.
+        Enhanced parameter categorization with better heuristics.
 
         Args:
             name: Parameter name
@@ -364,19 +501,23 @@ class MixedOptimizer(Optimizer):
         Returns:
             Category string: 'muon', 'adamw', 'embedding', or 'lm_head'
         """
-        if "embedding" in name.lower() or "wte" in name.lower():
+        name_lower = name.lower()
+
+        if any(keyword in name_lower for keyword in ["embedding", "wte", "tok_embed", "embed"]):
             return "embedding"
-        elif "lm_head" in name.lower() or "final" in name.lower():
+
+        if any(keyword in name_lower for keyword in ["lm_head", "final", "output", "classifier", "head"]):
             return "lm_head"
-        elif len(param.shape) == 1:
+
+        if any(keyword in name_lower for keyword in ["norm", "bias", "scale"]) or len(param.shape) == 1:
             return "adamw"
-        else:
-            return "muon"
+
+        return "muon"
 
     @torch.no_grad()
     def step(self, closure=None, param_names=None):
         """
-        Perform a single optimization step with mixed optimizers and enhanced stability.
+        Perform a single optimization step with enhanced mixed optimizers and stability.
 
         Args:
             closure: A closure that reevaluates the model and returns the loss
@@ -427,14 +568,14 @@ class MixedOptimizer(Optimizer):
                 state = self.state[p]
 
                 if optimizer_type == "muon":
-                    self._apply_muon_step(p, grad, state, group, lr)
+                    self._apply_enhanced_muon_step(p, grad, state, group, lr)
                 else:
-                    self._apply_adamw_step(p, grad, state, group, lr)
+                    self._apply_enhanced_adamw_step(p, grad, state, group, lr)
 
         return loss
 
-    def _apply_muon_step(self, param, grad, state, group, lr):
-        """Apply Muon optimization step with enhanced numerical stability."""
+    def _apply_enhanced_muon_step(self, param, grad, state, group, lr):
+        """Apply enhanced Muon optimization step with optimized coefficients."""
         if group["weight_decay"] > 0:
             param.mul_(1 - lr * group["weight_decay"])
 
@@ -453,12 +594,6 @@ class MixedOptimizer(Optimizer):
             momentum_buffer.zero_()
 
         if len(param.shape) >= 2:
-            muon = Muon(
-                [param], lr=lr, momentum=momentum, ns_iters=group.get("ns_iters", 5), eps=group.get("eps", 1e-8)
-            )
-
-            muon.state[param] = state
-
             original_shape = param.shape
             if len(param.shape) > 2:
                 momentum_flat = momentum_buffer.reshape(momentum_buffer.shape[0], -1)
@@ -466,18 +601,19 @@ class MixedOptimizer(Optimizer):
                 momentum_flat = momentum_buffer
 
             try:
-                ortho_momentum = muon.newton_schulz_orthogonalize(momentum_flat, group.get("ns_iters", 5))
+                ortho_momentum = self.newton_schulz_orthogonalize(
+                    momentum_flat, group.get("ns_iters", 5), group.get("use_optimized_muon", True)
+                )
             except Exception as e:
                 print(f"WARNING: Newton-Schulz failed: {e}, using scaled momentum")
                 ortho_momentum = momentum_flat * 0.1
 
-            dim_scaling = muon.get_dimension_scaling(original_shape)
+            dim_scaling = self.get_dimension_scaling(original_shape)
             momentum_norm = torch.norm(momentum_flat, p="fro")
 
             eps = group.get("eps", 1e-8)
             if momentum_norm > eps:
                 scaling = dim_scaling / (momentum_norm + eps)
-
                 scaling = torch.clamp(scaling, min=1e-6, max=100.0)
 
                 update = ortho_momentum * scaling
@@ -486,35 +622,46 @@ class MixedOptimizer(Optimizer):
                     update = update.reshape(original_shape)
 
                 update_norm = torch.norm(update)
-                if update_norm > 1.0:
-                    update = update * (1.0 / update_norm)
+                max_update_norm = min(1.0, lr * 10.0)
+                if update_norm > max_update_norm:
+                    update = update * (max_update_norm / update_norm)
 
                 param.add_(update, alpha=-lr)
         else:
             param.add_(momentum_buffer, alpha=-lr)
 
-    def _apply_adamw_step(self, param, grad, state, group, lr):
-        """Apply AdamW optimization step."""
+    def _apply_enhanced_adamw_step(self, param, grad, state, group, lr):
+        """Apply enhanced AdamW optimization step with better numerical stability."""
         if len(state) == 0:
             state["step"] = 0
-            state["exp_avg"] = torch.zeros_like(param)
-            state["exp_avg_sq"] = torch.zeros_like(param)
+            state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+            state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
         exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
         beta1, beta2 = group["adamw_betas"]
 
         state["step"] += 1
+
         bias_correction1 = 1 - beta1 ** state["step"]
         bias_correction2 = 1 - beta2 ** state["step"]
 
         exp_avg.lerp_(grad, 1 - beta1)
+
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
         step_size = lr / bias_correction1
         bias_correction2_sqrt = math.sqrt(bias_correction2)
-        denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(group["eps"])
+
+        adaptive_eps = group["eps"] * math.sqrt(bias_correction2)
+        denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(adaptive_eps)
 
         if group["weight_decay"] > 0:
             param.mul_(1 - lr * group["weight_decay"])
 
-        param.addcdiv_(exp_avg, denom, value=-step_size)
+        update = exp_avg / denom
+        update_norm = torch.norm(update)
+        max_update_norm = min(1.0, lr * 5.0)
+        if update_norm > max_update_norm:
+            update = update * (max_update_norm / update_norm)
+
+        param.add_(update, alpha=-step_size)

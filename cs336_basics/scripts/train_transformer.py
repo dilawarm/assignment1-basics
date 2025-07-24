@@ -42,7 +42,7 @@ from cs336_basics.loss.cross_entropy import cross_entropy
 from cs336_basics.nn.models import EnhancedTransformerLM
 from cs336_basics.training.checkpoint import load_checkpoint, save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
-from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
+from cs336_basics.training.lr_schedules import aggressive_cosine_schedule
 from cs336_basics.training.optimizers import AdamW, MixedOptimizer, Muon
 
 
@@ -141,7 +141,7 @@ class AdvancedMemoryManager:
 @dataclass
 class TrainingConfig:
     """
-    Advanced configuration for optimized H100 training.
+    Advanced configuration for optimized H100 training with aggressive settings.
     """
 
     # Data parameters
@@ -160,66 +160,66 @@ class TrainingConfig:
 
     # Architecture features
     tie_embeddings: bool = False
-    activation: str = "leader"
+    activation: str = "swiglu"
     use_unet_architecture: bool = True
 
     # Training parameters
-    max_steps: int = 25000
+    max_steps: int = 50000
     max_wallclock_hours: float = 1.5
     batch_size: int = 256
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 2
 
-    # Optimizer settings
+    # Optimizer settings (aggressive values for fast convergence)
     optimizer: str = "muon_adamw"
-    learning_rate: float = 3e-3
-    muon_lr: float = 3e-3
-    adamw_lr: float = 3e-3
-    embedding_lr: float = 4e-3
-    lm_head_lr: float = 2e-3
-    min_learning_rate: float = 3e-5
-    warmup_steps: int = 500
-    weight_decay: float = 0.01
+    learning_rate: float = 8e-3
+    muon_lr: float = 8e-3
+    adamw_lr: float = 6e-3
+    embedding_lr: float = 12e-3
+    lm_head_lr: float = 4e-3
+    min_learning_rate: float = 8e-5
+    warmup_steps: int = 200
+    weight_decay: float = 0.015
 
-    # Muon-specific parameters
-    momentum: float = 0.95
+    # Muon-specific parameters (optimized)
+    momentum: float = 0.97
     ns_iters: int = 5
 
     # AdamW-specific parameters
     beta1: float = 0.9
     beta2: float = 0.95
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 1.5
 
     # Optimization settings
     use_amp: bool = True
     use_bfloat16: bool = True
     use_gradient_checkpointing: bool = True
-    gradient_checkpointing_layers: int = 8
+    gradient_checkpointing_layers: int = 12
     use_tf32: bool = True
     compile_model: bool = True
     torch_compile_backend: str = "inductor"
-    torch_empty_cache_steps: int = 0  # 0 = disabled
+    torch_empty_cache_steps: int = 0
     channels_last: bool = False
 
     # Data loading optimizations
-    num_workers: int = 4
+    num_workers: int = 12
     pin_memory: bool = True
-    prefetch_factor: int = 2
+    prefetch_factor: int = 6
     dataloader_drop_last: bool = True
 
     # Logging and evaluation
-    log_interval: int = 50
-    eval_interval: int = 500
-    eval_batches: int = 50
-    save_interval: int = 2500
+    log_interval: int = 20
+    eval_interval: int = 200
+    eval_batches: int = 80
+    save_interval: int = 1000
 
     # Directories and experiment tracking
     checkpoint_dir: str = "checkpoints"
     experiment_name: str = "openwebtext_h100_v1"
-    experiment_description: str = "OpenWebText training with: Muon, U-Net, untied embeddings"
+    experiment_description: str = "OpenWebText H100 training"
     use_wandb: bool = True
     wandb_project: str = "cs336-assignment1"
 
-    # Hardware settings
+    # Device settings
     device: str = "cuda"
     resume_from: str | None = None
     auto_resume: bool = True
@@ -436,7 +436,7 @@ class Trainer:
                 self.config.compile_model = False
 
     def _setup_optimizer(self) -> None:
-        """Setup optimized optimizer based on configuration."""
+        """Setup optimized optimizer based on configuration with enhanced settings."""
         if self.config.optimizer == "muon":
             self.optimizer = Muon(
                 self.original_model.parameters(),
@@ -445,8 +445,9 @@ class Trainer:
                 ns_iters=self.config.ns_iters,
                 weight_decay=self.config.weight_decay,
                 eps=self.config.eps,
+                use_optimized_coefficients=True,
             )
-            print("Using Muon optimizer")
+            print("Using Muon optimizer with optimized coefficients")
 
         elif self.config.optimizer == "muon_adamw":
             param_names = {}
@@ -464,9 +465,10 @@ class Trainer:
                 weight_decay=self.config.weight_decay,
                 eps=self.config.eps,
                 ns_iters=self.config.ns_iters,
+                use_optimized_muon=True,
             )
             self.param_names = param_names
-            print("Using Mixed Optimizer (Muon + AdamW with different learning rates)")
+            print("Using Mixed Optimizer (Muon + AdamW) with optimized coefficients and enhanced categorization")
 
         else:
             self.optimizer = AdamW(
@@ -563,13 +565,18 @@ class Trainer:
                 print(f"WARNING: Failed to load checkpoint: {e}")
 
     def get_lr(self, step: int) -> float:
-        """Get learning rate with improved schedule."""
-        return cosine_learning_rate_schedule(
+        """Get learning rate for current step with optimized aggressive schedule."""
+        if self.config.max_steps <= 0:
+            return self.config.learning_rate
+
+        return aggressive_cosine_schedule(
             iteration=step,
             max_learning_rate=self.config.learning_rate,
             min_learning_rate=self.config.min_learning_rate,
             warmup_iters=self.config.warmup_steps,
-            cosine_cycle_iters=self.config.max_steps,
+            total_iters=self.config.max_steps,
+            peak_ratio=0.12,
+            fast_decay_ratio=0.35,
         )
 
     def train_step(self) -> dict[str, Any]:
