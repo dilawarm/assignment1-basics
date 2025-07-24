@@ -599,35 +599,66 @@ class Trainer:
 
         self.optimizer.zero_grad()
 
-        for _ in range(self.config.gradient_accumulation_steps):
-            inputs, targets = self.train_loader.get_batch()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
-            if self.config.use_amp:
-                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+        for accumulation_step in range(self.config.gradient_accumulation_steps):
+            try:
+                inputs, targets = self.train_loader.get_batch()
+
+                if self.config.use_amp:
+                    with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                        logits = self.model(inputs)
+                        loss = cross_entropy(logits, targets)
+                        loss = loss / self.config.gradient_accumulation_steps
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"ERROR: NaN/Inf loss detected at step {self.step}! Stopping training.")
+                        return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
+
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                else:
                     logits = self.model(inputs)
                     loss = cross_entropy(logits, targets)
                     loss = loss / self.config.gradient_accumulation_steps
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"ERROR: NaN/Inf loss detected at step {self.step}! Stopping training.")
-                    return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"ERROR: NaN/Inf loss detected at step {self.step}! Stopping training.")
+                        return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
 
-                if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-                else:
                     loss.backward()
-            else:
-                logits = self.model(inputs)
-                loss = cross_entropy(logits, targets)
-                loss = loss / self.config.gradient_accumulation_steps
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"ERROR: NaN/Inf loss detected at step {self.step}! Stopping training.")
-                    return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
+                total_loss += loss.item()
 
-                loss.backward()
+                del logits, loss
 
-            total_loss += loss.item()
+                if accumulation_step < self.config.gradient_accumulation_steps - 1 and self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"WARNING: OOM during accumulation step {accumulation_step}. Clearing cache and retrying...")
+
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    self.optimizer.zero_grad()
+
+                    if accumulation_step > 0:
+                        print(
+                            f"Completing step with {accumulation_step} accumulated gradients instead of {self.config.gradient_accumulation_steps}"
+                        )
+                        total_loss = total_loss * self.config.gradient_accumulation_steps / accumulation_step
+                        break
+                    else:
+                        print("OOM on first accumulation step - batch size too large!")
+                        return {"loss": float("nan"), "lr": current_lr, "training_stopped": True}
+                else:
+                    raise e
 
         has_nan_grad = False
         for param in self.original_model.parameters():

@@ -1,10 +1,11 @@
 """
-Cross-entropy loss function.
+Memory-optimized cross-entropy loss function.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float, Int
 
 
@@ -12,12 +13,10 @@ def cross_entropy(
     logits: Float[torch.Tensor, "... vocab_size"], targets: Int[torch.Tensor, "..."]
 ) -> Float[torch.Tensor, ""]:
     """
-    Compute cross-entropy loss between logits and targets.
+    Compute cross-entropy loss between logits and targets with memory optimization.
 
-    This function computes the cross-entropy loss with multiple layers of numerical stability:
-    1. Uses standard PyTorch implementation first
-    2. Falls back to numerically stable version if NaN/Inf detected
-    3. Adds epsilon to prevent log(0) issues only when needed
+    This function uses PyTorch's optimized cross_entropy implementation for better
+    memory efficiency, especially for large vocabulary sizes.
 
     Args:
         logits: predicted logits of shape (..., vocab_size)
@@ -28,23 +27,79 @@ def cross_entropy(
     """
     targets = targets.to(logits.device)
 
+    batch_elements = logits.numel() // logits.size(-1)
+    vocab_size = logits.size(-1)
+
+    memory_threshold = 8 * 1024**3
+    tensor_memory = batch_elements * vocab_size * 4
+
+    if tensor_memory > memory_threshold:
+        return _chunked_cross_entropy(logits, targets)
+
     try:
-        logits_max = logits.max(dim=-1, keepdim=True)[0]
-        logits_stable = logits - logits_max
+        logits_flat = logits.view(-1, vocab_size)
+        targets_flat = targets.view(-1)
 
-        log_sum_exp = torch.logsumexp(logits_stable, dim=-1, keepdim=True)
-        log_softmax = logits_stable - log_sum_exp
-
-        target_log_probs = log_softmax.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-
-        loss = -target_log_probs.mean()
+        loss = F.cross_entropy(logits_flat, targets_flat, reduction="mean")
 
         if torch.isfinite(loss):
             return loss
 
-    except Exception:
-        pass
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("OOM in standard path, falling back to chunked processing")
+            return _chunked_cross_entropy(logits, targets)
+        raise e
 
+    return _stable_cross_entropy(logits, targets)
+
+
+def _chunked_cross_entropy(
+    logits: Float[torch.Tensor, "... vocab_size"], targets: Int[torch.Tensor, "..."], chunk_size: int = 1024
+) -> Float[torch.Tensor, ""]:
+    """
+    Compute cross-entropy loss using chunked processing for memory efficiency.
+
+    Args:
+        logits: predicted logits of shape (..., vocab_size)
+        targets: target indices of shape (...)
+        chunk_size: number of elements to process at once
+
+    Returns:
+        scalar cross-entropy loss averaged over the batch
+    """
+    vocab_size = logits.size(-1)
+    logits_flat = logits.view(-1, vocab_size)
+    targets_flat = targets.view(-1)
+
+    total_loss = 0.0
+    total_elements = logits_flat.size(0)
+
+    for i in range(0, total_elements, chunk_size):
+        end_idx = min(i + chunk_size, total_elements)
+
+        logits_chunk = logits_flat[i:end_idx]
+        targets_chunk = targets_flat[i:end_idx]
+
+        chunk_loss = F.cross_entropy(logits_chunk, targets_chunk, reduction="sum")
+        total_loss += chunk_loss.item()
+
+    return torch.tensor(total_loss / total_elements, device=logits.device, dtype=logits.dtype)
+
+
+def _stable_cross_entropy(
+    logits: Float[torch.Tensor, "... vocab_size"], targets: Int[torch.Tensor, "..."]
+) -> Float[torch.Tensor, ""]:
+    """
+    Fallback numerically stable cross-entropy implementation.
+
+    Args:
+        logits: predicted logits of shape (..., vocab_size)
+        targets: target indices of shape (...)
+
+    Returns:
+        scalar cross-entropy loss averaged over the batch
+    """
     logits_clipped = torch.clamp(logits, min=-700.0, max=700.0)
 
     logits_max = logits_clipped.max(dim=-1, keepdim=True)[0]
@@ -61,7 +116,7 @@ def cross_entropy(
     loss = -target_log_probs.mean()
 
     if torch.isnan(loss) or torch.isinf(loss):
-        print("WARNING: NaN/Inf detected in cross_entropy loss computation")
+        print("WARNING: NaN/Inf detected in stable cross_entropy computation")
         return torch.tensor(10.0, device=logits.device, dtype=logits.dtype)
 
     return loss
