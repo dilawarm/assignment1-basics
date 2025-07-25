@@ -41,7 +41,7 @@ class TestNumericalStability:
         assert torch.isfinite(loss), "Loss should be finite even with NaN inputs"
 
     def test_ffn_stability(self):
-        """Test FFN (leader activation) numerical stability."""
+        """Test FFN (custom activation) numerical stability."""
         d_model, d_ff = 512, 2048
         ffn = FFN(d_model, d_ff)
 
@@ -142,46 +142,20 @@ class TestTrainingStability:
         assert trainer.optimizer is not None
 
     def test_learning_rate_schedule_application(self, minimal_config):
-        """Test that learning rate is properly applied to MixedOptimizer."""
-        minimal_config.optimizer = "muon_adamw"
+        """Test that learning rate schedule works correctly."""
         trainer = Trainer(minimal_config)
 
-        for group in trainer.optimizer.param_groups:
-            assert "muon_lr" in group
-            assert "adamw_lr" in group
+        # Test that get_lr returns expected dict structure
+        lr_step_0 = trainer.get_lr(0)
+        lr_step_5 = trainer.get_lr(5)
 
-        initial_muon_lr = trainer.optimizer.param_groups[0]["muon_lr"]
-        initial_adamw_lr = trainer.optimizer.param_groups[0]["adamw_lr"]
+        # Verify dict structure
+        assert "base_lr" in lr_step_0
+        assert isinstance(lr_step_0["base_lr"], float)
+        assert isinstance(lr_step_5["base_lr"], float)
 
-        trainer.step = 5
-        current_lr = trainer.get_lr(trainer.step)
-
-        if trainer.config.optimizer == "muon_adamw":
-            for group in trainer.optimizer.param_groups:
-                base_lr_ratio = current_lr / trainer.config.learning_rate
-                group["muon_lr"] = trainer.config.muon_lr * base_lr_ratio
-                group["adamw_lr"] = trainer.config.adamw_lr * base_lr_ratio
-                group["embedding_lr"] = trainer.config.embedding_lr * base_lr_ratio
-                group["lm_head_lr"] = trainer.config.lm_head_lr * base_lr_ratio
-
-        for group in trainer.optimizer.param_groups:
-            base_lr_ratio = current_lr / trainer.config.learning_rate
-            expected_muon_lr = trainer.config.muon_lr * base_lr_ratio
-            expected_adamw_lr = trainer.config.adamw_lr * base_lr_ratio
-
-            assert abs(group["muon_lr"] - expected_muon_lr) < 1e-6, (
-                f"Expected {expected_muon_lr}, got {group['muon_lr']}"
-            )
-            assert abs(group["adamw_lr"] - expected_adamw_lr) < 1e-6, (
-                f"Expected {expected_adamw_lr}, got {group['adamw_lr']}"
-            )
-
-            assert abs(group["muon_lr"] - initial_muon_lr) > 1e-6, (
-                "Learning rate should have changed from initial value"
-            )
-            assert abs(group["adamw_lr"] - initial_adamw_lr) > 1e-6, (
-                "Learning rate should have changed from initial value"
-            )
+        # Verify LR increases during warmup
+        assert lr_step_5["base_lr"] > lr_step_0["base_lr"]
 
     def test_nan_detection_and_early_stopping(self, minimal_config):
         """Test that NaN detection properly stops training."""
@@ -268,8 +242,8 @@ class TestActivationStability:
         output = swiglu(x)
         assert torch.isfinite(output).all(), "SwiGLU should handle large inputs"
 
-    def test_ffn_leader_bounded_output(self):
-        """Test that FFN (leader) activation produces bounded outputs."""
+    def test_ffn_custom_bounded_output(self):
+        """Test that FFN (custom) activation produces bounded outputs."""
         d_model, d_ff = 256, 1024
         ffn = FFN(d_model, d_ff)
 

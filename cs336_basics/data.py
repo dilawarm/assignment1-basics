@@ -1,5 +1,5 @@
 """
-Optimized data loading utilities for transformer training.
+Data loading utilities for transformer training.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ def get_batch(
     pin_memory: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimized batch generation for language model training.
+    Batch generation for language model training.
 
     This function efficiently samples random sequences from the dataset and
     prepares input-target pairs for autoregressive training.
@@ -81,7 +81,7 @@ class BatchSampler:
         num_workers: int = 0,
         prefetch_factor: int = 2,
     ):
-        """Initialize optimized batch sampler."""
+        """Initialize batch sampler."""
         self.dataset = dataset
         self.batch_size = batch_size
         self.context_length = context_length
@@ -113,7 +113,7 @@ class BatchSampler:
             )
 
     def sample_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample a batch with optimized memory access."""
+        """Sample a batch with memory access."""
         start_indices = np.random.randint(0, self.max_start_idx, size=self.batch_size)
 
         for i, start_idx in enumerate(start_indices):
@@ -140,7 +140,7 @@ def create_dataloader(
     use_memory_mapping: bool = True,
 ) -> BatchSampler:
     """
-    Create an optimized data loader for language model training.
+    Create a data loader for language model training.
 
     Args:
         data_path: Path to tokenized data file (.npy)
@@ -152,7 +152,7 @@ def create_dataloader(
         use_memory_mapping: Whether to use memory mapping for large files
 
     Returns:
-        Optimized batch sampler
+        Batch sampler
     """
     if use_memory_mapping:
         dataset = np.memmap(data_path, dtype=np.uint16, mode="r")

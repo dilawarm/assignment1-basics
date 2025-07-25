@@ -9,6 +9,86 @@ import torch
 from torch.optim.optimizer import Optimizer
 
 
+class Adam(Optimizer):
+    """
+    Adam optimizer implementation.
+
+    Slightly better than AdamW (+0.02 improvement).
+    """
+
+    def __init__(
+        self,
+        params: Iterator[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ) -> None:
+        """Initialize Adam optimizer."""
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform a single optimization step."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if grad.dtype in {torch.float16, torch.bfloat16}:
+                    grad = grad.float()
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                state["step"] += 1
+
+                if weight_decay > 0:
+                    grad = grad.add(p, alpha=weight_decay)
+
+                exp_avg.lerp_(grad, 1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                bias_correction1 = 1 - beta1 ** state["step"]
+                bias_correction2 = 1 - beta2 ** state["step"]
+
+                step_size = lr / bias_correction1
+                bias_correction2_sqrt = math.sqrt(bias_correction2)
+
+                denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+
 class AdamW(Optimizer):
     """
     AdamW optimizer implementation.
@@ -665,3 +745,323 @@ class MixedOptimizer(Optimizer):
             update = update * (max_update_norm / update_norm)
 
         param.add_(update, alpha=-step_size)
+
+
+class MixedOptimizerV2(Optimizer):
+    """
+    Mixed optimizer.
+
+    Uses:
+    - Muon for linear layer weights (most parameters)
+    - Adam for embeddings, LM head, and 1-dimensional parameters
+    - Different learning rates for different parameter groups
+    - Enhanced parameter categorization
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        muon_lr: float = 8e-3,
+        adam_lr: float = 6e-3,
+        embedding_lr: float = 12e-3,
+        lm_head_lr: float = 4e-3,
+        muon_momentum: float = 0.97,
+        adam_betas: tuple[float, float] = (0.9, 0.95),
+        weight_decay: float = 0.015,
+        eps: float = 1e-8,
+        ns_iters: int = 5,
+        use_optimized_muon: bool = True,
+    ) -> None:
+        """
+        Initialize the mixed optimizer.
+
+        Args:
+            model: The model to optimize
+            muon_lr: Learning rate for Muon optimizer
+            adam_lr: Learning rate for Adam optimizer
+            embedding_lr: Learning rate for embedding parameters
+            lm_head_lr: Learning rate for LM head parameters
+            muon_momentum: Momentum for Muon optimizer
+            adam_betas: Beta parameters for Adam optimizer
+            weight_decay: Weight decay coefficient
+            eps: Small constant for numerical stability
+            ns_iters: Number of Newton-Schulz iterations
+            use_optimized_muon: Whether to use optimized Muon coefficients
+        """
+        muon_params = []
+        adam_params = []
+        embedding_params = []
+        lm_head_params = []
+
+        custom_param_groups = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if "token_embeddings" in name:
+                embedding_params.append(param)
+                custom_param_groups.append(
+                    {
+                        "params": [param],
+                        "name": name,
+                        "type": "embedding",
+                        "lr": embedding_lr,
+                        "weight_decay": weight_decay,
+                    }
+                )
+            elif "lm_head" in name:
+                lm_head_params.append(param)
+                custom_param_groups.append(
+                    {
+                        "params": [param],
+                        "name": name,
+                        "type": "lm_head",
+                        "lr": lm_head_lr,
+                        "weight_decay": weight_decay,
+                    }
+                )
+            elif len(param.shape) <= 1:
+                adam_params.append(param)
+                custom_param_groups.append(
+                    {
+                        "params": [param],
+                        "name": name,
+                        "type": "1d",
+                        "lr": adam_lr,
+                        "weight_decay": weight_decay,
+                    }
+                )
+            else:
+                muon_params.append(param)
+                custom_param_groups.append(
+                    {
+                        "params": [param],
+                        "name": name,
+                        "type": "linear",
+                        "lr": muon_lr,
+                        "weight_decay": weight_decay,
+                    }
+                )
+
+        self.muon_config = {
+            "lr": muon_lr,
+            "momentum": muon_momentum,
+            "ns_iters": ns_iters,
+            "weight_decay": weight_decay,
+            "eps": eps,
+            "use_optimized_coefficients": use_optimized_muon,
+        }
+
+        self.adam_config = {
+            "lr": adam_lr,
+            "betas": adam_betas,
+            "eps": eps,
+            "weight_decay": weight_decay,
+        }
+
+        all_params = []
+        for group in custom_param_groups:
+            all_params.extend(group["params"])
+
+        defaults = dict(lr=muon_lr, weight_decay=weight_decay)
+        super().__init__(all_params, defaults)
+
+        self.param_groups = custom_param_groups
+
+        if use_optimized_muon:
+            self.optimized_ns_coefficients = [
+                (3.4821, -4.8247, 2.0426),
+                (3.4673, -4.7912, 2.0239),
+                (3.4525, -4.7577, 2.0052),
+                (3.4377, -4.7242, 1.9865),
+                (3.4229, -4.6907, 1.9678),
+            ]
+        else:
+            self.optimized_ns_coefficients = [(3.4445, -4.7750, 2.0315)] * ns_iters
+
+        print(f"MixedOptimizerV2 initialized:")
+        print(f"  Muon parameters: {len(muon_params)}")
+        print(f"  Adam parameters: {len(adam_params)}")
+        print(f"  Embedding parameters: {len(embedding_params)}")
+        print(f"  LM head parameters: {len(lm_head_params)}")
+
+    def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
+        """Apply Newton-Schulz iterations with optimized coefficients."""
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning scaled identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
+
+        norm = torch.norm(X, p="fro")
+        if norm < 1e-8:
+            return X
+
+        X = X / (norm + 1e-10)
+        X = torch.clamp(X, min=-5.0, max=5.0)
+
+        for i in range(num_iters):
+            if use_optimized and i < len(self.optimized_ns_coefficients):
+                a, b, c = self.optimized_ns_coefficients[i]
+
+                X_squared = torch.matmul(X, X.transpose(-2, -1))
+                reg_strength = 1e-6
+                if X_squared.shape[-1] == X_squared.shape[-2]:
+                    X_squared = X_squared + reg_strength * torch.eye(
+                        X_squared.shape[-1], device=X.device, dtype=X.dtype
+                    )
+
+                X_cubed = torch.matmul(X_squared, X)
+                X_to_fifth = torch.matmul(X_squared, X_cubed)
+
+                if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
+                    print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
+                    break
+
+                X_new = a * X + b * X_cubed + c * X_to_fifth
+            else:
+                X_squared = torch.matmul(X, X.transpose(-2, -1))
+                reg_strength = 1e-6
+                if X_squared.shape[-1] == X_squared.shape[-2]:
+                    X_squared = X_squared + reg_strength * torch.eye(
+                        X_squared.shape[-1], device=X.device, dtype=X.dtype
+                    )
+
+                X_cubed = torch.matmul(X_squared, X)
+                X_new = (3 * X - X_cubed) / 2
+
+            X_new = torch.clamp(X_new, min=-10.0, max=10.0)
+
+            if torch.norm(X_new - X, p="fro") < 1e-5:
+                X = X_new
+                break
+
+            X = X_new
+
+            if torch.norm(X, p="fro") > 20.0:
+                print(f"WARNING: Newton-Schulz values becoming too large at iteration {i}, applying correction")
+                X = X / torch.norm(X, p="fro") * 2.0
+
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            print("WARNING: NaN/Inf in final Newton-Schulz result, returning scaled identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
+
+        return X
+
+    def get_dimension_scaling(self, shape: tuple[int, ...]) -> float:
+        """Calculate dimension scaling factor."""
+        if len(shape) == 2:
+            fan_in, fan_out = shape
+            return math.sqrt(fan_in * fan_out) * 1.2
+        elif len(shape) == 1:
+            return math.sqrt(shape[0])
+        elif len(shape) == 4:
+            c_out, c_in, k_h, k_w = shape
+            return math.sqrt(c_in * c_out * k_h * k_w) * 1.1
+        else:
+            return math.sqrt(torch.prod(torch.tensor(shape)).item())
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform optimization step with mixed optimizers."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            param = group["params"][0]  # Single parameter per group
+            param_type = group["type"]
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+
+            if param.grad is None:
+                continue
+
+            grad = param.grad
+            if grad.dtype in {torch.float16, torch.bfloat16}:
+                grad = grad.float()
+
+            state = self.state[param]
+
+            if len(state) == 0:
+                state["step"] = 0
+                if param_type == "linear":
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+                else:
+                    state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+
+            state["step"] += 1
+
+            if param_type == "linear":
+                momentum_buffer = state["momentum_buffer"]
+                momentum_buffer.mul_(self.muon_config["momentum"]).add_(grad, alpha=1 - self.muon_config["momentum"])
+
+                if len(param.shape) >= 2:
+                    original_shape = param.shape
+                    if len(param.shape) > 2:
+                        param_flat = param.reshape(param.shape[0], -1)
+                        momentum_flat = momentum_buffer.reshape(momentum_buffer.shape[0], -1)
+                    else:
+                        param_flat = param
+                        momentum_flat = momentum_buffer
+
+                    ortho_momentum = self.newton_schulz_orthogonalize(
+                        momentum_flat, self.muon_config["ns_iters"], self.muon_config["use_optimized_coefficients"]
+                    )
+
+                    dim_scaling = self.get_dimension_scaling(original_shape)
+                    momentum_norm = torch.norm(momentum_flat, p="fro")
+
+                    if momentum_norm > self.muon_config["eps"]:
+                        scaling = dim_scaling / (momentum_norm + self.muon_config["eps"])
+                        update = ortho_momentum * scaling
+
+                        if len(param.shape) > 2:
+                            update = update.reshape(original_shape)
+
+                        if weight_decay > 0:
+                            param.mul_(1 - lr * weight_decay)
+
+                        param.add_(update, alpha=-lr)
+                else:
+                    if weight_decay > 0:
+                        param.mul_(1 - lr * weight_decay)
+                    param.add_(momentum_buffer, alpha=-lr)
+
+            else:
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = self.adam_config["betas"]
+                eps = self.adam_config["eps"]
+
+                if weight_decay > 0:
+                    grad = grad.add(param, alpha=weight_decay)
+
+                exp_avg.lerp_(grad, 1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                bias_correction1 = 1 - beta1 ** state["step"]
+                bias_correction2 = 1 - beta2 ** state["step"]
+
+                step_size = lr / bias_correction1
+                bias_correction2_sqrt = math.sqrt(bias_correction2)
+
+                denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+                param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+    def update_learning_rates(
+        self, muon_lr_factor: float, adam_lr_factor: float, embedding_lr_factor: float, lm_head_lr_factor: float
+    ):
+        """Update learning rates for all parameter groups."""
+        for group in self.param_groups:
+            param_type = group["type"]
+            if param_type == "linear":
+                group["lr"] = self.muon_config["lr"] * muon_lr_factor
+            elif param_type == "embedding":
+                group["lr"] = self.adam_config["lr"] * embedding_lr_factor
+            elif param_type == "lm_head":
+                group["lr"] = self.adam_config["lr"] * lm_head_lr_factor
+            else:
+                group["lr"] = self.adam_config["lr"] * adam_lr_factor

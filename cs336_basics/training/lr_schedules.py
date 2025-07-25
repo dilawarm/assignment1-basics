@@ -48,7 +48,7 @@ def aggressive_cosine_schedule(
     fast_decay_ratio: float = 0.4,
 ) -> float:
     """
-    Aggressive cosine learning rate schedule optimized for fast convergence within time constraints.
+    Aggressive cosine learning rate schedule for fast convergence within time constraints.
 
     This schedule is designed to:
     1. Warm up very quickly to high learning rates
@@ -145,6 +145,80 @@ def improved_cosine_schedule(
 
         cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
         return min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_factor
+
+
+def linear_decay_to_zero_schedule(
+    iteration: int,
+    max_learning_rate: float,
+    warmup_iters: int,
+    total_iters: int,
+) -> float:
+    """
+    Linear Decay to Zero (D2Z) learning rate schedule from ICLR 2025.
+
+    This schedule significantly outperforms cosine decay for LLMs by optimally
+    balancing early training (moving away from initial conditions) and late
+    training (averaging over more updates to mitigate gradient noise).
+
+    Benefits:
+    - 60% compute savings compared to cosine decay with 10x minimum
+    - Better final performance at compute-optimal dataset sizes
+    - Simpler and more stable than cosine schedules
+
+    Args:
+        iteration: current iteration number
+        max_learning_rate: maximum learning rate after warmup
+        warmup_iters: number of warmup iterations
+        total_iters: total number of training iterations
+
+    Returns:
+        learning rate for the current iteration
+    """
+    if iteration < warmup_iters:
+        return max_learning_rate * iteration / warmup_iters
+    elif iteration <= total_iters:
+        remaining_iters = total_iters - warmup_iters
+        progress = (iteration - warmup_iters) / remaining_iters
+        return max_learning_rate * (1.0 - progress)
+    else:
+        return 0.0
+
+
+def warmup_schedule(
+    iteration: int,
+    max_learning_rate: float,
+    warmup_iters: int,
+    total_iters: int,
+    warmup_type: str = "linear",
+) -> float:
+    """
+    Warmup with multiple warmup strategies.
+
+    Args:
+        iteration: current iteration number
+        max_learning_rate: maximum learning rate after warmup
+        warmup_iters: number of warmup iterations
+        total_iters: total number of training iterations
+        warmup_type: "linear", "cosine", or "exponential"
+
+    Returns:
+        learning rate for the current iteration
+    """
+    if iteration < warmup_iters:
+        if warmup_type == "linear":
+            warmup_factor = iteration / warmup_iters
+        elif warmup_type == "cosine":
+            warmup_factor = 0.5 * (1 - math.cos(math.pi * iteration / warmup_iters))
+        elif warmup_type == "exponential":
+            warmup_factor = 1 - math.exp(-6 * iteration / warmup_iters)
+        else:
+            warmup_factor = iteration / warmup_iters
+
+        return max_learning_rate * warmup_factor
+    else:
+        remaining_iters = total_iters - warmup_iters
+        progress = (iteration - warmup_iters) / remaining_iters
+        return max_learning_rate * (1.0 - progress)
 
 
 def exponential_decay_schedule(

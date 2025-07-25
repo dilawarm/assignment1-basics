@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 
-from cs336_basics.nn.activations import FFN, SwiGLU
+from cs336_basics.nn.activations import CustomFFN, SwiGLU
 from cs336_basics.nn.attention import MultiHeadSelfAttention, RotaryPositionalEmbedding
 from cs336_basics.nn.layers import Embedding, Linear, RMSNorm
 
 
 class TransformerBlock(nn.Module):
     """
-    Optimized Pre-norm Transformer block with gradient checkpointing support.
+    Pre-norm Transformer block with gradient checkpointing support.
 
     Enhanced with memory efficiency improvements and performance optimizations
     for modern GPU architectures.
@@ -27,7 +27,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         eps: float = 1e-5,
-        activation: str = "swiglu",
+        activation: str = "custom",
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -39,7 +39,7 @@ class TransformerBlock(nn.Module):
             num_heads: Number of attention heads
             d_ff: Dimensionality of the feed-forward inner layer
             eps: Epsilon value for RMSNorm numerical stability
-            activation: Type of activation function ("swiglu" or "leader")
+            activation: Type of activation function ("custom" or "swiglu")
             device: Device to store parameters on
             dtype: Data type for parameters
         """
@@ -54,8 +54,8 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadSelfAttention(d_model, num_heads, **factory_kwargs)
         self.ln1 = RMSNorm(d_model, eps, **factory_kwargs)
 
-        if activation == "leader":
-            self.ffn = FFN(d_model, d_ff, **factory_kwargs)
+        if activation == "custom":
+            self.ffn = CustomFFN(d_model, d_ff, **factory_kwargs)
         else:
             self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
 
@@ -109,7 +109,7 @@ class TransformerBlock(nn.Module):
 
 class TransformerLM(nn.Module):
     """
-    Optimized Transformer Language Model with performance enhancements.
+    Transformer Language Model with performance enhancements.
 
     Enhanced with gradient checkpointing, memory optimizations, and architectural
     improvements for better training efficiency on modern hardware.
@@ -216,7 +216,7 @@ class TransformerLM(nn.Module):
         self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
     ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
         """
-        Forward pass with optimized memory and compute efficiency.
+        Forward pass with memory and compute efficiency.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, seq_len)
@@ -289,12 +289,12 @@ class TransformerLM(nn.Module):
 
 class EnhancedTransformerLM(nn.Module):
     """
-    Enhanced Transformer Language Model with optimizations.
+    Enhanced Transformer Language Model.
 
     Features:
-    - U-Net like skip connections for better gradient flow
+    - U-Net like skip connections with proper learnable mixing parameters
     - Untied input/output embeddings with different learning rates
-    - Configurable activation functions (SwiGLU or Leader's custom activation)
+    - CustomFFN activation: w2(max(w1(x), 0)^2)
     - Mixed precision support with bfloat16
     - Advanced gradient checkpointing
     """
@@ -310,7 +310,7 @@ class EnhancedTransformerLM(nn.Module):
         rope_theta: float = 10000.0,
         eps: float = 1e-5,
         tie_embeddings: bool = False,
-        activation: str = "leader",
+        activation: str = "custom",
         use_unet_architecture: bool = True,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -328,7 +328,7 @@ class EnhancedTransformerLM(nn.Module):
             rope_theta: RoPE theta parameter
             eps: Epsilon for numerical stability
             tie_embeddings: Whether to tie input and output embeddings
-            activation: Activation function type ("swiglu" or "leader")
+            activation: Activation function type ("custom" or "swiglu")
             use_unet_architecture: Whether to use U-Net skip connections
             device: Device to store parameters on
             dtype: Data type for parameters
@@ -373,10 +373,11 @@ class EnhancedTransformerLM(nn.Module):
         if use_unet_architecture:
             self.skip_layers = num_layers // 2
             self.skip_mixing = nn.ParameterList(
-                [nn.Parameter(torch.zeros(d_model, **factory_kwargs)) for _ in range(self.skip_layers)]
+                [nn.Parameter(torch.zeros(1, **factory_kwargs)) for _ in range(self.skip_layers)]
             )
         else:
             self.skip_layers = 0
+            self.skip_mixing = None
 
         self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
 
@@ -418,7 +419,7 @@ class EnhancedTransformerLM(nn.Module):
         self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
     ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
         """
-        Forward pass with U-Net skip connections.
+        Forward pass with improved U-Net skip connections.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, seq_len)
@@ -447,12 +448,12 @@ class EnhancedTransformerLM(nn.Module):
         for i in range(self.skip_layers, self.num_layers):
             x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
 
-            if self.use_unet_architecture and i >= self.skip_layers:
+            if self.use_unet_architecture and i < self.num_layers:
                 skip_idx = self.num_layers - 1 - i
-                if skip_idx >= 0 and skip_idx < len(skip_connections):
+                if 0 <= skip_idx < len(skip_connections):
                     skip_connection = skip_connections[skip_idx]
-                    mixing_param = torch.sigmoid(self.skip_mixing[skip_idx])
-                    x = x * (1 - mixing_param) + skip_connection * mixing_param
+                    mixing_weight = torch.sigmoid(self.skip_mixing[skip_idx])
+                    x = (1 - mixing_weight) * x + mixing_weight * skip_connection
 
         x = self.ln_final(x)
 

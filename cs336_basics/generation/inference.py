@@ -96,7 +96,7 @@ class TinyStoriesInferenceEngine:
     """
     High-performance inference engine for TinyStories Transformer models.
 
-    This class provides optimized text generation capabilities with support for
+    This class provides text generation capabilities with support for
     various decoding strategies and batch processing.
     """
 
@@ -246,7 +246,7 @@ class TinyStoriesInferenceEngine:
         if self.torch_compile and self.device.type == "cuda":
             try:
                 model = torch.compile(model, mode="reduce-overhead")
-                print("⚡ Model compiled for optimized execution")
+                print("⚡ Model compiled for execution")
             except Exception as e:
                 warnings.warn(f"Model compilation failed: {e}")
 

@@ -1,5 +1,5 @@
 """
-Memory-optimized cross-entropy loss function.
+Cross-entropy loss function.
 """
 
 from __future__ import annotations
@@ -13,10 +13,7 @@ def cross_entropy(
     logits: Float[torch.Tensor, "... vocab_size"], targets: Int[torch.Tensor, "..."]
 ) -> Float[torch.Tensor, ""]:
     """
-    Compute cross-entropy loss between logits and targets with memory optimization.
-
-    This function uses PyTorch's optimized cross_entropy implementation for better
-    memory efficiency, especially for large vocabulary sizes.
+    Compute cross-entropy loss between logits and targets.
 
     Args:
         logits: predicted logits of shape (..., vocab_size)
