@@ -351,10 +351,9 @@ class Trainer:
         """Get comprehensive metrics for logging."""
         try:
             filtered_base_metrics = {
-                k: v for k, v in base_metrics.items() 
-                if k not in ["loss", "lr", "step_time", "tokens_per_sec"]
+                k: v for k, v in base_metrics.items() if k not in ["loss", "lr", "step_time", "tokens_per_sec"]
             }
-            
+
             enhanced_metrics = {
                 **filtered_base_metrics,
                 "mfu": self.calculate_mfu(tokens_per_sec),
@@ -372,7 +371,7 @@ class Trainer:
                 "training_progress": self.step / self.config.max_steps,
                 "wallclock_hours": (time.time() - self.start_time) / 3600,
             }
-            
+
             return enhanced_metrics
         except Exception as e:
             print(f"Warning: Error in enhanced metrics calculation: {e}")
@@ -805,7 +804,6 @@ class Trainer:
             print(f"\n🏁 FINAL RESULTS:")
             print(f"Final validation loss: {final_val_loss:.4f}")
             print(f"Training time: {final_elapsed_hours:.2f} hours")
-
 
             self.training_integrator.log_validation_step(
                 wallclock_time=final_elapsed_hours,
