@@ -580,11 +580,20 @@ class Trainer:
         }
 
     def train_step(self) -> dict[str, Any]:
-        """Training step."""
+        """Training step with enhanced error handling and debugging."""
         self.model.train()
         total_loss = 0.0
+        step_start_time = time.time()
+
+        if self.step == 0:
+            print(f"🐛 DEBUG: Starting first training step (step {self.step})")
 
         lrs = self.get_lr(self.step)
+
+        if self.step < 5 or self.step % 100 == 0:
+            print(
+                f"🐛 DEBUG: Step {self.step}, LRs: base={lrs['base_lr']:.6f}, muon={lrs['muon_lr']:.6f}, adam={lrs['adam_lr']:.6f}"
+            )
 
         if self.config.optimizer == "mixed_v2":
             muon_lr_factor = lrs["muon_lr"] / self.config.muon_lr if self.config.muon_lr > 0 else 0
@@ -592,17 +601,36 @@ class Trainer:
             embedding_lr_factor = lrs["embedding_lr"] / self.config.embedding_lr if self.config.embedding_lr > 0 else 0
             lm_head_lr_factor = lrs["lm_head_lr"] / self.config.lm_head_lr if self.config.lm_head_lr > 0 else 0
 
-            self.optimizer.update_learning_rates(muon_lr_factor, adam_lr_factor, embedding_lr_factor, lm_head_lr_factor)
+            try:
+                self.optimizer.update_learning_rates(
+                    muon_lr_factor, adam_lr_factor, embedding_lr_factor, lm_head_lr_factor
+                )
+            except Exception as e:
+                print(f"❌ ERROR: Failed to update learning rates at step {self.step}: {e}")
+                return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
         else:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lrs["base_lr"]
 
         self.optimizer.zero_grad()
 
+        accumulation_start_time = time.time()
+
         for accumulation_step in range(self.config.gradient_accumulation_steps):
             try:
+                data_start_time = time.time()
                 inputs, targets = self.train_loader.get_batch()
+                data_load_time = time.time() - data_start_time
 
+                if data_load_time > 1.0:
+                    print(f"⚠️  Slow data loading: {data_load_time:.2f}s at step {self.step}")
+
+                if inputs.device != self.device:
+                    inputs = inputs.to(self.device, non_blocking=True)
+                if targets.device != self.device:
+                    targets = targets.to(self.device, non_blocking=True)
+
+                forward_start_time = time.time()
                 if self.config.use_amp:
                     with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                         logits = self.model(inputs)
@@ -610,9 +638,10 @@ class Trainer:
                         loss = loss / self.config.gradient_accumulation_steps
 
                     if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"❌ NaN/Inf loss detected at step {self.step}! Stopping training.")
+                        print(f"❌ NaN/Inf loss detected at step {self.step}, accumulation_step {accumulation_step}!")
                         return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
 
+                    backward_start_time = time.time()
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
@@ -623,16 +652,27 @@ class Trainer:
                     loss = loss / self.config.gradient_accumulation_steps
 
                     if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"❌ NaN/Inf loss detected at step {self.step}! Stopping training.")
+                        print(f"❌ NaN/Inf loss detected at step {self.step}, accumulation_step {accumulation_step}!")
                         return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
 
+                    backward_start_time = time.time()
                     loss.backward()
+
+                backward_time = time.time() - backward_start_time
+                forward_time = backward_start_time - forward_start_time
+
+                if forward_time > 5.0:
+                    print(f"⚠️  Slow forward pass: {forward_time:.2f}s at step {self.step}")
+                if backward_time > 5.0:
+                    print(f"⚠️  Slow backward pass: {backward_time:.2f}s at step {self.step}")
 
                 total_loss += loss.item()
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"⚠️  OOM during accumulation step {accumulation_step}. Clearing cache...")
+                    print(
+                        f"⚠️  OOM during accumulation step {accumulation_step} at training step {self.step}. Clearing cache..."
+                    )
                     if self.device.type == "cuda":
                         torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
@@ -640,27 +680,52 @@ class Trainer:
                         total_loss = total_loss * self.config.gradient_accumulation_steps / accumulation_step
                         break
                     else:
+                        print("❌ OOM on first accumulation step - training cannot continue")
                         return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
                 else:
-                    raise e
+                    print(f"❌ Runtime error at step {self.step}, accumulation_step {accumulation_step}: {e}")
+                    return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
+            except Exception as e:
+                print(f"❌ Unexpected error at step {self.step}, accumulation_step {accumulation_step}: {e}")
+                return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
 
-        if self.scaler is not None:
-            self.scaler.unscale_(self.optimizer)
-            gradient_clipping(self.original_model.parameters(), self.config.grad_clip_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            gradient_clipping(self.original_model.parameters(), self.config.grad_clip_norm)
-            self.optimizer.step()
+        accumulation_time = time.time() - accumulation_start_time
+
+        optimizer_start_time = time.time()
+        try:
+            if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+                gradient_clipping(self.original_model.parameters(), self.config.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                gradient_clipping(self.original_model.parameters(), self.config.grad_clip_norm)
+                self.optimizer.step()
+        except Exception as e:
+            print(f"❌ Optimizer step failed at step {self.step}: {e}")
+            return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
+
+        optimizer_time = time.time() - optimizer_start_time
+
+        if optimizer_time > 10.0:
+            print(f"⚠️  Slow optimizer step: {optimizer_time:.2f}s at step {self.step}")
 
         if self.config.torch_empty_cache_steps > 0 and self.step % self.config.torch_empty_cache_steps == 0:
             torch.cuda.empty_cache()
 
         self.stability_tracker.update(total_loss)
 
+        total_step_time = time.time() - step_start_time
+
+        if total_step_time > 30.0:
+            print(f"🐛 DEBUG: Extremely slow step {self.step}: {total_step_time:.2f}s total")
+            print(f"  - Accumulation: {accumulation_time:.2f}s")
+            print(f"  - Optimizer: {optimizer_time:.2f}s")
+
         return {
             "loss": total_loss,
             "lr": lrs["base_lr"],
+            "step_time": total_step_time,
             **lrs,
         }
 

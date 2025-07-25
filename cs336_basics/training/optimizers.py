@@ -241,15 +241,20 @@ class Muon(Optimizer):
         super().__init__(params, defaults)
 
         if use_optimized_coefficients:
+            # Stable coefficients from YouJiacheng's 6-step method (2025)
+            # These provide much better stability than the original "cursed quintic"
+            # Source: https://gist.github.com/YouJiacheng/393c90cbdc23b09d5688815ba382288b
             self.optimized_ns_coefficients = [
-                (3.4821, -4.8247, 2.0426),
-                (3.4673, -4.7912, 2.0239),
-                (3.4525, -4.7577, 2.0052),
-                (3.4377, -4.7242, 1.9865),
-                (3.4229, -4.6907, 1.9678),
+                (3955 / 1024, -8306 / 1024, 5008 / 1024),  # Step 1: Aggressive initial correction
+                (3735 / 1024, -6681 / 1024, 3463 / 1024),  # Step 2: Moderate correction
+                (3799 / 1024, -6499 / 1024, 3211 / 1024),  # Step 3: Fine-tuning
+                (4019 / 1024, -6385 / 1024, 2906 / 1024),  # Step 4: Stability improvement
+                (2677 / 1024, -3029 / 1024, 1162 / 1024),  # Step 5: Convergence acceleration
+                (2172 / 1024, -1833 / 1024, 682 / 1024),  # Step 6: Final flattening
             ]
         else:
-            self.optimized_ns_coefficients = [(3.4445, -4.7750, 2.0315)] * ns_iters
+            # Fallback to stable cubic iteration (more stable than cursed quintic)
+            self.optimized_ns_coefficients = [(1.5, -0.5, 0.0)] * ns_iters
 
     def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
         """
@@ -480,15 +485,20 @@ class MixedOptimizer(Optimizer):
         }
 
         if use_optimized_muon:
+            # Stable coefficients from YouJiacheng's 6-step method (2025)
+            # These provide much better stability than the original "cursed quintic"
+            # Source: https://gist.github.com/YouJiacheng/393c90cbdc23b09d5688815ba382288b
             self.optimized_ns_coefficients = [
-                (3.4821, -4.8247, 2.0426),
-                (3.4673, -4.7912, 2.0239),
-                (3.4525, -4.7577, 2.0052),
-                (3.4377, -4.7242, 1.9865),
-                (3.4229, -4.6907, 1.9678),
+                (3955 / 1024, -8306 / 1024, 5008 / 1024),  # Step 1: Aggressive initial correction
+                (3735 / 1024, -6681 / 1024, 3463 / 1024),  # Step 2: Moderate correction
+                (3799 / 1024, -6499 / 1024, 3211 / 1024),  # Step 3: Fine-tuning
+                (4019 / 1024, -6385 / 1024, 2906 / 1024),  # Step 4: Stability improvement
+                (2677 / 1024, -3029 / 1024, 1162 / 1024),  # Step 5: Convergence acceleration
+                (2172 / 1024, -1833 / 1024, 682 / 1024),  # Step 6: Final flattening
             ]
         else:
-            self.optimized_ns_coefficients = [(3.4445, -4.7750, 2.0315)] * ns_iters
+            # Fallback to stable cubic iteration (more stable than cursed quintic)
+            self.optimized_ns_coefficients = [(1.5, -0.5, 0.0)] * ns_iters
 
     def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
         """
@@ -870,15 +880,19 @@ class MixedOptimizerV2(Optimizer):
         self.param_groups = custom_param_groups
 
         if use_optimized_muon:
+            # Stable coefficients from YouJiacheng's 6-step method (2025)
+            # These provide much better stability than the original "cursed quintic"
+            # Source: https://gist.github.com/YouJiacheng/393c90cbdc23b09d5688815ba382288b
             self.optimized_ns_coefficients = [
-                (3.4821, -4.8247, 2.0426),
-                (3.4673, -4.7912, 2.0239),
-                (3.4525, -4.7577, 2.0052),
-                (3.4377, -4.7242, 1.9865),
-                (3.4229, -4.6907, 1.9678),
+                (3955 / 1024, -8306 / 1024, 5008 / 1024),  # Step 1: Aggressive initial correction
+                (3735 / 1024, -6681 / 1024, 3463 / 1024),  # Step 2: Moderate correction
+                (3799 / 1024, -6499 / 1024, 3211 / 1024),  # Step 3: Fine-tuning
+                (4019 / 1024, -6385 / 1024, 2906 / 1024),  # Step 4: Stability improvement
+                (2677 / 1024, -3029 / 1024, 1162 / 1024),  # Step 5: Convergence acceleration
+                (2172 / 1024, -1833 / 1024, 682 / 1024),  # Step 6: Final flattening
             ]
         else:
-            self.optimized_ns_coefficients = [(3.4445, -4.7750, 2.0315)] * ns_iters
+            self.optimized_ns_coefficients = [(1.5, -0.5, 0.0)] * ns_iters
 
         print(f"MixedOptimizerV2 initialized:")
         print(f"  Muon parameters: {len(muon_params)}")
@@ -887,7 +901,7 @@ class MixedOptimizerV2(Optimizer):
         print(f"  LM head parameters: {len(lm_head_params)}")
 
     def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
-        """Apply Newton-Schulz iterations with optimized coefficients."""
+        """Apply Newton-Schulz iterations with enhanced stability from 2025 research."""
         if torch.isnan(X).any() or torch.isinf(X).any():
             print("WARNING: NaN/Inf detected in Newton-Schulz input, returning scaled identity")
             return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
@@ -896,54 +910,86 @@ class MixedOptimizerV2(Optimizer):
         if norm < 1e-8:
             return X
 
-        X = X / (norm + 1e-10)
-        X = torch.clamp(X, min=-5.0, max=5.0)
+        X = X / (norm + 1e-8)
+        X = torch.clamp(X, min=-2.0, max=2.0)
 
-        for i in range(num_iters):
+        device = X.device
+        dtype = X.dtype
+
+        for i in range(min(num_iters, len(self.optimized_ns_coefficients))):
             if use_optimized and i < len(self.optimized_ns_coefficients):
                 a, b, c = self.optimized_ns_coefficients[i]
 
-                X_squared = torch.matmul(X, X.transpose(-2, -1))
-                reg_strength = 1e-6
+                if X.shape[0] <= X.shape[1]:
+                    X_squared = torch.matmul(X, X.transpose(-2, -1))
+                else:
+                    X_squared = torch.matmul(X.transpose(-2, -1), X)
+
+                reg_strength = max(1e-6, 1e-4 / (i + 1))
                 if X_squared.shape[-1] == X_squared.shape[-2]:
-                    X_squared = X_squared + reg_strength * torch.eye(
-                        X_squared.shape[-1], device=X.device, dtype=X.dtype
-                    )
+                    X_squared = X_squared + reg_strength * torch.eye(X_squared.shape[-1], device=device, dtype=dtype)
 
-                X_cubed = torch.matmul(X_squared, X)
-                X_to_fifth = torch.matmul(X_squared, X_cubed)
+                try:
+                    if X.shape[0] <= X.shape[1]:
+                        X_cubed = torch.matmul(X_squared, X)
+                        X_to_fifth = torch.matmul(X_squared, X_cubed)
+                    else:
+                        X_cubed = torch.matmul(X, X_squared)
+                        X_to_fifth = torch.matmul(X_cubed, X_squared)
 
-                if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
-                    print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
-                    break
+                    if (
+                        torch.isnan(X_cubed).any()
+                        or torch.isinf(X_cubed).any()
+                        or torch.isnan(X_to_fifth).any()
+                        or torch.isinf(X_to_fifth).any()
+                    ):
+                        print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, using cubic fallback")
+                        X_new = 1.5 * X - 0.5 * torch.matmul(X_squared, X)
+                    else:
+                        X_new = a * X + b * X_cubed + c * X_to_fifth
 
-                X_new = a * X + b * X_cubed + c * X_to_fifth
+                except RuntimeError as e:
+                    print(f"WARNING: Newton-Schulz computation failed at iteration {i}: {e}, using cubic fallback")
+                    X_new = 1.5 * X - 0.5 * torch.matmul(X_squared, X)
             else:
-                X_squared = torch.matmul(X, X.transpose(-2, -1))
+                if X.shape[0] <= X.shape[1]:
+                    X_squared = torch.matmul(X, X.transpose(-2, -1))
+                else:
+                    X_squared = torch.matmul(X.transpose(-2, -1), X)
+
                 reg_strength = 1e-6
                 if X_squared.shape[-1] == X_squared.shape[-2]:
-                    X_squared = X_squared + reg_strength * torch.eye(
-                        X_squared.shape[-1], device=X.device, dtype=X.dtype
-                    )
+                    X_squared = X_squared + reg_strength * torch.eye(X_squared.shape[-1], device=device, dtype=dtype)
 
-                X_cubed = torch.matmul(X_squared, X)
-                X_new = (3 * X - X_cubed) / 2
+                if X.shape[0] <= X.shape[1]:
+                    X_cubed = torch.matmul(X_squared, X)
+                else:
+                    X_cubed = torch.matmul(X, X_squared)
+                X_new = 1.5 * X - 0.5 * X_cubed
 
-            X_new = torch.clamp(X_new, min=-10.0, max=10.0)
+            X_new = torch.clamp(X_new, min=-5.0, max=5.0)
 
-            if torch.norm(X_new - X, p="fro") < 1e-5:
+            diff_norm = torch.norm(X_new - X, p="fro")
+            if diff_norm < 1e-5:
                 X = X_new
                 break
 
             X = X_new
 
-            if torch.norm(X, p="fro") > 20.0:
-                print(f"WARNING: Newton-Schulz values becoming too large at iteration {i}, applying correction")
-                X = X / torch.norm(X, p="fro") * 2.0
+            current_norm = torch.norm(X, p="fro")
+            if current_norm > 10.0:
+                print(
+                    f"WARNING: Newton-Schulz values becoming large at iteration {i} (norm={current_norm:.4f}), applying stabilization"
+                )
+                X = X / current_norm * 1.0  # More conservative renormalization
+
+            if current_norm > 50.0:
+                print(f"ERROR: Newton-Schulz severe instability at iteration {i}, terminating early")
+                break
 
         if torch.isnan(X).any() or torch.isinf(X).any():
             print("WARNING: NaN/Inf in final Newton-Schulz result, returning scaled identity")
-            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
+            return torch.eye(X.shape[0], X.shape[1], device=device, dtype=dtype) * 0.1
 
         return X
 
@@ -969,7 +1015,7 @@ class MixedOptimizerV2(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            param = group["params"][0]  # Single parameter per group
+            param = group["params"][0]
             param_type = group["type"]
             lr = group["lr"]
             weight_decay = group["weight_decay"]

@@ -27,7 +27,7 @@
   "warmup_steps": 100,
   "weight_decay": 0.015,
   "momentum": 0.97,
-  "ns_iters": 5,
+  "ns_iters": 6,
   "beta1": 0.9,
   "beta2": 0.95,
   "grad_clip_norm": 1.0,

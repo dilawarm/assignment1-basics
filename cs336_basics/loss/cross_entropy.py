@@ -22,10 +22,18 @@ def cross_entropy(
     Returns:
         scalar cross-entropy loss averaged over the batch
     """
-    targets = targets.to(logits.device)
+    device = logits.device
+    dtype = logits.dtype
+
+    if targets.device != device:
+        targets = targets.to(device=device, non_blocking=True)
 
     batch_elements = logits.numel() // logits.size(-1)
     vocab_size = logits.size(-1)
+
+    if batch_elements == 0 or vocab_size == 0:
+        print("WARNING: Empty batch in cross_entropy, returning zero loss")
+        return torch.tensor(0.0, device=device, dtype=dtype)
 
     memory_threshold = 8 * 1024**3
     tensor_memory = batch_elements * vocab_size * 4
@@ -37,6 +45,10 @@ def cross_entropy(
         logits_flat = logits.view(-1, vocab_size)
         targets_flat = targets.view(-1)
 
+        assert logits_flat.device == targets_flat.device, (
+            f"Device mismatch: logits on {logits_flat.device}, targets on {targets_flat.device}"
+        )
+
         loss = F.cross_entropy(logits_flat, targets_flat, reduction="mean")
 
         if torch.isfinite(loss):
@@ -46,6 +58,13 @@ def cross_entropy(
         if "out of memory" in str(e):
             print("OOM in standard path, falling back to chunked processing")
             return _chunked_cross_entropy(logits, targets)
+        elif "device" in str(e).lower():
+            print(f"Device mismatch error in cross_entropy: {e}")
+            targets = targets.to(device=device, dtype=torch.long)
+            logits_flat = logits.view(-1, vocab_size).to(device=device)
+            targets_flat = targets.view(-1).to(device=device)
+            loss = F.cross_entropy(logits_flat, targets_flat, reduction="mean")
+            return loss
         raise e
 
     return _stable_cross_entropy(logits, targets)
@@ -65,6 +84,12 @@ def _chunked_cross_entropy(
     Returns:
         scalar cross-entropy loss averaged over the batch
     """
+    device = logits.device
+    dtype = logits.dtype
+
+    if targets.device != device:
+        targets = targets.to(device=device, non_blocking=True)
+
     vocab_size = logits.size(-1)
     logits_flat = logits.view(-1, vocab_size)
     targets_flat = targets.view(-1)
@@ -78,10 +103,14 @@ def _chunked_cross_entropy(
         logits_chunk = logits_flat[i:end_idx]
         targets_chunk = targets_flat[i:end_idx]
 
+        assert logits_chunk.device == targets_chunk.device, (
+            f"Chunk device mismatch: logits on {logits_chunk.device}, targets on {targets_chunk.device}"
+        )
+
         chunk_loss = F.cross_entropy(logits_chunk, targets_chunk, reduction="sum")
         total_loss += chunk_loss.item()
 
-    return torch.tensor(total_loss / total_elements, device=logits.device, dtype=logits.dtype)
+    return torch.tensor(total_loss / total_elements, device=device, dtype=dtype)
 
 
 def _stable_cross_entropy(
