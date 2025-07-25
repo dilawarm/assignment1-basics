@@ -4,8 +4,6 @@ Data loading utilities for transformer training.
 
 from __future__ import annotations
 
-from typing import Tuple, Union
-
 import numpy as np
 import torch
 
@@ -17,7 +15,7 @@ def get_batch(
     device: str = "cuda",
     dtype: torch.dtype = torch.long,
     pin_memory: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Batch generation for language model training.
 
@@ -112,7 +110,7 @@ class BatchSampler:
                 (self.batch_size, self.context_length), dtype=torch.long, device=self.device
             )
 
-    def sample_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample a batch with memory access."""
         start_indices = np.random.randint(0, self.max_start_idx, size=self.batch_size)
 
