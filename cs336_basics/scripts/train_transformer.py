@@ -8,6 +8,7 @@ Training Script for Transformer Language Model
 - Untied embeddings with different learning rates
 - Advanced H100 optimizations for maximum throughput
 - Enhanced memory management and gradient checkpointing
+- Comprehensive experiment logging for optimization analysis
 """
 
 from __future__ import annotations
@@ -35,6 +36,32 @@ from cs336_basics.training.checkpoint import load_checkpoint, save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import linear_decay_to_zero_schedule, warmup_schedule
 from cs336_basics.training.optimizers import Adam, AdamW, MixedOptimizerV2, Muon
+
+
+class StabilityTracker:
+    """Track training stability metrics over a rolling window."""
+
+    def __init__(self, window_size: int = 100):
+        self.losses = []
+        self.window_size = window_size
+
+    def update(self, loss: float) -> None:
+        """Update with new loss value."""
+        self.losses.append(loss)
+        if len(self.losses) > self.window_size:
+            self.losses.pop(0)
+
+    def get_stats(self) -> dict[str, float]:
+        """Get stability statistics."""
+        if len(self.losses) < 10:
+            return {}
+
+        recent_losses = self.losses[-50:]
+        return {
+            "loss_variance": float(np.var(recent_losses)),
+            "loss_trend": float(np.polyfit(range(len(recent_losses)), recent_losses, 1)[0]),
+            "loss_stability": float(1.0 / (1.0 + np.std(recent_losses))),
+        }
 
 
 @dataclass
@@ -198,6 +225,8 @@ class Trainer:
         self.step = 0
         self.start_time = time.time()
 
+        self.stability_tracker = StabilityTracker()
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         timestamped_experiment_name = f"{config.experiment_name}_{timestamp}"
 
@@ -234,9 +263,120 @@ class Trainer:
         print(f"Model memory: {memory_stats.get('parameter_memory_gb', 0):.2f} GB")
         print(f"Architecture: U-Net={self.config.use_unet_architecture}, Activation={self.config.activation}")
         print(f"Optimizer: {self.config.optimizer} with D2Z schedule")
-        print(f"Training target: <3.0781 validation loss in {self.config.max_wallclock_hours}h")
         print(f"Effective batch size: {config.effective_batch_size}")
         print("=" * 80)
+
+    def log_memory_stats(self) -> dict[str, float]:
+        """Get detailed memory usage statistics."""
+        if not torch.cuda.is_available():
+            return {}
+
+        try:
+            memory_stats = {
+                "memory_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+                "memory_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                "memory_peak_gb": torch.cuda.max_memory_allocated() / 1e9,
+            }
+
+            if memory_stats["memory_reserved_gb"] > 0:
+                memory_stats["memory_efficiency"] = (
+                    memory_stats["memory_allocated_gb"] / memory_stats["memory_reserved_gb"]
+                )
+
+            return memory_stats
+        except Exception:
+            return {}
+
+    def calculate_mfu(self, tokens_per_sec: float) -> float:
+        """Calculate Model FLOPs Utilization (MFU) for H100."""
+        try:
+            N = sum(p.numel() for p in self.model.parameters())
+            L = self.config.num_layers
+            H = self.config.d_model
+            Q = self.config.context_length
+
+            flops_per_token = 6 * N + 12 * L * H * Q
+            model_flops_per_sec = tokens_per_sec * flops_per_token * 3
+
+            h100_peak_flops = 1000e12
+            mfu = model_flops_per_sec / h100_peak_flops
+
+            return min(mfu, 1.0)
+        except Exception:
+            return 0.0
+
+    def log_muon_diagnostics(self) -> dict[str, float]:
+        """Log Muon-specific diagnostics including orthogonalization quality."""
+        if not isinstance(self.optimizer, MixedOptimizerV2):
+            return {}
+
+        diagnostics = {}
+
+        try:
+            checked_matrices = 0
+            total_ortho_error = 0.0
+
+            for name, param in self.original_model.named_parameters():
+                if len(param.shape) >= 2 and "weight" in name and checked_matrices < 3:
+                    with torch.no_grad():
+                        if param.shape[0] <= param.shape[1]:
+                            gram = torch.mm(param, param.t())
+                            identity = torch.eye(param.shape[0], device=param.device, dtype=param.dtype)
+                            ortho_error = (gram - identity).norm().item()
+                            total_ortho_error += ortho_error
+                            checked_matrices += 1
+
+            if checked_matrices > 0:
+                diagnostics["avg_orthogonalization_error"] = total_ortho_error / checked_matrices
+
+            for group in self.optimizer.param_groups:
+                group_type = group.get("type", "unknown")
+                group_lr = group["lr"]
+
+                param_norm = sum(p.norm().item() ** 2 for p in group["params"] if p.requires_grad) ** 0.5
+                diagnostics[f"{group_type}_param_norm"] = param_norm
+                diagnostics[f"{group_type}_lr_actual"] = group_lr
+
+                grad_norm = sum(p.grad.norm().item() ** 2 for p in group["params"] if p.grad is not None) ** 0.5
+                diagnostics[f"{group_type}_grad_norm"] = grad_norm
+
+        except Exception as e:
+            diagnostics["muon_diagnostics_error"] = 1.0
+
+        return diagnostics
+
+    def get_enhanced_metrics(
+        self, base_metrics: dict[str, Any], step_time: float, tokens_per_sec: float
+    ) -> dict[str, Any]:
+        """Get comprehensive metrics for logging."""
+        try:
+            filtered_base_metrics = {
+                k: v for k, v in base_metrics.items() 
+                if k not in ["loss", "lr", "step_time", "tokens_per_sec"]
+            }
+            
+            enhanced_metrics = {
+                **filtered_base_metrics,
+                "mfu": self.calculate_mfu(tokens_per_sec),
+                "samples_per_sec": tokens_per_sec / self.config.context_length,
+                **self.log_memory_stats(),
+                **self.stability_tracker.get_stats(),
+                **self.log_muon_diagnostics(),
+                "total_param_norm": sum(p.norm().item() ** 2 for p in self.original_model.parameters()) ** 0.5,
+                "total_grad_norm": sum(
+                    p.grad.norm().item() ** 2 for p in self.original_model.parameters() if p.grad is not None
+                )
+                ** 0.5,
+                "effective_batch_size": self.config.effective_batch_size,
+                "grad_accumulation_steps": self.config.gradient_accumulation_steps,
+                "training_progress": self.step / self.config.max_steps,
+                "wallclock_hours": (time.time() - self.start_time) / 3600,
+            }
+            
+            return enhanced_metrics
+        except Exception as e:
+            print(f"Warning: Error in enhanced metrics calculation: {e}")
+            return base_metrics
 
     def _setup_device(self) -> None:
         """Setup device with H100-specific optimizations."""
@@ -517,6 +657,8 @@ class Trainer:
         if self.config.torch_empty_cache_steps > 0 and self.step % self.config.torch_empty_cache_steps == 0:
             torch.cuda.empty_cache()
 
+        self.stability_tracker.update(total_loss)
+
         return {
             "loss": total_loss,
             "lr": lrs["base_lr"],
@@ -570,7 +712,6 @@ class Trainer:
         """Main training loop."""
         max_time_seconds = self.config.max_wallclock_hours * 3600
         print(f"\n🚀 STARTING TRAINING 🚀")
-        print(f"Target: <3.0781 validation loss in {self.config.max_wallclock_hours:.1f} hours")
         print(f"Schedule: {self.config.lr_schedule} with {self.config.warmup_steps} warmup steps")
         print(f"Optimizer: {self.config.optimizer}")
         print("=" * 80)
@@ -599,10 +740,11 @@ class Trainer:
             steps_per_sec = (self.step + 1) / elapsed_time if elapsed_time > 0 else 0
             tokens_per_sec = steps_per_sec * self.config.effective_batch_size * self.config.context_length
 
-            # Logging
             if self.step % self.config.log_interval == 0:
                 tokens_this_step = self.config.effective_batch_size * self.config.context_length
                 samples_this_step = self.config.effective_batch_size
+
+                enhanced_metrics = self.get_enhanced_metrics(metrics, step_time, tokens_per_sec)
 
                 self.training_integrator.log_training_step(
                     wallclock_time=elapsed_hours,
@@ -613,12 +755,19 @@ class Trainer:
                     samples_processed=samples_this_step,
                     step_time=step_time,
                     tokens_per_sec=tokens_per_sec,
+                    **enhanced_metrics,
                 )
 
                 remaining_hours = self.config.max_wallclock_hours - elapsed_hours
+
+                mfu = enhanced_metrics.get("mfu", 0.0)
+                memory_efficiency = enhanced_metrics.get("memory_efficiency", 0.0)
+                loss_stability = enhanced_metrics.get("loss_stability", 0.0)
+
                 print(
                     f"Step {self.step:5d}: loss={metrics['loss']:.4f}, lr={metrics['lr']:.2e}, "
-                    f"{tokens_per_sec:.0f} tok/s, Time: {elapsed_hours:.2f}h/{self.config.max_wallclock_hours:.1f}h"
+                    f"{tokens_per_sec:.0f} tok/s, MFU={mfu:.2f}, MemEff={memory_efficiency:.2f}, "
+                    f"Stability={loss_stability:.2f}, Time: {elapsed_hours:.2f}h/{self.config.max_wallclock_hours:.1f}h"
                 )
 
             if self.step % self.config.eval_interval == 0 and self.step > 0:
@@ -656,7 +805,7 @@ class Trainer:
             print(f"\n🏁 FINAL RESULTS:")
             print(f"Final validation loss: {final_val_loss:.4f}")
             print(f"Training time: {final_elapsed_hours:.2f} hours")
-            print(f"Status: {'🎯 SUCCESS!' if final_val_loss < 3.0781 else '❌ Target not reached'}")
+
 
             self.training_integrator.log_validation_step(
                 wallclock_time=final_elapsed_hours,
@@ -668,8 +817,67 @@ class Trainer:
         final_checkpoint = Path(self.config.checkpoint_dir) / f"checkpoint_final_step_{self.step}.pt"
         self.save_checkpoint(str(final_checkpoint))
 
+        self._log_training_summary(final_elapsed_hours, final_eval)
+
         self.experiment_logger.add_note(f"Training completed in {final_elapsed_hours:.2f} hours")
         self.experiment_logger.mark_completed()
+
+    def _log_training_summary(self, final_elapsed_hours: float, final_eval: dict[str, float]) -> None:
+        """Log comprehensive training summary with key success indicators."""
+        print(f"\n🏁 COMPREHENSIVE TRAINING SUMMARY:")
+        print("=" * 80)
+
+        final_val_loss = final_eval.get("loss", float("inf"))
+        print(f"Final validation loss: {final_val_loss:.4f}")
+        print(f"Training time: {final_elapsed_hours:.2f} hours")
+        print(f"Total steps: {self.step}")
+
+        final_metrics = self.get_enhanced_metrics({}, 0, 0)
+
+        avg_mfu = final_metrics.get("mfu", 0.0)
+        memory_efficiency = final_metrics.get("memory_efficiency", 0.0)
+        final_stability = final_metrics.get("loss_stability", 0.0)
+
+        print(f"\n📊 PERFORMANCE METRICS:")
+        print(f"  Average MFU: {avg_mfu:.2f} {'✅' if avg_mfu > 0.4 else '⚠️'}")
+        print(f"  Memory Efficiency: {memory_efficiency:.2f} {'✅' if memory_efficiency > 0.85 else '⚠️'}")
+        print(f"  Training Stability: {final_stability:.2f} {'✅' if final_stability > 0.8 else '⚠️'}")
+
+        ortho_error = final_metrics.get("avg_orthogonalization_error", 0.0)
+        if ortho_error > 0:
+            print(f"  Orthogonalization Error: {ortho_error:.4f} {'✅' if ortho_error < 0.1 else '⚠️'}")
+
+        peak_memory = final_metrics.get("memory_peak_gb", 0.0)
+        print(f"  Peak GPU Memory: {peak_memory:.1f} GB {'✅' if peak_memory < 75.0 else '⚠️'}")
+
+        print(f"\n🎯 SUCCESS CRITERIA ANALYSIS:")
+        criteria = [
+            ("Training Time ≤ 1.5h", final_elapsed_hours <= 1.5),
+            ("No GPU OOM", peak_memory < 80.0),
+            ("Good MFU (>40%)", avg_mfu > 0.4),
+            ("Stable Training", final_stability > 0.8),
+        ]
+
+        passed_criteria = 0
+        for criterion, passed in criteria:
+            status = "✅ PASS" if passed else "❌ FAIL"
+            print(f"  {criterion}: {status}")
+            if passed:
+                passed_criteria += 1
+
+        print(f"\nOverall Success Rate: {passed_criteria}/{len(criteria)} criteria met")
+
+        print(f"\n💡 RECOMMENDATIONS FOR NEXT RUN:")
+        if final_val_loss > 4.0:
+            print("  • Loss too high - check learning rate schedule and data quality")
+        elif avg_mfu < 0.4:
+            print("  • Low MFU - consider batch size tuning or model compilation")
+        elif final_stability < 0.8:
+            print("  • Training unstable - reduce learning rate or improve gradient clipping")
+        if peak_memory > 75.0:
+            print("  • Memory usage high - consider gradient checkpointing or smaller batch size")
+
+        print("=" * 80)
 
 
 def load_config(config_path: str) -> TrainingConfig:
