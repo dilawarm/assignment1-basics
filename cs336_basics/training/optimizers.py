@@ -279,8 +279,8 @@ class Muon(Optimizer):
         if norm < 1e-8:
             return X
 
-        X = X / (norm + 1e-10)
-        X = torch.clamp(X, min=-5.0, max=5.0)
+        X = X / (norm + 1e-8)
+        X = X.clamp(min=-2.0, max=2.0)
 
         for i in range(num_iters):
             if use_optimized and i < len(self.optimized_ns_coefficients):
@@ -512,8 +512,8 @@ class MixedOptimizer(Optimizer):
         if norm < 1e-8:
             return X
 
-        X = X / (norm + 1e-10)
-        X = torch.clamp(X, min=-5.0, max=5.0)
+        X = X / (norm + 1e-8)
+        X = X.clamp(min=-2.0, max=2.0)
 
         for i in range(num_iters):
             if use_optimized and i < len(self.optimized_ns_coefficients):
@@ -911,7 +911,7 @@ class MixedOptimizerV2(Optimizer):
             return X
 
         X = X / (norm + 1e-8)
-        X = torch.clamp(X, min=-2.0, max=2.0)
+        X = X.clamp(min=-2.0, max=2.0)
 
         device = X.device
         dtype = X.dtype
@@ -981,7 +981,7 @@ class MixedOptimizerV2(Optimizer):
                 print(
                     f"WARNING: Newton-Schulz values becoming large at iteration {i} (norm={current_norm:.4f}), applying stabilization"
                 )
-                X = X / current_norm * 1.0  # More conservative renormalization
+                X = X / current_norm * 1.0
 
             if current_norm > 50.0:
                 print(f"ERROR: Newton-Schulz severe instability at iteration {i}, terminating early")

@@ -68,12 +68,10 @@ class CustomFFN(nn.Module):
         """
         hidden = self.w1(x)
         activated = torch.relu(hidden)
-        activated = torch.clamp(activated, max=20.0)
+        activated = activated.clamp(max=20.0)
         squared = activated * activated
-        squared = torch.clamp(squared, max=400.0)
-
+        squared = squared.clamp(max=400.0)
         output = self.w2(squared)
-
         return output
 
     def extra_repr(self) -> str:
