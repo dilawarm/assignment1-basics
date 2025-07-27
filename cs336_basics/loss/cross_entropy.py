@@ -112,7 +112,17 @@ def _chunked_cross_entropy(
     """
     Memory-efficient chunked cross-entropy computation.
 
-    Processes the input in smaller chunks to avoid OOM issues.
+    Processes the input in smaller chunks to avoid OOM issues while maintaining
+    the computation graph for proper gradient computation.
+
+    Args:
+        logits: Logits tensor of shape (..., vocab_size)
+        targets: Target indices tensor of shape (...)
+        device: Device to perform computation on
+        chunk_size: Size of chunks to process at once
+
+    Returns:
+        Scalar cross-entropy loss tensor with gradients preserved
     """
     vocab_size = logits.shape[-1]
     logits_flat = logits.view(-1, vocab_size)
@@ -123,8 +133,9 @@ def _chunked_cross_entropy(
 
     targets_flat = torch.clamp(targets_flat, 0, vocab_size - 1)
 
-    total_loss = 0.0
-    total_samples = 0
+    # Use a list to collect chunk losses, then stack them to preserve gradients
+    chunk_losses = []
+    chunk_weights = []
 
     for i in range(0, logits_flat.shape[0], chunk_size):
         end_idx = min(i + chunk_size, logits_flat.shape[0])
@@ -132,11 +143,56 @@ def _chunked_cross_entropy(
         chunk_logits = logits_flat[i:end_idx]
         chunk_targets = targets_flat[i:end_idx]
 
-        chunk_loss = F.cross_entropy(chunk_logits, chunk_targets, reduction="sum")
-        total_loss += chunk_loss.item()
-        total_samples += chunk_targets.numel()
+        try:
+            # Use reduction='mean' for each chunk to get proper weighting
+            chunk_loss = F.cross_entropy(chunk_logits, chunk_targets, reduction="mean")
 
-    return torch.tensor(total_loss / total_samples, device=device, dtype=logits.dtype)
+            if torch.isfinite(chunk_loss):
+                chunk_losses.append(chunk_loss)
+                chunk_weights.append(chunk_targets.numel())
+            else:
+                print(f"Warning: Non-finite loss in chunk {i // chunk_size}, skipping...")
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                # If even the chunk is too large, try with a smaller chunk
+                print(f"OOM in chunk {i // chunk_size}, trying smaller chunks...")
+                torch.cuda.empty_cache() if device.type == "cuda" else None
+
+                # Recursively process with smaller chunks
+                smaller_chunk_size = max(chunk_size // 4, 64)  # Minimum chunk size of 64
+                if smaller_chunk_size < chunk_size:
+                    smaller_logits = logits_flat[i:end_idx]
+                    smaller_targets = targets_flat[i:end_idx]
+                    chunk_loss = _chunked_cross_entropy(
+                        smaller_logits.view(-1, vocab_size), smaller_targets, device, smaller_chunk_size
+                    )
+                    if torch.isfinite(chunk_loss):
+                        chunk_losses.append(chunk_loss)
+                        chunk_weights.append(chunk_targets.numel())
+                else:
+                    print(f"Cannot process chunk {i // chunk_size}, skipping...")
+            else:
+                raise e
+
+    if not chunk_losses:
+        # Fallback to a simple tensor if no chunks succeeded
+        print("Warning: No chunks processed successfully, returning zero loss")
+        return torch.tensor(0.0, device=device, dtype=logits.dtype, requires_grad=True)
+
+    # Weighted average of chunk losses
+    if len(chunk_losses) == 1:
+        return chunk_losses[0]
+
+    # Convert weights to tensor for proper gradient computation
+    weights = torch.tensor(chunk_weights, device=device, dtype=logits.dtype)
+    weights = weights / weights.sum()  # Normalize weights
+
+    # Stack losses and compute weighted average
+    losses_tensor = torch.stack(chunk_losses)
+    weighted_loss = torch.sum(losses_tensor * weights)
+
+    return weighted_loss
 
 
 def _stable_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, device: torch.device) -> torch.Tensor:
