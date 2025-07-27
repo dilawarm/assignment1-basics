@@ -1390,6 +1390,11 @@ class Trainer:
 
     def train(self) -> None:
         """Training loop with comprehensive monitoring and optimization."""
+        # Ensure step is an integer
+        if not isinstance(self.step, int):
+            print(f"⚠️ Warning: self.step was {type(self.step)}, converting to int")
+            self.step = int(self.step) if isinstance(self.step, (int, float)) else 0
+        
         max_time_seconds = self.config.max_wallclock_hours * 3600
         best_val_loss = float("inf")
 
@@ -1454,7 +1459,7 @@ class Trainer:
                 status_emoji = "🔥" if metrics["loss"] < 4.0 else "⚡" if metrics["loss"] < 5.0 else "🚀"
 
                 print(
-                    f"{status_emoji} Step {self.step:5d}: "
+                    f"{status_emoji} Step {step_number:5d}: "
                     f"loss={metrics['loss']:.4f}, lr={metrics['lr']:.2e}, "
                     f"{tokens_per_sec:.0f} tok/s, MFU={mfu:.2f}, "
                     f"MemEff={memory_efficiency:.2f}, Stab={stability_score:.2f}, "
@@ -1477,18 +1482,21 @@ class Trainer:
                         best_val_loss = val_loss
                         status = "🏆 NEW BEST!"
 
-                        best_path = Path(self.config.checkpoint_dir) / f"best_model_step_{self.step}.pt"
+                        step_number = int(self.step) if isinstance(self.step, (int, float)) else 0
+                        best_path = Path(self.config.checkpoint_dir) / f"best_model_step_{step_number}.pt"
                         self.save_checkpoint(str(best_path))
                     else:
                         status = ""
 
+                    step_number = int(self.step) if isinstance(self.step, (int, float)) else 0
                     print(
-                        f"📊 Eval Step {self.step}: val_loss={val_loss:.4f}, "
+                        f"📊 Eval Step {step_number}: val_loss={val_loss:.4f}, "
                         f"perplexity={eval_metrics['perplexity']:.2f} {status}"
                     )
 
             if self.step % self.config.save_interval == 0 and self.step > 0:
-                checkpoint_path = Path(self.config.checkpoint_dir) / f"checkpoint_step_{self.step}.pt"
+                step_number = int(self.step) if isinstance(self.step, (int, float)) else 0
+                checkpoint_path = Path(self.config.checkpoint_dir) / f"checkpoint_step_{step_number}.pt"
                 self.save_checkpoint(str(checkpoint_path))
 
             self.step += 1
@@ -1504,7 +1512,8 @@ class Trainer:
 
             print(f"🎯 Final validation loss: {final_val_loss:.4f}")
             print(f"⏱️  Training time: {final_elapsed_hours:.2f} hours")
-            print(f"📈 Total steps: {self.step}")
+            step_number = int(self.step) if isinstance(self.step, (int, float)) else 0
+            print(f"📈 Total steps: {step_number}")
 
             self.training_integrator.log_validation_step(
                 wallclock_time=final_elapsed_hours,
@@ -1513,7 +1522,8 @@ class Trainer:
                 perplexity=final_eval["perplexity"],
             )
 
-        final_checkpoint = Path(self.config.checkpoint_dir) / f"final_checkpoint_step_{self.step}.pt"
+        step_number = int(self.step) if isinstance(self.step, (int, float)) else 0
+        final_checkpoint = Path(self.config.checkpoint_dir) / f"final_checkpoint_step_{step_number}.pt"
         self.save_checkpoint(str(final_checkpoint))
 
         self._log_final_summary(final_elapsed_hours, final_eval)
@@ -1537,7 +1547,8 @@ class Trainer:
                 print(f"📉 Need to improve by: {remaining:.4f}")
 
         print(f"⏱️  Training Time: {elapsed_hours:.2f} / {self.config.max_wallclock_hours:.1f} hours")
-        print(f"📈 Steps Completed: {self.step} / {self.config.max_steps}")
+        step_number = int(self.step) if isinstance(self.step, (int, float)) else 0
+        print(f"📈 Steps Completed: {step_number} / {self.config.max_steps}")
 
         # Get comprehensive stability statistics
         final_metrics = self._get_memory_stats()
