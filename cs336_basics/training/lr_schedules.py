@@ -38,6 +38,72 @@ def cosine_learning_rate_schedule(
         return min_learning_rate
 
 
+def aggressive_cosine_schedule(
+    iteration: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    total_iters: int,
+    peak_ratio: float = 0.15,
+    fast_decay_ratio: float = 0.4,
+) -> float:
+    """
+    Aggressive cosine learning rate schedule for fast convergence within time constraints.
+
+    This schedule is designed to:
+    1. Warm up very quickly to high learning rates
+    2. Maintain high learning rates for rapid initial progress
+    3. Use fast decay to quickly reach stable convergence
+    4. Fine-tune with lower learning rates for final performance
+
+    Args:
+        iteration: current iteration number
+        max_learning_rate: maximum learning rate
+        min_learning_rate: minimum learning rate
+        warmup_iters: number of warmup iterations (should be small)
+        total_iters: total number of training iterations
+        peak_ratio: ratio of training spent at near-peak learning rates
+        fast_decay_ratio: ratio of training spent in fast decay phase
+
+    Returns:
+        learning rate for the current iteration
+    """
+    if iteration < warmup_iters:
+        if iteration == 0:
+            return max_learning_rate * 0.01
+
+        warmup_progress = iteration / warmup_iters
+        warmup_factor = 1 - math.exp(-4 * warmup_progress)
+
+        baseline_lr = max_learning_rate * 0.005
+        warmup_lr = max_learning_rate * warmup_factor
+
+        return max(baseline_lr, warmup_lr)
+
+    remaining_iters = total_iters - warmup_iters
+    post_warmup_iter = iteration - warmup_iters
+
+    peak_iters = int(remaining_iters * peak_ratio)
+    if post_warmup_iter < peak_iters:
+        modulation = 1.0 - 0.05 * (1 - math.cos(2 * math.pi * post_warmup_iter / peak_iters))
+        return max_learning_rate * modulation
+
+    fast_decay_iters = int(remaining_iters * fast_decay_ratio)
+    if post_warmup_iter < peak_iters + fast_decay_iters:
+        decay_progress = (post_warmup_iter - peak_iters) / fast_decay_iters
+        decay_factor = 0.5 * (1 + math.cos(math.pi * decay_progress))
+        target_lr = min_learning_rate + 0.3 * (max_learning_rate - min_learning_rate)
+        return target_lr + (max_learning_rate - target_lr) * decay_factor
+
+    fine_tune_start = peak_iters + fast_decay_iters
+    fine_tune_progress = (post_warmup_iter - fine_tune_start) / (remaining_iters - fine_tune_start)
+    fine_tune_progress = min(fine_tune_progress, 1.0)
+
+    start_lr = min_learning_rate + 0.3 * (max_learning_rate - min_learning_rate)
+    final_decay_factor = 0.5 * (1 + math.cos(math.pi * fine_tune_progress))
+    return min_learning_rate + (start_lr - min_learning_rate) * final_decay_factor
+
+
 def improved_cosine_schedule(
     iteration: int,
     max_learning_rate: float,
@@ -79,6 +145,80 @@ def improved_cosine_schedule(
 
         cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
         return min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_factor
+
+
+def linear_decay_to_zero_schedule(
+    iteration: int,
+    max_learning_rate: float,
+    warmup_iters: int,
+    total_iters: int,
+) -> float:
+    """
+    Linear Decay to Zero (D2Z) learning rate schedule from ICLR 2025.
+
+    This schedule significantly outperforms cosine decay for LLMs by optimally
+    balancing early training (moving away from initial conditions) and late
+    training (averaging over more updates to mitigate gradient noise).
+
+    Benefits:
+    - 60% compute savings compared to cosine decay with 10x minimum
+    - Better final performance at compute-optimal dataset sizes
+    - Simpler and more stable than cosine schedules
+
+    Args:
+        iteration: current iteration number
+        max_learning_rate: maximum learning rate after warmup
+        warmup_iters: number of warmup iterations
+        total_iters: total number of training iterations
+
+    Returns:
+        learning rate for the current iteration
+    """
+    if iteration < warmup_iters:
+        return max_learning_rate * iteration / warmup_iters
+    elif iteration <= total_iters:
+        remaining_iters = total_iters - warmup_iters
+        progress = (iteration - warmup_iters) / remaining_iters
+        return max_learning_rate * (1.0 - progress)
+    else:
+        return 0.0
+
+
+def warmup_schedule(
+    iteration: int,
+    max_learning_rate: float,
+    warmup_iters: int,
+    total_iters: int,
+    warmup_type: str = "linear",
+) -> float:
+    """
+    Warmup with multiple warmup strategies.
+
+    Args:
+        iteration: current iteration number
+        max_learning_rate: maximum learning rate after warmup
+        warmup_iters: number of warmup iterations
+        total_iters: total number of training iterations
+        warmup_type: "linear", "cosine", or "exponential"
+
+    Returns:
+        learning rate for the current iteration
+    """
+    if iteration < warmup_iters:
+        if warmup_type == "linear":
+            warmup_factor = iteration / warmup_iters
+        elif warmup_type == "cosine":
+            warmup_factor = 0.5 * (1 - math.cos(math.pi * iteration / warmup_iters))
+        elif warmup_type == "exponential":
+            warmup_factor = 1 - math.exp(-6 * iteration / warmup_iters)
+        else:
+            warmup_factor = iteration / warmup_iters
+
+        return max_learning_rate * warmup_factor
+    else:
+        remaining_iters = total_iters - warmup_iters
+        progress = (iteration - warmup_iters) / remaining_iters
+        return max_learning_rate * (1.0 - progress)
 
 
 def exponential_decay_schedule(
@@ -234,6 +374,12 @@ def get_scheduler(
         def scheduler(iteration):
             return cosine_learning_rate_schedule(
                 iteration, max_lr, min_lr, warmup_steps, total_steps or warmup_steps * 10
+            )
+    elif scheduler_type == "aggressive":
+
+        def scheduler(iteration):
+            return aggressive_cosine_schedule(
+                iteration, max_lr, min_lr, warmup_steps, total_steps or warmup_steps * 10, **kwargs
             )
     elif scheduler_type == "improved_cosine":
 
