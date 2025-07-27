@@ -258,10 +258,10 @@ class Muon(Optimizer):
 
     def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
         """
-        Apply Newton-Schulz iterations to approximate orthogonalization with optimized coefficients.
+        Apply Newton-Schulz iterations for matrix orthogonalization.
 
-        The optimized method uses different polynomial coefficients for each iteration step,
-        providing better balance between steepness and noise reduction.
+        Based on YouJiacheng's 6-step method with proper mathematical implementation.
+        Reference: https://docs.modula.systems/algorithms/newton-schulz/
 
         Args:
             X: Input matrix to orthogonalize
@@ -271,64 +271,102 @@ class Muon(Optimizer):
         Returns:
             Orthogonalized matrix
         """
+        # Input validation
         if torch.isnan(X).any() or torch.isinf(X).any():
-            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning identity")
-            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype)
+            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning scaled identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
 
+        # Handle degenerate cases
         norm = torch.norm(X, p="fro")
         if norm < 1e-8:
             return X
 
-        X = X / (norm + 1e-8)
-        X = X.clamp(min=-2.0, max=2.0)
+        # Determine if we need to transpose for efficiency
+        transpose = X.shape[1] > X.shape[0]
+        if transpose:
+            X = X.transpose(-2, -1)
 
-        for i in range(num_iters):
-            if use_optimized and i < len(self.optimized_ns_coefficients):
-                a, b, c = self.optimized_ns_coefficients[i]
+        # Critical: Proper normalization as per Newton-Schulz theory
+        # This ensures singular values lie in the convergence region
+        X = X / torch.norm(X, p="fro")
 
-                X_squared = torch.matmul(X, X.transpose(-2, -1))
+        # Apply the iterative orthogonalization
+        device = X.device
+        dtype = X.dtype
 
-                reg_strength = 1e-6
-                if X_squared.shape[-1] == X_squared.shape[-2]:
-                    X_squared = X_squared + reg_strength * torch.eye(
-                        X_squared.shape[-1], device=X.device, dtype=X.dtype
-                    )
+        # Use YouJiacheng's proven coefficients if optimized=True
+        if use_optimized:
+            abc_list = self.optimized_ns_coefficients[: min(num_iters, len(self.optimized_ns_coefficients))]
+        else:
+            # Fallback to standard cubic Newton-Schulz: f(x) = 1.5x - 0.5x³
+            abc_list = [(1.5, -0.5, 0.0)] * num_iters
 
-                X_cubed = torch.matmul(X_squared, X)
-                X_to_fifth = torch.matmul(X_squared, X_cubed)
+        for i, (a, b, c) in enumerate(abc_list):
+            try:
+                # Compute A = X^T @ X (Gram matrix)
+                A = torch.matmul(X.transpose(-2, -1), X)
 
-                if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
-                    print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
+                # Add small regularization for numerical stability
+                reg = 1e-7 * torch.eye(A.shape[-1], device=device, dtype=dtype)
+                A = A + reg
+
+                # Newton-Schulz iteration: X := X @ (aI + bA + cA²)
+                # This corresponds to the polynomial f(x) = ax + bx³ + cx⁵
+                I = torch.eye(A.shape[-1], device=device, dtype=dtype)
+
+                if c != 0.0:
+                    # Full quintic: X @ (aI + bA + cA²)
+                    A_squared = torch.matmul(A, A)
+                    update_matrix = a * I + b * A + c * A_squared
+                else:
+                    # Cubic only: X @ (aI + bA)
+                    update_matrix = a * I + b * A
+
+                X_new = torch.matmul(X, update_matrix)
+
+                # Check for numerical issues
+                if torch.isnan(X_new).any() or torch.isinf(X_new).any():
+                    print(f"WARNING: NaN/Inf in Newton-Schulz iteration {i}, stopping early")
                     break
 
-                X_new = a * X + b * X_cubed + c * X_to_fifth
-            else:
-                X_squared = torch.matmul(X, X.transpose(-2, -1))
+                # Check convergence
+                diff_norm = torch.norm(X_new - X, p="fro")
+                if diff_norm < 1e-6:
+                    X = X_new
+                    break
 
-                reg_strength = 1e-6
-                if X_squared.shape[-1] == X_squared.shape[-2]:
-                    X_squared = X_squared + reg_strength * torch.eye(
-                        X_squared.shape[-1], device=X.device, dtype=X.dtype
-                    )
-
-                X_cubed = torch.matmul(X_squared, X)
-                X_new = (3 * X - X_cubed) / 2
-
-            X_new = torch.clamp(X_new, min=-10.0, max=10.0)
-
-            if torch.norm(X_new - X, p="fro") < 1e-5:
                 X = X_new
-                break
 
-            X = X_new
+                # Stability check with proper threshold
+                current_norm = torch.norm(X, p="fro")
+                if current_norm > 3.0:  # Conservative threshold based on theory
+                    print(f"WARNING: Newton-Schulz values becoming large at iteration {i} (norm={current_norm:.4f})")
+                    # Renormalize to maintain stability
+                    X = X / current_norm
 
-            if torch.norm(X, p="fro") > 20.0:
-                print(f"WARNING: Newton-Schulz values becoming too large at iteration {i}, applying correction")
-                X = X / torch.norm(X, p="fro") * 2.0
+                if current_norm > 10.0:  # Hard limit for safety
+                    print(f"ERROR: Newton-Schulz severe instability at iteration {i}, terminating")
+                    break
 
+            except RuntimeError as e:
+                print(f"WARNING: Newton-Schulz computation failed at iteration {i}: {e}")
+                # Fallback to simple cubic iteration
+                try:
+                    A = torch.matmul(X.transpose(-2, -1), X)
+                    I = torch.eye(A.shape[-1], device=device, dtype=dtype)
+                    X = torch.matmul(X, 1.5 * I - 0.5 * A)
+                except:
+                    print("WARNING: Even cubic fallback failed, returning current state")
+                    break
+
+        # Restore original orientation
+        if transpose:
+            X = X.transpose(-2, -1)
+
+        # Final validation
         if torch.isnan(X).any() or torch.isinf(X).any():
             print("WARNING: NaN/Inf in final Newton-Schulz result, returning scaled identity")
-            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
+            return torch.eye(X.shape[0], X.shape[1], device=device, dtype=dtype) * 0.1
 
         return X
 
@@ -502,66 +540,58 @@ class MixedOptimizer(Optimizer):
 
     def newton_schulz_orthogonalize(self, X: torch.Tensor, num_iters: int, use_optimized: bool = True) -> torch.Tensor:
         """
-        Apply Newton-Schulz iterations with optimized coefficients (copied from Muon class).
+        Apply Newton-Schulz iterations for matrix orthogonalization.
+
+        Based on mathematically sound implementation following proper Newton-Schulz theory.
         """
         if torch.isnan(X).any() or torch.isinf(X).any():
-            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning identity")
-            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype)
+            print("WARNING: NaN/Inf detected in Newton-Schulz input, returning scaled identity")
+            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
 
         norm = torch.norm(X, p="fro")
         if norm < 1e-8:
             return X
 
-        X = X / (norm + 1e-8)
-        X = X.clamp(min=-2.0, max=2.0)
+        # Proper normalization for convergence
+        X = X / norm
 
-        for i in range(num_iters):
-            if use_optimized and i < len(self.optimized_ns_coefficients):
-                a, b, c = self.optimized_ns_coefficients[i]
+        device = X.device
+        dtype = X.dtype
 
-                X_squared = torch.matmul(X, X.transpose(-2, -1))
+        for i in range(min(num_iters, 3)):  # Limit iterations for stability
+            try:
+                # Standard cubic Newton-Schulz: f(x) = 1.5x - 0.5x³
+                A = torch.matmul(X.transpose(-2, -1), X)
+                I = torch.eye(A.shape[-1], device=device, dtype=dtype)
 
-                reg_strength = 1e-6
-                if X_squared.shape[-1] == X_squared.shape[-2]:
-                    X_squared = X_squared + reg_strength * torch.eye(
-                        X_squared.shape[-1], device=X.device, dtype=X.dtype
-                    )
+                # Add minimal regularization
+                A = A + 1e-7 * I
 
-                X_cubed = torch.matmul(X_squared, X)
-                X_to_fifth = torch.matmul(X_squared, X_cubed)
+                X_new = torch.matmul(X, 1.5 * I - 0.5 * A)
 
-                if torch.isnan(X_cubed).any() or torch.isinf(X_cubed).any():
-                    print(f"WARNING: NaN/Inf detected in Newton-Schulz iteration {i}, stopping early")
+                if torch.isnan(X_new).any() or torch.isinf(X_new).any():
+                    print(f"WARNING: NaN/Inf in Newton-Schulz iteration {i}, stopping")
                     break
 
-                X_new = a * X + b * X_cubed + c * X_to_fifth
-            else:
-                X_squared = torch.matmul(X, X.transpose(-2, -1))
+                # Check convergence
+                if torch.norm(X_new - X, p="fro") < 1e-6:
+                    X = X_new
+                    break
 
-                reg_strength = 1e-6
-                if X_squared.shape[-1] == X_squared.shape[-2]:
-                    X_squared = X_squared + reg_strength * torch.eye(
-                        X_squared.shape[-1], device=X.device, dtype=X.dtype
-                    )
-
-                X_cubed = torch.matmul(X_squared, X)
-                X_new = (3 * X - X_cubed) / 2
-
-            X_new = torch.clamp(X_new, min=-10.0, max=10.0)
-
-            if torch.norm(X_new - X, p="fro") < 1e-5:
                 X = X_new
+
+                # Conservative stability check
+                current_norm = torch.norm(X, p="fro")
+                if current_norm > 2.0:
+                    X = X / current_norm
+
+            except RuntimeError as e:
+                print(f"WARNING: Newton-Schulz failed at iteration {i}: {e}")
                 break
-
-            X = X_new
-
-            if torch.norm(X, p="fro") > 20.0:
-                print(f"WARNING: Newton-Schulz values becoming too large at iteration {i}, applying correction")
-                X = X / torch.norm(X, p="fro") * 2.0
 
         if torch.isnan(X).any() or torch.isinf(X).any():
             print("WARNING: NaN/Inf in final Newton-Schulz result, returning scaled identity")
-            return torch.eye(X.shape[0], X.shape[1], device=X.device, dtype=X.dtype) * 0.1
+            return torch.eye(X.shape[0], X.shape[1], device=device, dtype=dtype) * 0.1
 
         return X
 
@@ -686,8 +716,10 @@ class MixedOptimizer(Optimizer):
         if len(param.shape) >= 2:
             original_shape = param.shape
             if len(param.shape) > 2:
+                param_flat = param.reshape(param.shape[0], -1)
                 momentum_flat = momentum_buffer.reshape(momentum_buffer.shape[0], -1)
             else:
+                param_flat = param
                 momentum_flat = momentum_buffer
 
             try:
@@ -978,6 +1010,9 @@ class MixedOptimizerV2(Optimizer):
 
             current_norm = torch.norm(X, p="fro")
             if current_norm > 10.0:
+                print(
+                    f"WARNING: Newton-Schulz values becoming large at iteration {i} (norm={current_norm:.4f}), applying stabilization"
+                )
                 X = X / current_norm * 1.0
 
             if current_norm > 50.0:

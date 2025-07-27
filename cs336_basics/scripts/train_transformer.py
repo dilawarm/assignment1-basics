@@ -772,6 +772,16 @@ class Trainer:
                         with autocast(device_type=self.device.type, dtype=self.amp_dtype, cache_enabled=True):
                             logits = self.model(inputs)
 
+                            # Check for NaN/inf in logits before loss computation
+                            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                                print(
+                                    f"❌ NaN/Inf detected in logits at step {self.step}, accumulation {accumulation_step}"
+                                )
+                                self.consecutive_failures += 1
+                                if self.consecutive_failures >= self.config.max_consecutive_failures:
+                                    self.emergency_mode = True
+                                return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
+
                             if self.config.use_label_smoothing:
                                 loss = robust_cross_entropy(
                                     logits, targets, label_smoothing=self.config.label_smoothing
@@ -788,6 +798,16 @@ class Trainer:
                     else:
                         logits = self.model(inputs)
 
+                        # Check for NaN/inf in logits before loss computation
+                        if torch.isnan(logits).any() or torch.isinf(logits).any():
+                            print(
+                                f"❌ NaN/Inf detected in logits at step {self.step}, accumulation {accumulation_step}"
+                            )
+                            self.consecutive_failures += 1
+                            if self.consecutive_failures >= self.config.max_consecutive_failures:
+                                self.emergency_mode = True
+                            return {"loss": float("nan"), "lr": lrs["base_lr"], "training_stopped": True}
+
                         if self.config.use_label_smoothing:
                             loss = robust_cross_entropy(logits, targets, label_smoothing=self.config.label_smoothing)
                         else:
@@ -797,7 +817,7 @@ class Trainer:
                         loss.backward()
 
                     if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"❌ NaN/Inf loss at step {self.step}, accumulation {accumulation_step}")
+                        print(f"❌ NaN/Inf loss at step {self.step}, accumulation {accumulation_step}: {loss.item()}")
                         self.consecutive_failures += 1
                         if self.consecutive_failures >= self.config.max_consecutive_failures:
                             self.emergency_mode = True

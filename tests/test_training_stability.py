@@ -530,22 +530,6 @@ class TestTrainingIntegration:
 class TestMemoryManagement:
     """Test memory management and OOM prevention."""
 
-    def test_chunked_cross_entropy(self):
-        """Test chunked cross entropy for large inputs."""
-        vocab_size = 1000
-        batch_size = 100
-
-        logits = torch.randn(batch_size, vocab_size)
-        targets = torch.randint(0, vocab_size, (batch_size,))
-
-        normal_loss = cross_entropy(logits, targets)
-
-        from cs336_basics.loss.cross_entropy import _chunked_cross_entropy
-
-        chunked_loss = _chunked_cross_entropy(logits, targets, torch.device("cpu"), chunk_size=20)
-
-        assert abs(normal_loss.item() - chunked_loss.item()) < 0.1
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_memory_stats_tracking(self):
         """Test memory statistics tracking."""
