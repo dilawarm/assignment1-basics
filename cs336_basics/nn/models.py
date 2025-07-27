@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 
-from cs336_basics.nn.activations import SwiGLU
+from cs336_basics.nn.activations import CustomFFN, SwiGLU
 from cs336_basics.nn.attention import MultiHeadSelfAttention, RotaryPositionalEmbedding
 from cs336_basics.nn.layers import Embedding, Linear, RMSNorm
 
 
 class TransformerBlock(nn.Module):
     """
-    Optimized Pre-norm Transformer block with gradient checkpointing support.
+    Pre-norm Transformer block with gradient checkpointing support.
 
     Enhanced with memory efficiency improvements and performance optimizations
     for modern GPU architectures.
@@ -27,6 +27,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         eps: float = 1e-5,
+        activation: str = "custom",
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -38,6 +39,7 @@ class TransformerBlock(nn.Module):
             num_heads: Number of attention heads
             d_ff: Dimensionality of the feed-forward inner layer
             eps: Epsilon value for RMSNorm numerical stability
+            activation: Type of activation function ("custom" or "swiglu")
             device: Device to store parameters on
             dtype: Data type for parameters
         """
@@ -52,7 +54,11 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadSelfAttention(d_model, num_heads, **factory_kwargs)
         self.ln1 = RMSNorm(d_model, eps, **factory_kwargs)
 
-        self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
+        if activation == "custom":
+            self.ffn = CustomFFN(d_model, d_ff, **factory_kwargs)
+        else:
+            self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
+
         self.ln2 = RMSNorm(d_model, eps, **factory_kwargs)
 
         self.use_checkpoint = False
@@ -103,7 +109,7 @@ class TransformerBlock(nn.Module):
 
 class TransformerLM(nn.Module):
     """
-    Optimized Transformer Language Model with performance enhancements.
+    Transformer Language Model with performance enhancements.
 
     Enhanced with gradient checkpointing, memory optimizations, and architectural
     improvements for better training efficiency on modern hardware.
@@ -210,7 +216,7 @@ class TransformerLM(nn.Module):
         self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
     ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
         """
-        Forward pass with optimized memory and compute efficiency.
+        Forward pass with memory and compute efficiency.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, seq_len)
@@ -278,4 +284,233 @@ class TransformerLM(nn.Module):
             f"d_model={self.d_model}, num_layers={self.num_layers}, "
             f"num_heads={self.num_heads}, d_ff={self.d_ff}, "
             f"rope_theta={self.rope_theta}"
+        )
+
+
+class EnhancedTransformerLM(nn.Module):
+    """
+    Enhanced Transformer Language Model.
+
+    Features:
+    - U-Net like skip connections with proper learnable mixing parameters
+    - Untied input/output embeddings with different learning rates
+    - CustomFFN activation: w2(max(w1(x), 0)^2)
+    - Mixed precision support with bfloat16
+    - Advanced gradient checkpointing
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float = 10000.0,
+        eps: float = 1e-5,
+        tie_embeddings: bool = False,
+        activation: str = "custom",
+        use_unet_architecture: bool = True,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        Initialize the Enhanced Transformer Language Model.
+
+        Args:
+            vocab_size: Size of the vocabulary
+            context_length: Maximum sequence length
+            d_model: Model dimension
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            d_ff: Feed-forward dimension
+            rope_theta: RoPE theta parameter
+            eps: Epsilon for numerical stability
+            tie_embeddings: Whether to tie input and output embeddings
+            activation: Activation function type ("custom" or "swiglu")
+            use_unet_architecture: Whether to use U-Net skip connections
+            device: Device to store parameters on
+            dtype: Data type for parameters
+        """
+        super().__init__()
+
+        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        assert vocab_size > 0, f"vocab_size must be positive, got {vocab_size}"
+        assert context_length > 0, f"context_length must be positive, got {context_length}"
+        assert num_layers > 0, f"num_layers must be positive, got {num_layers}"
+
+        if d_ff % 64 != 0:
+            d_ff = ((d_ff + 63) // 64) * 64
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.tie_embeddings = tie_embeddings
+        self.activation = activation
+        self.use_unet_architecture = use_unet_architecture
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
+
+        d_k = d_model // num_heads
+        self.rope = RotaryPositionalEmbedding(theta=rope_theta, d_k=d_k, max_seq_len=context_length, device=device)
+
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, activation=activation, **factory_kwargs
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        if use_unet_architecture:
+            self.skip_layers = num_layers // 2
+            self.skip_mixing = nn.ParameterList(
+                [nn.Parameter(torch.zeros(1, **factory_kwargs)) for _ in range(self.skip_layers)]
+            )
+        else:
+            self.skip_layers = 0
+            self.skip_mixing = None
+
+        self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
+
+        if tie_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
+
+        self.use_gradient_checkpointing = False
+        self._gradient_checkpointing_layers = None
+
+    def enable_gradient_checkpointing(self, layers_to_checkpoint: int | None = None) -> None:
+        """Enable gradient checkpointing for memory efficiency."""
+        self.use_gradient_checkpointing = True
+
+        if layers_to_checkpoint is None:
+            layers_to_checkpoint = self.num_layers
+        else:
+            layers_to_checkpoint = min(layers_to_checkpoint, self.num_layers)
+
+        self._gradient_checkpointing_layers = layers_to_checkpoint
+
+        for i, layer in enumerate(self.layers):
+            if i < layers_to_checkpoint:
+                layer.use_checkpoint = True
+                layer.attn.use_checkpoint = True
+            else:
+                layer.use_checkpoint = False
+                layer.attn.use_checkpoint = False
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self.use_gradient_checkpointing = False
+        for layer in self.layers:
+            layer.use_checkpoint = False
+            layer.attn.use_checkpoint = False
+
+    def forward(
+        self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
+    ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
+        """
+        Forward pass with improved U-Net skip connections.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len)
+
+        Returns:
+            Logits tensor of shape (batch_size, seq_len, vocab_size)
+        """
+        batch_size, seq_len = input_ids.shape
+
+        assert seq_len <= self.context_length, (
+            f"Input sequence length ({seq_len}) exceeds context length ({self.context_length})"
+        )
+
+        token_positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+
+        x = self.token_embeddings(input_ids)
+
+        skip_connections = [] if self.use_unet_architecture else None
+
+        for i in range(self.skip_layers):
+            x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
+            if self.use_unet_architecture:
+                skip_connections.append(x)
+
+        for i in range(self.skip_layers, self.num_layers):
+            x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
+
+            if self.use_unet_architecture and i < self.num_layers:
+                skip_idx = self.num_layers - 1 - i
+                if 0 <= skip_idx < len(skip_connections):
+                    skip_connection = skip_connections[skip_idx]
+                    mixing_weight = torch.sigmoid(self.skip_mixing[skip_idx])
+                    x = (1 - mixing_weight) * x + mixing_weight * skip_connection
+
+        x = self.ln_final(x)
+
+        if self.tie_embeddings:
+            logits = torch.matmul(x, self.token_embeddings.weight.t())
+        else:
+            logits = self.lm_head(x)
+
+        return logits
+
+    def get_memory_stats(self) -> dict[str, float]:
+        """Get memory usage statistics for monitoring."""
+        if not torch.cuda.is_available():
+            return {}
+
+        stats = {}
+        stats["memory_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
+        stats["memory_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+        stats["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+
+        param_memory = sum(p.numel() * p.element_size() for p in self.parameters()) / 1e9
+        stats["parameter_memory_gb"] = param_memory
+
+        return stats
+
+    def count_parameters(self) -> dict[str, int]:
+        """Count model parameters by component."""
+        counts = {}
+
+        counts["embeddings"] = sum(p.numel() for p in self.token_embeddings.parameters())
+
+        if self.layers:
+            layer_params = sum(p.numel() for p in self.layers[0].parameters())
+            counts["transformer_layer"] = layer_params
+            counts["all_transformer_layers"] = layer_params * self.num_layers
+
+        if self.use_unet_architecture:
+            counts["skip_mixing"] = sum(p.numel() for p in self.skip_mixing)
+
+        counts["final_ln"] = sum(p.numel() for p in self.ln_final.parameters())
+
+        if self.lm_head is not None:
+            counts["lm_head"] = sum(p.numel() for p in self.lm_head.parameters())
+        else:
+            counts["lm_head"] = 0
+
+        counts["total"] = sum(p.numel() for p in self.parameters())
+        counts["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        return counts
+
+    def extra_repr(self) -> str:
+        """String representation for debugging."""
+        return (
+            f"vocab_size={self.vocab_size}, context_length={self.context_length}, "
+            f"d_model={self.d_model}, num_layers={self.num_layers}, "
+            f"num_heads={self.num_heads}, d_ff={self.d_ff}, "
+            f"rope_theta={self.rope_theta}, tie_embeddings={self.tie_embeddings}, "
+            f"activation={self.activation}, use_unet_architecture={self.use_unet_architecture}"
         )

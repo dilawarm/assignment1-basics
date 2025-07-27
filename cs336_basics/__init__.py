@@ -40,7 +40,7 @@ from cs336_basics.tokenization.bpe import train_bpe
 # Tokenization
 from cs336_basics.tokenization.tokenizer import Tokenizer
 from cs336_basics.training.checkpoint import load_checkpoint, save_checkpoint
-from cs336_basics.training.gradient_clipping import gradient_clipping
+from cs336_basics.training.gradient_clipping import advanced_gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
 
 # Training components
@@ -66,7 +66,7 @@ __all__ = [
     # Training
     "AdamW",
     "cosine_learning_rate_schedule",
-    "gradient_clipping",
+    "advanced_gradient_clipping",
     "save_checkpoint",
     "load_checkpoint",
     # Loss

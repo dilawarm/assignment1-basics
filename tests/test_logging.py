@@ -1,7 +1,7 @@
 """
 Tests for experiment logging functionality.
 
-These tests verify the basic functionality of the optimized experiment logging system.
+These tests verify the basic functionality of the experiment logging system.
 """
 
 import json

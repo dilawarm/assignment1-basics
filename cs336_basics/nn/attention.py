@@ -25,7 +25,7 @@ def scaled_dot_product_attention(
     """
     Scaled Dot-Product Attention with FlashAttention-2 optimization.
 
-    Uses PyTorch's optimized scaled_dot_product_attention when available for better
+    Uses PyTorch's scaled_dot_product_attention when available for better
     memory efficiency and performance, especially on modern GPUs like H100.
 
     Args:
@@ -33,7 +33,7 @@ def scaled_dot_product_attention(
         K: Key tensor of shape (..., n_keys, d_k)
         V: Value tensor of shape (..., n_values, d_v)
         mask: Optional attention mask
-        use_flash_attention: Whether to use optimized attention when available
+        use_flash_attention: Whether to use attention when available
 
     Returns:
         Output tensor with shape (..., n_queries, d_v)
@@ -57,7 +57,7 @@ def scaled_dot_product_attention(
 
 class RotaryPositionalEmbedding(nn.Module):
     """
-    Optimized Rotary Position Embedding (RoPE) implementation.
+    Rotary Position Embedding (RoPE) implementation.
 
     Enhanced with better memory efficiency and tensor core optimization.
     """
@@ -97,7 +97,7 @@ class RotaryPositionalEmbedding(nn.Module):
         token_positions: Int[torch.Tensor, "... seq_len"],
     ) -> Float[torch.Tensor, "... seq_len d_k"]:
         """
-        Apply rotary position embedding with optimized memory access patterns.
+        Apply rotary position embedding with memory access patterns.
 
         Args:
             x: Input tensor with arbitrary batch dimensions (..., seq_len, d_k)
@@ -125,7 +125,7 @@ class RotaryPositionalEmbedding(nn.Module):
 
 class MultiHeadSelfAttention(nn.Module):
     """
-    Optimized Causal Multi-Head Self-Attention with FlashAttention-2.
+    Causal Multi-Head Self-Attention with FlashAttention-2.
 
     Enhanced with memory-efficient implementations and better GPU utilization.
     """

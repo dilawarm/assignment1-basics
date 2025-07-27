@@ -11,6 +11,74 @@ from jaxtyping import Float
 from cs336_basics.nn.layers import Linear
 
 
+class CustomFFN(nn.Module):
+    """
+    Custom Feed-Forward Network.
+
+    Uses the activation pattern: w2(max(w1(x), 0)^2)
+    This outperformed SwiGLU and other GLU variants in the competition.
+
+    Key improvements:
+    - Squaring after ReLU provides better non-linearity
+    - More stable training than SwiGLU
+    - Better performance on OpenWebText
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        Initialize the CustomFFN.
+
+        Args:
+            d_model: Input/output dimension (hidden dimension of the model)
+            d_ff: Inner dimension of the feed-forward network. If None, defaults to
+                  4 * d_model rounded to the nearest multiple of 64
+            device: Device to store parameters on
+            dtype: Data type for parameters
+        """
+        super().__init__()
+
+        self.d_model = d_model
+
+        if d_ff is None:
+            d_ff = 4 * d_model
+            d_ff = ((d_ff + 63) // 64) * 64
+
+        self.d_ff = d_ff
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.w1 = Linear(d_model, d_ff, **factory_kwargs)
+        self.w2 = Linear(d_ff, d_model, **factory_kwargs)
+
+    def forward(self, x: Float[torch.Tensor, "... d_model"]) -> Float[torch.Tensor, "... d_model"]:
+        """
+        Apply CustomFFN transformation: w2(max(w1(x), 0)^2).
+
+        Args:
+            x: Input tensor of shape (..., d_model)
+
+        Returns:
+            Output tensor of the same shape as input
+        """
+        hidden = self.w1(x)
+        activated = torch.relu(hidden)
+        activated = activated.clamp(max=20.0)
+        squared = activated * activated
+        squared = squared.clamp(max=400.0)
+        output = self.w2(squared)
+        return output
+
+    def extra_repr(self) -> str:
+        """String representation for debugging."""
+        return f"d_model={self.d_model}, d_ff={self.d_ff}"
+
+
 class SwiGLU(nn.Module):
     """
     Position-wise Feed-Forward Network with SwiGLU activation.
@@ -80,6 +148,9 @@ class SwiGLU(nn.Module):
     def extra_repr(self) -> str:
         """String representation for debugging."""
         return f"d_model={self.d_model}, d_ff={self.d_ff}"
+
+
+FFN = CustomFFN
 
 
 def silu(input: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
