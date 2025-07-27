@@ -1,205 +1,512 @@
 """
-Gradient clipping utilities with advanced AdaGC support.
+Advanced Gradient Clipping Techniques for Training Stability
 
-This module provides both traditional gradient clipping and Adaptive Gradient Clipping (AdaGC)
-which tracks per-parameter gradient statistics for more stable training.
+This module implements state-of-the-art gradient clipping methods based on:
+- ZClip: Adaptive Spike Mitigation for LLM Pre-Training (2025)
+- AdaGC: Improving Training Stability for Large Language Model Pretraining (2025)
+- Best practices for preventing NaN/inf gradients in deep learning
 """
 
+from __future__ import annotations
+
 import math
-from typing import Dict, Iterable, Optional
+import warnings
+from collections import deque
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.clip_grad import clip_grad_norm_
+
+
+class ZClip:
+    """
+    ZClip: Adaptive gradient clipping using z-score based anomaly detection.
+
+    Proactively detects and mitigates gradient spikes before they cause training instability.
+    Based on "ZClip: Adaptive Spike Mitigation for LLM Pre-Training" (2025).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        window_size: int = 200,
+        z_threshold: float = 3.0,
+        min_threshold: float = 0.1,
+        max_threshold: float = 10.0,
+        ema_decay: float = 0.99,
+        warmup_steps: int = 100,
+        enable_logging: bool = True,
+    ):
+        """
+        Initialize ZClip adaptive gradient clipping.
+
+        Args:
+            model: The model to apply gradient clipping to
+            window_size: Size of the sliding window for gradient norm history
+            z_threshold: Z-score threshold for anomaly detection
+            min_threshold: Minimum clipping threshold
+            max_threshold: Maximum clipping threshold
+            ema_decay: Exponential moving average decay factor
+            warmup_steps: Number of warmup steps before full ZClip activation
+            enable_logging: Whether to enable detailed logging
+        """
+        self.model = model
+        self.window_size = window_size
+        self.z_threshold = z_threshold
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
+        self.ema_decay = ema_decay
+        self.warmup_steps = warmup_steps
+        self.enable_logging = enable_logging
+
+        # Gradient norm history
+        self.grad_norm_history = deque(maxlen=window_size)
+
+        # Statistics
+        self.mean_grad_norm = 0.0
+        self.var_grad_norm = 1.0
+        self.ema_mean = 0.0
+        self.ema_var = 1.0
+
+        # Counters
+        self.step_count = 0
+        self.spike_count = 0
+        self.total_clips = 0
+
+        # Current adaptive threshold
+        self.current_threshold = max_threshold
+
+    def compute_grad_norm(self, parameters: Union[torch.Tensor, List[torch.Tensor]]) -> float:
+        """Compute the global gradient norm."""
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+
+        total_norm = 0.0
+        param_count = 0
+
+        for p in parameters:
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(dtype=torch.float32)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+
+        if param_count == 0:
+            return 0.0
+
+        return math.sqrt(total_norm)
+
+    def update_statistics(self, grad_norm: float) -> None:
+        """Update gradient norm statistics."""
+        self.grad_norm_history.append(grad_norm)
+
+        # Update EMA statistics
+        if self.step_count == 0:
+            self.ema_mean = grad_norm
+            self.ema_var = 1.0
+        else:
+            delta = grad_norm - self.ema_mean
+            self.ema_mean += (1 - self.ema_decay) * delta
+            self.ema_var = self.ema_decay * self.ema_var + (1 - self.ema_decay) * delta * delta
+
+        # Update window-based statistics if we have enough history
+        if len(self.grad_norm_history) >= 20:
+            history_list = list(self.grad_norm_history)
+            self.mean_grad_norm = sum(history_list) / len(history_list)
+            self.var_grad_norm = sum((x - self.mean_grad_norm) ** 2 for x in history_list) / len(history_list)
+
+    def detect_anomaly(self, grad_norm: float) -> bool:
+        """Detect if current gradient norm is anomalous using z-score."""
+        if self.step_count < self.warmup_steps or len(self.grad_norm_history) < 20:
+            return False
+
+        # Use EMA statistics for more responsive detection
+        std_dev = math.sqrt(max(self.ema_var, 1e-8))
+        z_score = abs(grad_norm - self.ema_mean) / std_dev
+
+        return z_score > self.z_threshold
+
+    def compute_adaptive_threshold(self, grad_norm: float) -> float:
+        """Compute adaptive clipping threshold."""
+        if self.step_count < self.warmup_steps:
+            return self.max_threshold
+
+        if self.detect_anomaly(grad_norm):
+            # Use more conservative threshold for anomalies
+            threshold = max(self.ema_mean + 2 * math.sqrt(self.ema_var), self.min_threshold)
+            self.spike_count += 1
+        else:
+            # Use more permissive threshold for normal gradients
+            threshold = max(self.ema_mean + 3 * math.sqrt(self.ema_var), self.min_threshold)
+
+        # Clamp to reasonable bounds
+        threshold = min(max(threshold, self.min_threshold), self.max_threshold)
+
+        # Smooth threshold changes
+        if hasattr(self, "current_threshold"):
+            alpha = 0.1  # Smoothing factor
+            threshold = alpha * threshold + (1 - alpha) * self.current_threshold
+
+        return threshold
+
+    def clip_gradients(self, parameters: Union[torch.Tensor, List[torch.Tensor]]) -> Tuple[float, float]:
+        """
+        Apply ZClip adaptive gradient clipping.
+
+        Returns:
+            Tuple of (original_grad_norm, clipped_grad_norm)
+        """
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+
+        # Compute current gradient norm
+        grad_norm = self.compute_grad_norm(parameters)
+
+        # Update statistics
+        self.update_statistics(grad_norm)
+
+        # Compute adaptive threshold
+        threshold = self.compute_adaptive_threshold(grad_norm)
+        self.current_threshold = threshold
+
+        # Apply clipping if necessary
+        clipped_grad_norm = grad_norm
+        if grad_norm > threshold:
+            clip_grad_norm_(parameters, threshold)
+            clipped_grad_norm = threshold
+            self.total_clips += 1
+
+            if self.enable_logging and self.step_count % 100 == 0:
+                print(
+                    f"ZClip: Clipped grad_norm {grad_norm:.3f} -> {threshold:.3f} "
+                    f"(z-score: {abs(grad_norm - self.ema_mean) / math.sqrt(self.ema_var):.2f})"
+                )
+
+        self.step_count += 1
+        return grad_norm, clipped_grad_norm
+
+    def get_stats(self) -> Dict[str, float]:
+        """Get clipping statistics."""
+        spike_rate = self.spike_count / max(self.step_count, 1)
+        clip_rate = self.total_clips / max(self.step_count, 1)
+
+        return {
+            "zclip_threshold": self.current_threshold,
+            "zclip_mean_grad_norm": self.ema_mean,
+            "zclip_grad_norm_std": math.sqrt(self.ema_var),
+            "zclip_spike_rate": spike_rate,
+            "zclip_clip_rate": clip_rate,
+            "zclip_total_spikes": self.spike_count,
+            "zclip_total_clips": self.total_clips,
+        }
 
 
 class AdaptiveGradientClipper:
     """
-    Adaptive Gradient Clipping (AdaGC) implementation.
+    Enhanced AdaGC: Per-parameter adaptive gradient clipping.
 
-    Tracks exponential moving averages of gradient norms per parameter
-    and applies adaptive thresholds. Based on arXiv:2502.11034.
-
-    This prevents loss spikes more effectively than global gradient clipping.
+    Based on "AdaGC: Improving Training Stability for Large Language Model Pretraining" (2025).
+    Maintains separate adaptive thresholds for each parameter group.
     """
 
     def __init__(
         self,
         model: nn.Module,
         max_global_norm: float = 1.0,
-        beta: float = 0.95,
+        beta: float = 0.98,
         eps: float = 1e-8,
+        per_param_clipping: bool = True,
         device: Optional[torch.device] = None,
+        enable_logging: bool = True,
     ):
         """
-        Initialize AdaGC clipper.
+        Initialize enhanced AdaGC.
 
         Args:
-            model: Model to clip gradients for
+            model: The model to apply gradient clipping to
             max_global_norm: Maximum global gradient norm
-            beta: Exponential moving average decay
-            eps: Small value for numerical stability
-            device: Device to place moving averages on
+            beta: EMA decay factor for adaptive thresholds
+            eps: Small constant for numerical stability
+            per_param_clipping: Whether to use per-parameter adaptive clipping
+            device: Device to run computations on
+            enable_logging: Whether to enable detailed logging
         """
+        self.model = model
         self.max_global_norm = max_global_norm
         self.beta = beta
         self.eps = eps
+        self.per_param_clipping = per_param_clipping
         self.device = device or next(model.parameters()).device
+        self.enable_logging = enable_logging
 
-        self.moving_averages: Dict[str, torch.Tensor] = {}
+        # Parameter-specific adaptive thresholds
+        self.param_ema_norms = {}
+        self.param_thresholds = {}
         self.step_count = 0
+        self.total_clips = 0
 
-        for name, param in model.named_parameters():
+        # Initialize parameter tracking
+        self._initialize_param_tracking()
+
+    def _initialize_param_tracking(self) -> None:
+        """Initialize per-parameter tracking."""
+        for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.moving_averages[name] = torch.zeros(1, device=self.device)
+                self.param_ema_norms[name] = 0.0
+                self.param_thresholds[name] = self.max_global_norm
 
-    def update_moving_averages(self, model: nn.Module) -> None:
-        """Update moving averages of gradient norms."""
-        self.step_count += 1
+    def _update_param_threshold(self, name: str, grad_norm: float) -> float:
+        """Update adaptive threshold for a specific parameter."""
+        if name not in self.param_ema_norms:
+            self.param_ema_norms[name] = grad_norm
+            self.param_thresholds[name] = self.max_global_norm
+        else:
+            # Update EMA of gradient norm
+            self.param_ema_norms[name] = self.beta * self.param_ema_norms[name] + (1 - self.beta) * grad_norm
 
-        for name, param in model.named_parameters():
-            if param.grad is None or not param.requires_grad:
-                continue
+            # Compute adaptive threshold
+            ema_norm = self.param_ema_norms[name]
 
-            grad = param.grad.to(device=self.device)
+            # Use a multiple of the EMA norm as threshold, bounded by global max
+            adaptive_threshold = min(max(ema_norm * 2.0, self.max_global_norm * 0.1), self.max_global_norm)
 
-            param_grad_norm = torch.norm(grad, dtype=torch.float32)
+            self.param_thresholds[name] = adaptive_threshold
 
-            if name not in self.moving_averages:
-                self.moving_averages[name] = torch.zeros(1, device=self.device)
+        return self.param_thresholds[name]
 
-            self.moving_averages[name] = self.beta * self.moving_averages[name] + (1 - self.beta) * param_grad_norm
-
-    def clip_gradients(self, model: nn.Module) -> float:
+    def clip_gradients(self, model: Optional[nn.Module] = None) -> float:
         """
-        Apply adaptive gradient clipping.
+        Apply enhanced AdaGC gradient clipping.
 
         Returns:
-            The global gradient norm before clipping
+            The computed gradient norm after clipping
         """
-        self.update_moving_averages(model)
+        if model is None:
+            model = self.model
 
-        total_norm_squared = 0.0
-        param_count = 0
+        parameters = [p for p in model.parameters() if p.grad is not None]
+
+        if len(parameters) == 0:
+            return 0.0
+
+        # Compute global gradient norm
+        total_norm = 0.0
+        param_norms = {}
 
         for name, param in model.named_parameters():
-            if param.grad is None or not param.requires_grad:
-                continue
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(dtype=torch.float32).item()
+                param_norms[name] = param_norm
+                total_norm += param_norm**2
 
-            if param.grad.device != self.device:
-                param.grad = param.grad.to(device=self.device)
+        total_norm = math.sqrt(total_norm)
 
-            param_norm = torch.norm(param.grad, dtype=torch.float32)
-            total_norm_squared += param_norm.item() ** 2
-            param_count += 1
-
-        global_norm = math.sqrt(total_norm_squared) if param_count > 0 else 0.0
-
-        if global_norm > self.max_global_norm:
-            clip_coeff = self.max_global_norm / (global_norm + self.eps)
+        if self.per_param_clipping:
+            # Apply per-parameter adaptive clipping
+            any_clipped = False
 
             for name, param in model.named_parameters():
-                if param.grad is None or not param.requires_grad:
-                    continue
+                if param.grad is not None:
+                    param_norm = param_norms[name]
+                    threshold = self._update_param_threshold(name, param_norm)
 
-                bias_corrected_ma = self.moving_averages[name] / (1 - self.beta**self.step_count)
-                adaptive_threshold = bias_corrected_ma + self.eps
+                    if param_norm > threshold:
+                        scaling_factor = threshold / (param_norm + self.eps)
+                        param.grad.data.mul_(scaling_factor)
+                        any_clipped = True
 
-                param_norm = torch.norm(param.grad, dtype=torch.float32)
+            if any_clipped:
+                self.total_clips += 1
 
-                param_norm_scalar = param_norm.item()
-                adaptive_threshold_scalar = adaptive_threshold.item()
-
-                if param_norm_scalar > adaptive_threshold_scalar:
-                    local_clip_coeff = adaptive_threshold_scalar / (param_norm_scalar + self.eps)
-                    param.grad.mul_(min(clip_coeff, local_clip_coeff))
-                else:
-                    param.grad.mul_(clip_coeff)
-
-        return global_norm
-
-
-def gradient_clipping(
-    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, device: Optional[torch.device] = None
-) -> float:
-    """
-    Clip gradients by global L2 norm with robust device handling.
-
-    Args:
-        parameters: Model parameters with gradients
-        max_l2_norm: Maximum L2 norm for clipping
-        device: Device for computation (auto-detected if None)
-
-    Returns:
-        Global gradient norm before clipping
-    """
-    eps = 1e-8
-
-    param_list = list(parameters)
-
-    if device is None:
-        for param in param_list:
-            if param.grad is not None:
-                device = param.grad.device
-                break
+        # Apply global clipping as final safety net
+        if total_norm > self.max_global_norm:
+            clip_grad_norm_(parameters, self.max_global_norm)
+            final_norm = self.max_global_norm
+            self.total_clips += 1
         else:
-            device = torch.device("cpu")
+            final_norm = total_norm
 
-    total_norm_squared = torch.tensor(0.0, device=device, dtype=torch.float32)
-    param_count = 0
+        self.step_count += 1
 
-    for param in param_list:
-        if param.grad is not None:
-            if param.grad.device != device:
-                param.grad = param.grad.to(device=device)
+        if self.enable_logging and self.step_count % 100 == 0:
+            avg_threshold = sum(self.param_thresholds.values()) / len(self.param_thresholds)
+            print(f"AdaGC: Global norm {total_norm:.3f}, Avg param threshold {avg_threshold:.3f}")
 
-            param_norm = torch.norm(param.grad.data, dtype=torch.float32)
-            total_norm_squared += param_norm**2
-            param_count += 1
+        return final_norm
 
-    if param_count == 0:
-        return 0.0
+    def get_stats(self) -> Dict[str, float]:
+        """Get clipping statistics."""
+        if self.param_thresholds:
+            avg_threshold = sum(self.param_thresholds.values()) / len(self.param_thresholds)
+            max_threshold = max(self.param_thresholds.values())
+            min_threshold = min(self.param_thresholds.values())
+        else:
+            avg_threshold = max_threshold = min_threshold = self.max_global_norm
 
-    global_norm = torch.sqrt(total_norm_squared + eps)
+        clip_rate = self.total_clips / max(self.step_count, 1)
 
-    if global_norm > max_l2_norm:
-        clip_coeff = max_l2_norm / global_norm
-        for param in param_list:
-            if param.grad is not None:
-                param.grad.data.mul_(clip_coeff)
+        return {
+            "adagc_avg_threshold": avg_threshold,
+            "adagc_max_threshold": max_threshold,
+            "adagc_min_threshold": min_threshold,
+            "adagc_clip_rate": clip_rate,
+            "adagc_total_clips": self.total_clips,
+        }
 
-    return global_norm.item()
+
+class HybridGradientClipper:
+    """
+    Hybrid gradient clipping combining ZClip and AdaGC for maximum stability.
+
+    Uses ZClip for anomaly detection and spike prevention, and AdaGC for
+    fine-grained per-parameter control.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        zclip_config: Optional[Dict] = None,
+        adagc_config: Optional[Dict] = None,
+        enable_logging: bool = True,
+    ):
+        """
+        Initialize hybrid gradient clipping.
+
+        Args:
+            model: The model to apply gradient clipping to
+            zclip_config: Configuration for ZClip
+            adagc_config: Configuration for AdaGC
+            enable_logging: Whether to enable detailed logging
+        """
+        self.model = model
+        self.enable_logging = enable_logging
+
+        # Initialize ZClip with default or provided config
+        zclip_defaults = {
+            "window_size": 200,
+            "z_threshold": 2.5,  # More conservative for stability
+            "min_threshold": 0.1,
+            "max_threshold": 5.0,  # Lower max for better stability
+            "ema_decay": 0.99,
+            "warmup_steps": 100,
+            "enable_logging": enable_logging,
+        }
+        zclip_config = {**zclip_defaults, **(zclip_config or {})}
+        self.zclip = ZClip(model, **zclip_config)
+
+        # Initialize AdaGC with default or provided config
+        adagc_defaults = {
+            "max_global_norm": 1.0,
+            "beta": 0.98,
+            "eps": 1e-8,
+            "per_param_clipping": True,
+            "enable_logging": enable_logging,
+        }
+        adagc_config = {**adagc_defaults, **(adagc_config or {})}
+        self.adagc = AdaptiveGradientClipper(model, **adagc_config)
+
+        self.step_count = 0
+
+    def clip_gradients(self, model: Optional[nn.Module] = None) -> Tuple[float, float]:
+        """
+        Apply hybrid gradient clipping.
+
+        Returns:
+            Tuple of (original_norm, final_norm)
+        """
+        if model is None:
+            model = self.model
+
+        parameters = [p for p in model.parameters() if p.grad is not None]
+
+        if len(parameters) == 0:
+            return 0.0, 0.0
+
+        # First apply ZClip for anomaly detection and spike prevention
+        original_norm, zclip_norm = self.zclip.clip_gradients(parameters)
+
+        # Then apply AdaGC for fine-grained per-parameter control
+        final_norm = self.adagc.clip_gradients(model)
+
+        self.step_count += 1
+
+        if self.enable_logging and self.step_count % 100 == 0:
+            print(f"Hybrid Clipping: {original_norm:.3f} -> ZClip: {zclip_norm:.3f} -> AdaGC: {final_norm:.3f}")
+
+        return original_norm, final_norm
+
+    def get_stats(self) -> Dict[str, float]:
+        """Get comprehensive clipping statistics."""
+        stats = {}
+        stats.update(self.zclip.get_stats())
+        stats.update(self.adagc.get_stats())
+        stats["hybrid_step_count"] = self.step_count
+        return stats
 
 
 def advanced_gradient_clipping(
     model: nn.Module,
     max_global_norm: float = 1.0,
     use_adaptive: bool = True,
-    beta: float = 0.95,
-    eps: float = 1e-8,
-    adaptive_clipper: Optional[AdaptiveGradientClipper] = None,
+    clipper: Optional[Union[ZClip, AdaptiveGradientClipper, HybridGradientClipper]] = None,
 ) -> float:
     """
-    Apply advanced gradient clipping with optional AdaGC.
+    Advanced gradient clipping function with multiple strategies.
 
     Args:
-        model: Model to clip gradients for
-        max_global_norm: Maximum global gradient norm
-        use_adaptive: Whether to use AdaGC
-        beta: AdaGC exponential moving average decay
-        eps: Small value for numerical stability
-        adaptive_clipper: Pre-existing AdaGC clipper to reuse
+        model: The model to apply gradient clipping to
+        max_global_norm: Maximum global gradient norm for fallback clipping
+        use_adaptive: Whether to use adaptive clipping techniques
+        clipper: Pre-initialized clipper instance
 
     Returns:
-        Global gradient norm before clipping
+        The final gradient norm after clipping
     """
-    try:
-        if adaptive_clipper is not None:
-            return adaptive_clipper.clip_gradients(model)
-        elif use_adaptive:
-            temp_clipper = AdaptiveGradientClipper(model=model, max_global_norm=max_global_norm, beta=beta, eps=eps)
-            return temp_clipper.clip_gradients(model)
+    parameters = [p for p in model.parameters() if p.grad is not None]
+
+    if len(parameters) == 0:
+        return 0.0
+
+    if clipper is not None:
+        if isinstance(clipper, HybridGradientClipper):
+            _, final_norm = clipper.clip_gradients(model)
+            return final_norm
+        elif isinstance(clipper, ZClip):
+            _, final_norm = clipper.clip_gradients(parameters)
+            return final_norm
+        elif isinstance(clipper, AdaptiveGradientClipper):
+            return clipper.clip_gradients(model)
+
+    # Fallback to standard clipping
+    if use_adaptive:
+        # Use simple adaptive clipping based on gradient norm history
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in parameters]))
+        clip_coef = max_global_norm / (total_norm + 1e-6)
+
+        if clip_coef < 1.0:
+            for p in parameters:
+                p.grad.detach().mul_(clip_coef)
+            return max_global_norm
         else:
-            return gradient_clipping(model.parameters(), max_global_norm)
-    except Exception as e:
-        print(f"Advanced gradient clipping failed, using standard clipping: {e}")
-        return gradient_clipping(model.parameters(), max_global_norm)
+            return total_norm.item()
+    else:
+        # Standard gradient clipping
+        return clip_grad_norm_(parameters, max_global_norm)
+
+
+# Legacy function for backward compatibility
+def clip_gradients(model: nn.Module, max_norm: float = 1.0) -> float:
+    """
+    Simple gradient clipping function for backward compatibility.
+
+    Args:
+        model: The model to apply gradient clipping to
+        max_norm: Maximum gradient norm
+
+    Returns:
+        The gradient norm after clipping
+    """
+    warnings.warn(
+        "clip_gradients is deprecated. Use advanced_gradient_clipping instead.", DeprecationWarning, stacklevel=2
+    )
+    return advanced_gradient_clipping(model, max_norm, use_adaptive=False)
