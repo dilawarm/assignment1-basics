@@ -1017,6 +1017,9 @@ class Trainer:
             if self.step % self.config.log_interval == 0:
                 enhanced_metrics = self.get_enhanced_metrics(metrics, step_time)
 
+                # Remove step_time from enhanced_metrics to avoid duplicate parameter
+                log_metrics = {k: v for k, v in enhanced_metrics.items() if k != "step_time"}
+
                 self.training_integrator.log_training_step(
                     wallclock_time=elapsed_hours,
                     step=self.step,
@@ -1026,7 +1029,7 @@ class Trainer:
                     samples_processed=self.config.effective_batch_size,
                     step_time=step_time,
                     tokens_per_sec=tokens_per_sec,
-                    **enhanced_metrics,
+                    **log_metrics,
                 )
 
                 mfu = enhanced_metrics.get("mfu", 0.0)

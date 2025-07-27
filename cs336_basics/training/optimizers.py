@@ -978,9 +978,6 @@ class MixedOptimizerV2(Optimizer):
 
             current_norm = torch.norm(X, p="fro")
             if current_norm > 10.0:
-                print(
-                    f"WARNING: Newton-Schulz values becoming large at iteration {i} (norm={current_norm:.4f}), applying stabilization"
-                )
                 X = X / current_norm * 1.0
 
             if current_norm > 50.0:
