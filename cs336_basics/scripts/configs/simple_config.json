@@ -1,0 +1,35 @@
+{
+    "vocab_size": 32000,
+    "context_length": 256,
+    "num_layers": 4,
+    "d_model": 512,
+    "num_heads": 16,
+    "d_ff": 1344,
+    "rope_theta": 10000,
+    
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999],
+    
+    "max_learning_rate": 0.002,
+    "min_learning_rate": 0.00001,
+    "warmup_iters": 2000,
+    "cosine_cycle_iters": 40960,
+    
+    "training_set": "owt_train_tokens.npy",
+    "validation_set": "owt_valid_tokens.npy",
+    "tokenizer_vocab": "openwebtext_vocab.json",
+    "tokenizer_merges": "openwebtext_merges.pkl",
+    
+    "validation_step_interval": 500,
+    "checkpoint_step_interval": 10000,
+    "steps": 40960,
+    "batch_size": 32,
+    "gradient_clipping": 1.0,
+    
+    "device": "cuda",
+    "compile_model": true,
+    
+    "wandb_active": false,
+    "wandb_project": "cs336-assignment1",
+    "wandb_run": "simple_transformer_training"
+} 

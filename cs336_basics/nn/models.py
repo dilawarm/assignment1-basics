@@ -27,7 +27,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         eps: float = 1e-5,
-        activation: str = "custom",
+        activation: str = "swiglu",
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
