@@ -26,6 +26,7 @@ from cs336_basics.scripts.train_transformer import (
 from cs336_basics.training.gradient_clipping import (
     AdaptiveGradientClipper,
     advanced_gradient_clipping,
+    gradient_clipping,
 )
 from cs336_basics.training.lr_schedules import linear_decay_to_zero_schedule
 from cs336_basics.training.optimizers import MixedOptimizerV2, Muon
@@ -75,7 +76,7 @@ class TestDeviceManagement:
         loss = model(torch.randn(3, 10).cuda()).sum()
         loss.backward()
 
-        grad_norm = advanced_gradient_clipping(model, max_global_norm=1.0, use_adaptive=False)
+        grad_norm = gradient_clipping(model.parameters(), max_l2_norm=1.0)
         assert grad_norm >= 0
 
         total_norm = sum(p.grad.norm().item() ** 2 for p in model.parameters()) ** 0.5
@@ -91,7 +92,7 @@ class TestAdaptiveGradientClipping:
 
         clipper = AdaptiveGradientClipper(model, max_global_norm=1.0)
 
-        assert len(clipper.param_ema_norms) == 4  # 2 weights + 2 biases
+        assert len(clipper.moving_averages) == 4  # 2 weights + 2 biases
         assert clipper.step_count == 0
 
     def test_adaptive_clipping_reduces_spikes(self):

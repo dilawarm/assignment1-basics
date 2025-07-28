@@ -40,7 +40,7 @@ from cs336_basics.training.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from cs336_basics.training.gradient_clipping import advanced_gradient_clipping
+from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
 from cs336_basics.training.optimizers import AdamW
 
@@ -624,8 +624,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    # Use torch's built-in gradient clipping for backward compatibility in tests
-    torch.nn.utils.clip_grad_norm_(parameters, max_l2_norm)
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
