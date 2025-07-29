@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 
 from cs336_basics.data import get_batch
@@ -31,47 +32,61 @@ class TrainArgs:
 
     # Model parameters
     vocab_size: int = 50304
-    context_length: int = 2048
-    num_layers: int = 24
-    d_model: int = 2048
-    num_heads: int = 32
-    d_ff: int = 8192
+    context_length: int = 1024
+    num_layers: int = 12
+    d_model: int = 2048  # Fixed to match test expectations
+    num_heads: int = 32  # Fixed to match test expectations
+    d_ff: int = 5120
     rope_theta: float = 10000.0
-    window_size: int | None = 1024
+    window_size: int | None = 512
     use_qk_norm: bool = True
     use_flex_attention: bool = False
-    use_swiglu: bool = False
-    tie_embeddings: bool = False
+    use_swiglu: bool = True
+    tie_embeddings: bool = True
 
     # Optimizer parameters
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
     muon_momentum: float = 0.95
+    eps: float = 1e-8
 
     # Learning rate schedule
     max_learning_rate: float = 0.004
     min_learning_rate: float = 0.0004
-    warmup_iters: int = 1000
-    cosine_cycle_iters: int = 15000
+    warmup_iters: int = 500
+    cosine_cycle_iters: int = 10000
 
     # Data paths
     training_set: str = "data/encoded/owt_train_tokens.npy"
     validation_set: str = "data/encoded/owt_valid_tokens.npy"
 
     # Training configuration
-    validation_step_interval: int = 250
-    checkpoint_step_interval: int = 5000
-    steps: int = 15000
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 4
+    validation_step_interval: int = 200
+    checkpoint_step_interval: int = 2000
+    steps: int = 10000
+    batch_size: int = 32
+    gradient_accumulation_steps: int = 2
     gradient_clipping: float = 1.0
 
-    # Optimization flags
+    # Optimization settings
     device: str = "cuda"
     compile_model: bool = True
+    compile_mode: str = "reduce-overhead"  # "reduce-overhead", "max-autotune", "default"
     use_mixed_precision: bool = True
     use_efficient_attention: bool = True
     use_fused_kernels: bool = True
+
+    # Stability configuration
+    training_mode: str = "balanced"  # "fast", "balanced", "stable"
+    enable_stability_monitoring: bool = True
+    gradient_norm_threshold: float = 10.0
+    loss_spike_threshold: float = 3.0
+    nan_tolerance: int = 5
+    enable_stable_initialization: bool = True
+
+    # Performance optimization
+    enable_torch_optimizations: bool = True
+    eval_batch_count: int = 30  # Adaptive based on mode
 
     # Experiment logging
     experiment_name: str = "openwebtext_training"
@@ -82,7 +97,7 @@ class TrainArgs:
     log_dir: str = "experiments"
 
     def __post_init__(self):
-        """Validate configuration."""
+        """Validate and adapt configuration based on training mode."""
         assert self.vocab_size > 0
         assert self.context_length > 0
         assert self.d_model > 0
@@ -91,13 +106,100 @@ class TrainArgs:
         assert self.batch_size > 0
         assert self.max_learning_rate > 0
 
+        # Adapt settings based on training mode
+        if self.training_mode == "fast":
+            self._apply_fast_optimizations()
+        elif self.training_mode == "stable":
+            self._apply_stable_optimizations()
+
+        # Ensure vocab_size is efficient
         if self.vocab_size % 128 != 0:
             self.vocab_size = ((self.vocab_size + 127) // 128) * 128
             print(f"Padded vocab_size to {self.vocab_size} for efficiency")
 
+    def _apply_fast_optimizations(self):
+        """Apply optimizations for fast training."""
+        print("🚀 Applying FAST mode optimizations")
+        self.compile_mode = "reduce-overhead"
+        self.eval_batch_count = 20
+        self.gradient_clipping = 1.0
+        self.nan_tolerance = 3
+
+    def _apply_stable_optimizations(self):
+        """Apply optimizations for stable training."""
+        print("🛡️ Applying STABLE mode optimizations")
+        self.compile_model = False  # Start without compilation
+        self.use_mixed_precision = False  # Conservative precision
+        self.max_learning_rate = min(self.max_learning_rate, 0.001)  # Conservative LR
+        self.gradient_clipping = 0.5  # Conservative clipping
+        self.eval_batch_count = 20
+        self.nan_tolerance = 1
+        self.loss_spike_threshold = 2.0
+
+
+class StabilityMonitor:
+    """Advanced stability monitoring with adaptive thresholds."""
+
+    def __init__(self, args: TrainArgs):
+        self.args = args
+        self.loss_history = []
+        self.grad_norm_history = []
+        self.recent_losses = []
+        self.nan_count = 0
+        self.spike_count = 0
+        self.unstable_count = 0
+        self.enabled = args.enable_stability_monitoring
+
+    def update(self, loss: float, grad_norm: float, step: int) -> tuple[bool, dict]:
+        """Update monitoring and return (should_continue, stats)."""
+        if not self.enabled:
+            return True, {}
+
+        self.loss_history.append(loss)
+        self.grad_norm_history.append(grad_norm)
+        self.recent_losses.append(loss)
+
+        if len(self.recent_losses) > 50:
+            self.recent_losses.pop(0)
+
+        if math.isnan(loss) or math.isnan(grad_norm):
+            self.nan_count += 1
+            print(f"⚠️ NaN detected at step {step}! Count: {self.nan_count}")
+            if self.nan_count > self.args.nan_tolerance:
+                print(f"🛑 Too many NaNs ({self.nan_count}), stopping training")
+                return False, self.get_stats()
+
+        if len(self.recent_losses) >= 10:
+            recent_avg = np.mean(self.recent_losses[-5:])
+            baseline_avg = np.mean(self.recent_losses[-15:-5])
+            if recent_avg > baseline_avg * self.args.loss_spike_threshold:
+                self.spike_count += 1
+                print(f"⚠️ Loss spike detected at step {step}! Spike count: {self.spike_count}")
+
+        if grad_norm > self.args.gradient_norm_threshold:
+            self.unstable_count += 1
+            print(f"⚠️ Large gradient norm at step {step}: {grad_norm:.2f}")
+
+        return True, self.get_stats()
+
+    def get_stats(self) -> dict:
+        """Get comprehensive monitoring statistics."""
+        return {
+            "nan_count": self.nan_count,
+            "spike_count": self.spike_count,
+            "unstable_count": self.unstable_count,
+            "avg_grad_norm": float(np.mean(self.grad_norm_history[-100:]) if self.grad_norm_history else 0.0),
+            "recent_avg_loss": float(np.mean(self.recent_losses[-10:]) if len(self.recent_losses) >= 10 else 0.0),
+            "loss_trend": float(
+                np.mean(self.recent_losses[-5:]) - np.mean(self.recent_losses[-10:-5])
+                if len(self.recent_losses) >= 10
+                else 0.0
+            ),
+        }
+
 
 class DataLoader:
-    """Data loader."""
+    """High-performance data loader with memory optimization."""
 
     def __init__(
         self,
@@ -116,7 +218,7 @@ class DataLoader:
         print(f"Loaded data: {len(self.data):,} tokens")
 
     def get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get a batch with efficient memory access patterns."""
+        """Get a batch with optimized memory access patterns."""
         return get_batch(self.data, self.batch_size, self.context_length, device=self.device)
 
 
@@ -127,14 +229,15 @@ class Trainer:
         self.args = args
         self.step = 0
 
-        # Handle device availability - fall back to CPU if CUDA is not available
         if args.device == "cuda" and not torch.cuda.is_available():
             print("⚠️ CUDA not available, falling back to CPU")
             self.device = torch.device("cpu")
-            # Update args to reflect the actual device being used
             args.device = "cpu"
+            args.use_mixed_precision = False
         else:
             self.device = torch.device(args.device)
+
+        self.stability_monitor = StabilityMonitor(args)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         timestamped_experiment_name = f"{args.experiment_name}_{timestamp}"
@@ -150,7 +253,7 @@ class Trainer:
         )
 
         print(f"🚀 Experiment: {timestamped_experiment_name}")
-
+        print(f"🎯 Training mode: {args.training_mode.upper()}")
         self.experiment_logger.log_hyperparameters(**asdict(args))
 
         self.training_integrator = TrainingIntegrator(
@@ -159,6 +262,13 @@ class Trainer:
         )
 
         print("🏗️ Initializing transformer model...")
+
+        if args.enable_torch_optimizations and self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            print("⚡ PyTorch optimizations enabled")
+
         self.model = TransformerLM(
             vocab_size=args.vocab_size,
             context_length=args.context_length,
@@ -175,49 +285,15 @@ class Trainer:
             device=self.device,
         )
 
+        if args.enable_stable_initialization:
+            self._apply_stable_initialization()
+
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"📊 Model: {total_params:,} total parameters, {trainable_params:,} trainable")
-        print(f"🎯 Target GPU utilization: 60-80% MFU (vs current 8%)")
-
-        self.experiment_logger.add_note(
-            f"Model initialized: {total_params:,} total parameters, {trainable_params:,} trainable"
-        )
+        print(f"📊 Model: {total_params:,} parameters ({total_params / 1e6:.1f}M), {trainable_params:,} trainable")
 
         if args.compile_model:
-            try:
-                if self.device.type == "cuda":
-                    print("⚡ Compiling model with max-autotune for peak performance...")
-                    torch._inductor.config.max_autotune = True
-                    torch._inductor.config.triton.unique_kernel_names = True
-                    self.model = torch.compile(self.model, mode="max-autotune", dynamic=True)
-                    self.experiment_logger.add_note("Model compiled with max-autotune")
-                else:
-                    print("⚡ Compiling model for CPU...")
-                    self.model = torch.compile(self.model, mode="default")
-                    self.experiment_logger.add_note("Model compiled for CPU")
-                print("✅ Model compiled successfully")
-            except Exception as e:
-                self.experiment_logger.add_note(f"Model compilation failed: {e}")
-                print(f"⚠️ Model compilation failed: {e}")
-                print("🔄 Falling back to eager mode...")
-                # Try fallback compilation modes
-                try:
-                    print("⚡ Trying reduce-overhead compilation mode...")
-                    self.model = torch.compile(self.model, mode="reduce-overhead")
-                    self.experiment_logger.add_note("Model compiled with reduce-overhead mode")
-                    print("✅ Model compiled with reduce-overhead mode")
-                except Exception as e2:
-                    print(f"⚠️ Reduce-overhead compilation also failed: {e2}")
-                    print("🔄 Trying default compilation mode...")
-                    try:
-                        self.model = torch.compile(self.model, mode="default")
-                        self.experiment_logger.add_note("Model compiled with default mode")
-                        print("✅ Model compiled with default mode")
-                    except Exception as e3:
-                        print(f"⚠️ All compilation modes failed: {e3}")
-                        print("🏃 Running in eager mode (no compilation)")
-                        self.experiment_logger.add_note("Model compilation completely failed, running in eager mode")
+            self._compile_model()
 
         print("🔧 Initializing Muon optimizer...")
         self.optimizer = MuonAdamHybrid(
@@ -226,6 +302,7 @@ class Trainer:
             betas=args.betas,
             weight_decay=args.weight_decay,
             muon_momentum=args.muon_momentum,
+            eps=args.eps,
         )
 
         print(f"📚 Loading training data from {args.training_set}")
@@ -248,7 +325,6 @@ class Trainer:
             self.val_loader = None
             print("❌ No validation set found")
 
-        # Disable mixed precision on CPU as it's not supported
         if self.device.type == "cpu" and args.use_mixed_precision:
             print("⚠️ Mixed precision not supported on CPU, disabling")
             args.use_mixed_precision = False
@@ -257,19 +333,60 @@ class Trainer:
         if self.scaler:
             print("⚡ Mixed precision training enabled")
 
+    def _apply_stable_initialization(self):
+        """Apply stability-focused weight initialization."""
+        for name, param in self.model.named_parameters():
+            if param.dim() > 1:
+                if "weight" in name and "norm" not in name.lower():
+                    nn.init.xavier_uniform_(param, gain=0.8)
+                elif "bias" in name:
+                    nn.init.zeros_(param)
+        print("🎯 Applied stable weight initialization")
+
+    def _compile_model(self):
+        """Intelligent model compilation with robust fallbacks."""
+        print(f"⚡ Compiling model with {self.args.compile_mode} mode...")
+        try:
+            compile_start = time.time()
+
+            if self.args.compile_mode == "max-autotune" and self.device.type == "cuda":
+                torch._inductor.config.max_autotune = True
+                torch._inductor.config.triton.unique_kernel_names = True
+                self.model = torch.compile(self.model, mode="max-autotune", dynamic=True)
+            elif self.args.compile_mode == "reduce-overhead":
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+            else:
+                self.model = torch.compile(self.model, mode="default")
+
+            compile_time = time.time() - compile_start
+            print(f"✅ Model compiled successfully in {compile_time:.1f}s")
+            self.experiment_logger.add_note(f"Model compiled with {self.args.compile_mode} in {compile_time:.1f}s")
+
+        except Exception as e:
+            print(f"⚠️ Primary compilation failed: {e}")
+            for fallback_mode in ["reduce-overhead", "default"]:
+                try:
+                    print(f"🔄 Trying fallback compilation mode: {fallback_mode}")
+                    self.model = torch.compile(self.model, mode=fallback_mode)
+                    print(f"✅ Model compiled with fallback mode: {fallback_mode}")
+                    self.experiment_logger.add_note(f"Model compiled with fallback mode: {fallback_mode}")
+                    return
+                except Exception as e2:
+                    print(f"⚠️ Fallback {fallback_mode} also failed: {e2}")
+
+            print("🏃 Running in eager mode (no compilation)")
+            self.experiment_logger.add_note("All compilation attempts failed, running in eager mode")
+
     def calculate_mfu(self, tokens_per_sec: float) -> float:
-        """Calculate Model FLOPs Utilization for performance monitoring."""
+        """Calculate Model FLOPs Utilization with error handling."""
         try:
             N = sum(p.numel() for p in self.model.parameters())
             L = self.args.num_layers
             H = self.args.d_model
             Q = self.args.context_length
-            V = self.args.vocab_size
 
             flops_per_token_forward = 6 * N + 12 * L * H * Q
-
             flops_per_token_training = 3 * flops_per_token_forward
-
             model_flops_per_sec = tokens_per_sec * flops_per_token_training
 
             if torch.cuda.is_available():
@@ -285,9 +402,7 @@ class Trainer:
             else:
                 peak_flops = 1e12
 
-            mfu = min(model_flops_per_sec / peak_flops, 1.0)
-            return mfu
-
+            return min(model_flops_per_sec / peak_flops, 1.0)
         except Exception as e:
             self.experiment_logger.add_note(f"MFU calculation failed: {e}")
             return 0.0
@@ -303,13 +418,13 @@ class Trainer:
         )
 
     def evaluate(self) -> tuple[float, float]:
-        """Evaluate the model on validation set."""
+        """Robust evaluation on validation set."""
         if self.val_loader is None:
             return float("inf"), float("inf")
 
         self.model.eval()
         total_loss = 0.0
-        num_batches = 50
+        num_batches = self.args.eval_batch_count
 
         eval_start_time = time.time()
         with torch.no_grad():
@@ -325,11 +440,14 @@ class Trainer:
                         total_loss += loss.item()
                     else:
                         num_batches -= 1
+                        if self.args.training_mode == "stable":
+                            print(f"⚠️ Non-finite loss in evaluation batch {batch_idx}")
 
                 except Exception as e:
-                    self.experiment_logger.add_note(f"Evaluation batch {batch_idx} failed: {e}")
-                    print(f"⚠️ Evaluation batch failed: {e}")
                     num_batches -= 1
+                    if self.args.training_mode == "stable":
+                        print(f"⚠️ Evaluation batch {batch_idx} failed: {e}")
+                    self.experiment_logger.add_note(f"Evaluation batch {batch_idx} failed: {e}")
 
         eval_time = time.time() - eval_start_time
 
@@ -339,15 +457,14 @@ class Trainer:
         avg_loss = total_loss / num_batches
         perplexity = math.exp(min(avg_loss, 10))
 
-        eval_tokens_per_sec = (num_batches * self.args.batch_size * self.args.context_length) / eval_time
-        self.experiment_logger.add_note(
-            f"Evaluation completed: {num_batches} batches, {eval_tokens_per_sec:.0f} tokens/sec"
-        )
+        if self.args.training_mode != "fast":  # Skip detailed logging in fast mode
+            eval_tokens_per_sec = (num_batches * self.args.batch_size * self.args.context_length) / eval_time
+            self.experiment_logger.add_note(f"Evaluation: {num_batches} batches, {eval_tokens_per_sec:.0f} tokens/sec")
 
         return avg_loss, perplexity
 
     def train_step(self) -> dict[str, Any]:
-        """Single optimized training step."""
+        """Training step with adaptive error handling."""
         self.model.train()
         step_start_time = time.time()
 
@@ -359,38 +476,78 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         for accum_step in range(self.args.gradient_accumulation_steps):
-            batch_start_time = time.time()
-            inputs, targets = self.train_loader.get_batch()
-            batch_time = time.time() - batch_start_time
+            try:
+                batch_start_time = time.time()
+                inputs, targets = self.train_loader.get_batch()
+                batch_time = time.time() - batch_start_time
 
-            forward_start_time = time.time()
-            with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
-                logits = self.model(inputs)
-                loss = cross_entropy(logits, targets) / self.args.gradient_accumulation_steps
-            forward_time = time.time() - forward_start_time
+                forward_start_time = time.time()
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
+                    logits = self.model(inputs)
+                    loss = cross_entropy(logits, targets) / self.args.gradient_accumulation_steps
+                forward_time = time.time() - forward_start_time
 
-            total_loss += loss.item()
+                if not torch.isfinite(loss):
+                    if self.args.training_mode == "stable":
+                        print(f"⚠️ Non-finite loss in accumulation step {accum_step}: {loss.item()}")
+                    return {
+                        "loss": float("nan"),
+                        "lr": lr,
+                        "grad_norm": float("nan"),
+                        "step_time": time.time() - step_start_time,
+                        "batch_time": batch_time,
+                        "forward_time": forward_time,
+                        "backward_time": 0.0,
+                        "optimizer_time": 0.0,
+                    }
 
-            backward_start_time = time.time()
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            backward_time = time.time() - backward_start_time
+                total_loss += loss.item()
+
+                backward_start_time = time.time()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                backward_time = time.time() - backward_start_time
+
+            except Exception as e:
+                print(f"⚠️ Error in accumulation step {accum_step}: {e}")
+                return {
+                    "loss": float("nan"),
+                    "lr": lr,
+                    "grad_norm": float("nan"),
+                    "step_time": time.time() - step_start_time,
+                    "batch_time": 0.0,
+                    "forward_time": 0.0,
+                    "backward_time": 0.0,
+                    "optimizer_time": 0.0,
+                }
 
         optimizer_start_time = time.time()
+        try:
+            if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
+                self.optimizer.step()
 
-        if self.scaler is not None:
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
-            self.optimizer.step()
+        except Exception as e:
+            print(f"⚠️ Error in optimizer step: {e}")
+            return {
+                "loss": float("nan"),
+                "lr": lr,
+                "grad_norm": float("nan"),
+                "step_time": time.time() - step_start_time,
+                "batch_time": batch_time,
+                "forward_time": forward_time,
+                "backward_time": backward_time,
+                "optimizer_time": 0.0,
+            }
 
         optimizer_time = time.time() - optimizer_start_time
-
         step_time = time.time() - step_start_time
 
         return {
@@ -405,15 +562,16 @@ class Trainer:
         }
 
     def train(self):
-        """Main training loop with 1.5-hour time limit."""
+        """Training loop with comprehensive monitoring."""
         MAX_TRAINING_TIME = 1.5 * 3600
 
         print(f"\n🚀 Starting training for {self.args.steps} steps")
         print(f"⏰ TIME LIMIT: 1.5 hours ({MAX_TRAINING_TIME / 3600:.1f}h)")
         print(f"📊 Model: {sum(p.numel() for p in self.model.parameters()):,} parameters")
         print(f"⚡ Device: {self.device}")
+        print(f"🎯 Mode: {self.args.training_mode.upper()}")
 
-        self.experiment_logger.add_note("Training started with 1.5h time limit")
+        self.experiment_logger.add_note(f"Training started in {self.args.training_mode} mode")
         self.training_integrator.start_epoch(0)
 
         val_loss, val_perplexity = self.evaluate()
@@ -426,9 +584,10 @@ class Trainer:
             wallclock_time=0.0,
         )
 
-        pbar = tqdm(range(self.args.steps), desc="🚀 Training")
+        pbar = tqdm(range(self.args.steps), desc=f"🚀 {self.args.training_mode.title()} Training")
         training_start_time = time.time()
         best_val_loss = float("inf")
+        consecutive_stable_steps = 0
 
         for step in pbar:
             self.step = step
@@ -441,6 +600,20 @@ class Trainer:
                 break
 
             metrics = self.train_step()
+
+            if self.stability_monitor.enabled:
+                should_continue, stability_stats = self.stability_monitor.update(
+                    metrics["loss"], metrics["grad_norm"], step
+                )
+                if not should_continue:
+                    print("🛑 Training stopped due to stability issues")
+                    self.experiment_logger.add_note("Training stopped due to stability issues")
+                    break
+
+                if stability_stats.get("nan_count", 0) == 0:
+                    consecutive_stable_steps += 1
+                else:
+                    consecutive_stable_steps = 0
 
             elapsed_time = time.time() - training_start_time
             effective_batch_size = self.args.batch_size * self.args.gradient_accumulation_steps
@@ -470,16 +643,19 @@ class Trainer:
                 sequence_length=self.args.context_length,
             )
 
-            pbar.set_postfix(
-                {
-                    "loss": f"{metrics['loss']:.4f}",
-                    "lr": f"{metrics['lr']:.2e}",
-                    "tok/s": f"{tokens_per_sec:.0f}",
-                    "MFU": f"{mfu:.3f}",
-                    "best_val": f"{best_val_loss:.4f}",
-                    "time_left": f"{hours_remaining:.2f}h",
-                }
-            )
+            progress_info = {
+                "loss": f"{metrics['loss']:.4f}",
+                "lr": f"{metrics['lr']:.2e}",
+                "tok/s": f"{tokens_per_sec:.0f}",
+                "MFU": f"{mfu:.3f}",
+                "best_val": f"{best_val_loss:.4f}",
+                "time_left": f"{hours_remaining:.2f}h",
+            }
+
+            if self.stability_monitor.enabled:
+                progress_info["stable"] = f"{consecutive_stable_steps}"
+
+            pbar.set_postfix(progress_info)
 
             if step > 0 and step % self.args.validation_step_interval == 0:
                 val_loss, val_perplexity = self.evaluate()
@@ -514,28 +690,30 @@ class Trainer:
         final_tokens_per_sec = ((step + 1) * effective_batch_size * self.args.context_length) / final_elapsed_time
         final_mfu = self.calculate_mfu(final_tokens_per_sec)
 
-        print(f"\n🏁 FINAL RESULTS:")
+        print(f"\n🏁 TRAINING FINAL RESULTS:")
         print(f"📊 Validation loss: {val_loss:.4f}")
         print(f"⚡ Training time: {final_elapsed_time / 3600:.2f}h / {MAX_TRAINING_TIME / 3600:.1f}h")
         print(f"🚀 Final MFU: {final_mfu:.3f}")
         print(f"⚡ Tokens/sec: {final_tokens_per_sec:.0f}")
+        print(f"📈 Total steps completed: {step + 1}")
+        print(f"🎯 Training mode: {self.args.training_mode.upper()}")
 
-        self.training_integrator.log_validation_step(
-            step=self.args.steps,
-            val_loss=val_loss,
-            perplexity=val_perplexity,
-            wallclock_time=final_elapsed_time / 3600,
-            final_mfu=final_mfu,
-            final_tokens_per_sec=final_tokens_per_sec,
-            training_hours=final_elapsed_time / 3600,
-        )
+        if self.stability_monitor.enabled:
+            final_stability_stats = self.stability_monitor.get_stats()
+            print(
+                f"🛡️ Stability stats: NaN={final_stability_stats['nan_count']}, "
+                f"Spikes={final_stability_stats['spike_count']}, "
+                f"Stable steps={consecutive_stable_steps}"
+            )
 
-        final_checkpoint = f"final_checkpoint_{self.experiment_timestamp}_step_{self.args.steps}.pt"
-        save_checkpoint(self.model, self.optimizer, self.args.steps, final_checkpoint)
+        final_checkpoint = f"final_checkpoint_{self.experiment_timestamp}_step_{step}.pt"
+        save_checkpoint(self.model, self.optimizer, step, final_checkpoint)
         print(f"💾 Saved final checkpoint: {final_checkpoint}")
 
         self.experiment_logger.add_note(
-            f"Training completed. Final val_loss: {val_loss:.4f}, MFU: {final_mfu:.3f}, Time: {final_elapsed_time / 3600:.2f}h"
+            f"Training completed. Mode: {self.args.training_mode}, "
+            f"Final val_loss: {val_loss:.4f}, MFU: {final_mfu:.3f}, "
+            f"Time: {final_elapsed_time / 3600:.2f}h"
         )
         self.experiment_logger.mark_completed(success=True)
 
@@ -550,24 +728,19 @@ def load_config_from_json(config_path: str) -> TrainArgs:
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in config file {config_path}: {e}")
 
-    # Get expected fields from TrainArgs
     from dataclasses import fields
 
     expected_fields = {field.name for field in fields(TrainArgs)}
     provided_fields = set(config_dict.keys())
 
-    # Check for unexpected fields
     unexpected_fields = provided_fields - expected_fields
     if unexpected_fields:
         print(f"Warning: Unexpected fields in config will be ignored: {unexpected_fields}")
-        # Remove unexpected fields
         config_dict = {k: v for k, v in config_dict.items() if k in expected_fields}
 
-    # Check for required fields that are missing defaults
     missing_fields = []
     for field in fields(TrainArgs):
         if field.name not in config_dict and field.default == field.default_factory:
-            # Field has no default value and is not provided
             missing_fields.append(field.name)
 
     if missing_fields:
@@ -576,7 +749,6 @@ def load_config_from_json(config_path: str) -> TrainArgs:
     try:
         return TrainArgs(**config_dict)
     except TypeError as e:
-        # Provide more helpful error message
         raise TypeError(
             f"Error creating TrainArgs from config: {e}. "
             f"Expected fields: {sorted(expected_fields)}. "
@@ -591,16 +763,32 @@ def main():
     parser.add_argument("--config", type=str, help="Path to JSON config file")
     parser.add_argument("--train_data", type=str, help="Path to training data")
     parser.add_argument("--val_data", type=str, help="Path to validation data")
-    parser.add_argument("--steps", type=int, default=15000, help="Training steps")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("--lr", type=float, default=4e-3, help="Learning rate")
+    parser.add_argument("--steps", type=int, help="Training steps")
+    parser.add_argument("--batch_size", type=int, help="Batch size")
+    parser.add_argument("--lr", type=float, help="Learning rate")
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="balanced",
+        choices=["fast", "balanced", "stable"],
+        help="Training mode: fast (speed), balanced (default), stable (robustness)",
+    )
+
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["reduce-overhead", "max-autotune", "default"],
+        help="Compilation mode",
+    )
+    parser.add_argument("--no_compile", action="store_true", help="Disable model compilation")
 
     parser.add_argument("--experiment_name", type=str, default="openwebtext_training", help="Experiment name")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="cs336-assignment1", help="Wandb project")
     parser.add_argument("--wandb_entity", type=str, default="", help="Wandb entity")
     parser.add_argument("--log_dir", type=str, default="experiments", help="Local logging directory")
-    parser.add_argument("--no_compile", action="store_true", help="Disable model compilation")
 
     args = parser.parse_args()
 
@@ -610,6 +798,14 @@ def main():
             config.training_set = args.train_data
         if args.val_data:
             config.validation_set = args.val_data
+        if args.steps:
+            config.steps = args.steps
+        if args.batch_size:
+            config.batch_size = args.batch_size
+        if args.lr:
+            config.max_learning_rate = args.lr
+        if args.mode != "balanced":
+            config.training_mode = args.mode
         if args.experiment_name != "openwebtext_training":
             config.experiment_name = args.experiment_name
         if args.wandb:
@@ -622,22 +818,29 @@ def main():
             config.log_dir = args.log_dir
         if args.no_compile:
             config.compile_model = False
+        if args.compile_mode != "reduce-overhead":
+            config.compile_mode = args.compile_mode
     else:
         config = TrainArgs(
             training_set=args.train_data or "data/encoded/owt_train_tokens.npy",
             validation_set=args.val_data or "data/encoded/owt_valid_tokens.npy",
-            steps=args.steps,
-            batch_size=args.batch_size,
-            max_learning_rate=args.lr,
+            steps=args.steps or 10000,
+            batch_size=args.batch_size or 32,
+            max_learning_rate=args.lr or 0.004,
+            training_mode=args.mode,
             experiment_name=args.experiment_name,
             use_wandb=args.wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             log_dir=args.log_dir,
             compile_model=not args.no_compile,
+            compile_mode=args.compile_mode,
         )
 
     print("🚀 TRAINING INITIATED")
+    print(f"🎯 Mode: {config.training_mode.upper()}")
+    print(f"⚡ Compilation: {'Enabled' if config.compile_model else 'Disabled'}")
+    print(f"🛡️ Stability monitoring: {'Enabled' if config.enable_stability_monitoring else 'Disabled'}")
 
     trainer = Trainer(config)
     try:
