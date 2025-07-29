@@ -27,6 +27,10 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: str
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
     """
+    # Handle device availability - fall back to CPU if CUDA is not available
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)

@@ -126,7 +126,15 @@ class Trainer:
     def __init__(self, args: TrainArgs):
         self.args = args
         self.step = 0
-        self.device = torch.device(args.device)
+
+        # Handle device availability - fall back to CPU if CUDA is not available
+        if args.device == "cuda" and not torch.cuda.is_available():
+            print("⚠️ CUDA not available, falling back to CPU")
+            self.device = torch.device("cpu")
+            # Update args to reflect the actual device being used
+            args.device = "cpu"
+        else:
+            self.device = torch.device(args.device)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         timestamped_experiment_name = f"{args.experiment_name}_{timestamp}"
@@ -176,13 +184,18 @@ class Trainer:
             f"Model initialized: {total_params:,} total parameters, {trainable_params:,} trainable"
         )
 
-        if args.compile_model and self.device.type == "cuda":
+        if args.compile_model:
             try:
-                print("⚡ Compiling model with max-autotune for peak performance...")
-                torch._inductor.config.max_autotune = True
-                torch._inductor.config.triton.unique_kernel_names = True
-                self.model = torch.compile(self.model, mode="max-autotune", dynamic=True)
-                self.experiment_logger.add_note("Model compiled with max-autotune")
+                if self.device.type == "cuda":
+                    print("⚡ Compiling model with max-autotune for peak performance...")
+                    torch._inductor.config.max_autotune = True
+                    torch._inductor.config.triton.unique_kernel_names = True
+                    self.model = torch.compile(self.model, mode="max-autotune", dynamic=True)
+                    self.experiment_logger.add_note("Model compiled with max-autotune")
+                else:
+                    print("⚡ Compiling model for CPU...")
+                    self.model = torch.compile(self.model, mode="default")
+                    self.experiment_logger.add_note("Model compiled for CPU")
                 print("✅ Model compiled successfully")
             except Exception as e:
                 self.experiment_logger.add_note(f"Model compilation failed: {e}")
@@ -216,6 +229,11 @@ class Trainer:
         else:
             self.val_loader = None
             print("❌ No validation set found")
+
+        # Disable mixed precision on CPU as it's not supported
+        if self.device.type == "cpu" and args.use_mixed_precision:
+            print("⚠️ Mixed precision not supported on CPU, disabling")
+            args.use_mixed_precision = False
 
         self.scaler = torch.amp.GradScaler() if args.use_mixed_precision else None
         if self.scaler:
@@ -281,7 +299,7 @@ class Trainer:
                 try:
                     inputs, targets = self.val_loader.get_batch()
 
-                    with torch.amp.autocast(enabled=self.scaler is not None):
+                    with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
                         logits = self.model(inputs)
                         loss = cross_entropy(logits, targets)
 
@@ -328,7 +346,7 @@ class Trainer:
             batch_time = time.time() - batch_start_time
 
             forward_start_time = time.time()
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
                 logits = self.model(inputs)
                 loss = cross_entropy(logits, targets) / self.args.gradient_accumulation_steps
             forward_time = time.time() - forward_start_time

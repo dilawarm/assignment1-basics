@@ -159,17 +159,30 @@ class MuonAdamHybrid(Optimizer):
         self.muon_params = []
         self.adam_params = []
 
-        for param_group in params:
-            if isinstance(param_group, dict):
-                param_list = param_group["params"]
-            else:
-                param_list = param_group
+        # Convert params to a list if it's an iterator
+        if hasattr(params, "__iter__") and not isinstance(params, (list, tuple)):
+            params = list(params)
 
-            for p in param_list:
+        # Handle both individual parameters and parameter groups
+        if len(params) > 0 and isinstance(params[0], dict):
+            # Parameter groups format: [{"params": [p1, p2, ...]}, ...]
+            for param_group in params:
+                param_list = param_group["params"]
+                for p in param_list:
+                    if len(p.shape) >= 2 and min(p.shape) >= 16:
+                        self.muon_params.append(p)
+                    else:
+                        self.adam_params.append(p)
+        else:
+            # Individual parameters format: [p1, p2, p3, ...]
+            for p in params:
                 if len(p.shape) >= 2 and min(p.shape) >= 16:
                     self.muon_params.append(p)
                 else:
                     self.adam_params.append(p)
+
+        if len(self.muon_params) == 0 and len(self.adam_params) == 0:
+            raise ValueError("No parameters to optimize! Check if model parameters are being passed correctly.")
 
         self.muon = Muon(
             self.muon_params,
@@ -189,7 +202,7 @@ class MuonAdamHybrid(Optimizer):
         self.param_groups = self.muon.param_groups + self.adam.param_groups
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super().__init__([], defaults)
+        super().__init__(self.param_groups, defaults)
 
     def step(self, closure=None):
         """Perform optimization step with both optimizers."""
