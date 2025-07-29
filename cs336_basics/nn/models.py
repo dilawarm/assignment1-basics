@@ -7,7 +7,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: str = "cuda") -> torch.Tensor:
@@ -157,53 +156,16 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if self.use_flex_attention and hasattr(F, "scaled_dot_product_attention"):
-            try:
-                if self.window_size is not None:
-                    window_mask = self._create_sliding_window_mask(seq_len, x.device)
-                    if mask is not None:
-                        mask = mask & window_mask
-                    else:
-                        mask = window_mask
+        # Always use standard attention for maximum compatibility
+        # SDPA kernels are often unavailable or cause compilation issues
+        if self.window_size is not None:
+            window_mask = self._create_sliding_window_mask(seq_len, x.device)
+            if mask is not None:
+                mask = mask & window_mask
+            else:
+                mask = window_mask
 
-                # Try multiple backends with fallback
-                try:
-                    # First try with flash attention
-                    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                        out = F.scaled_dot_product_attention(
-                            q,
-                            k,
-                            v,
-                            attn_mask=mask,
-                            dropout_p=self.dropout if self.training else 0.0,
-                            is_causal=is_causal if mask is None else False,
-                        )
-                except:
-                    # Fallback to efficient attention or math backend
-                    try:
-                        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-                            out = F.scaled_dot_product_attention(
-                                q,
-                                k,
-                                v,
-                                attn_mask=mask,
-                                dropout_p=self.dropout if self.training else 0.0,
-                                is_causal=is_causal if mask is None else False,
-                            )
-                    except:
-                        # Final fallback: use default backend selection
-                        out = F.scaled_dot_product_attention(
-                            q,
-                            k,
-                            v,
-                            attn_mask=mask,
-                            dropout_p=self.dropout if self.training else 0.0,
-                            is_causal=is_causal if mask is None else False,
-                        )
-            except:
-                out = self._standard_attention(q, k, v, mask, is_causal)
-        else:
-            out = self._standard_attention(q, k, v, mask, is_causal)
+        out = self._standard_attention(q, k, v, mask, is_causal)
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         return self.o_proj(out)

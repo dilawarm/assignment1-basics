@@ -8,7 +8,7 @@
     "rope_theta": 10000,
     "window_size": 1024,
     "use_qk_norm": true,
-    "use_flex_attention": true,
+    "use_flex_attention": false,
     "use_swiglu": false,
     "tie_embeddings": false,
     

@@ -39,7 +39,7 @@ class TrainArgs:
     rope_theta: float = 10000.0
     window_size: int | None = 1024
     use_qk_norm: bool = True
-    use_flex_attention: bool = True
+    use_flex_attention: bool = False
     use_swiglu: bool = False
     tie_embeddings: bool = False
 
