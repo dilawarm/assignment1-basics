@@ -505,10 +505,47 @@ class Trainer:
 
 
 def load_config_from_json(config_path: str) -> TrainArgs:
-    """Load configuration from JSON file."""
-    with open(config_path, "r") as f:
-        config_dict = json.load(f)
-    return TrainArgs(**config_dict)
+    """Load configuration from JSON file with robust error handling."""
+    try:
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in config file {config_path}: {e}")
+
+    # Get expected fields from TrainArgs
+    from dataclasses import fields
+
+    expected_fields = {field.name for field in fields(TrainArgs)}
+    provided_fields = set(config_dict.keys())
+
+    # Check for unexpected fields
+    unexpected_fields = provided_fields - expected_fields
+    if unexpected_fields:
+        print(f"Warning: Unexpected fields in config will be ignored: {unexpected_fields}")
+        # Remove unexpected fields
+        config_dict = {k: v for k, v in config_dict.items() if k in expected_fields}
+
+    # Check for required fields that are missing defaults
+    missing_fields = []
+    for field in fields(TrainArgs):
+        if field.name not in config_dict and field.default == field.default_factory:
+            # Field has no default value and is not provided
+            missing_fields.append(field.name)
+
+    if missing_fields:
+        raise ValueError(f"Required fields missing from config: {missing_fields}")
+
+    try:
+        return TrainArgs(**config_dict)
+    except TypeError as e:
+        # Provide more helpful error message
+        raise TypeError(
+            f"Error creating TrainArgs from config: {e}. "
+            f"Expected fields: {sorted(expected_fields)}. "
+            f"Provided fields: {sorted(provided_fields)}"
+        )
 
 
 def main():

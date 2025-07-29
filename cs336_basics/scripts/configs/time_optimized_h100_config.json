@@ -6,9 +6,15 @@
     "num_heads": 32,
     "d_ff": 8192,
     "rope_theta": 10000,
+    "window_size": 1024,
+    "use_qk_norm": true,
+    "use_flex_attention": true,
+    "use_swiglu": false,
+    "tie_embeddings": false,
     
     "weight_decay": 0.1,
     "betas": [0.9, 0.95],
+    "muon_momentum": 0.95,
     
     "max_learning_rate": 0.006,
     "min_learning_rate": 0.0006,
@@ -27,11 +33,8 @@
     
     "device": "cuda",
     "compile_model": true,
-    "use_flex_attention": true,
-    "attention_window_size": 1024,
-    "use_muon_optimizer": true,
-    "use_advanced_arch": true,
     "use_mixed_precision": true,
+    "use_efficient_attention": true,
     "use_fused_kernels": true,
     
     "experiment_name": "time_optimized_h100_training",
