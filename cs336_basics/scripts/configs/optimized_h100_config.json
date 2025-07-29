@@ -1,0 +1,41 @@
+{
+    "vocab_size": 50304,
+    "context_length": 2048,
+    "num_layers": 24,
+    "d_model": 2048,
+    "num_heads": 32,
+    "d_ff": 8192,
+    "rope_theta": 10000,
+    
+    "weight_decay": 0.1,
+    "betas": [0.9, 0.95],
+    
+    "max_learning_rate": 0.004,
+    "min_learning_rate": 0.0004,
+    "warmup_iters": 1000,
+    "cosine_cycle_iters": 15000,
+    
+    "training_set": "data/encoded/owt_train_tokens.npy",
+    "validation_set": "data/encoded/owt_valid_tokens.npy",
+    
+    "validation_step_interval": 250,
+    "checkpoint_step_interval": 5000,
+    "steps": 15000,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 4,
+    "gradient_clipping": 1.0,
+    
+    "device": "cuda",
+    "compile_model": true,
+    "use_flex_attention": true,
+    "attention_window_size": 1024,
+    "use_muon_optimizer": true,
+    "use_advanced_arch": true,
+    
+    "experiment_name": "openwebtext_training",
+    "experiment_description": "OpenWebText training",
+    "use_wandb": true,
+    "wandb_project": "cs336-assignment1",
+    "wandb_entity": "",
+    "log_dir": "experiments"
+}

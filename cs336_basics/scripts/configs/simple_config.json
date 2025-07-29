@@ -33,4 +33,4 @@
     "wandb_project": "cs336-assignment1",
     "wandb_entity": "",
     "log_dir": "experiments"
-} 
+}

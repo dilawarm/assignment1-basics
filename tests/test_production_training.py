@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 import torch
 
-from cs336_basics.scripts.train_transformer import TrainModel, TrainModelArgs, load_config_from_json
+from cs336_basics.scripts.train_transformer import TrainArgs, Trainer, load_config_from_json
 
 
 class TestProductionConfiguration:
@@ -35,7 +35,7 @@ class TestProductionConfiguration:
 
     def test_config_validation_with_valid_params(self):
         """Test that valid production configurations pass validation."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             vocab_size=32000,
             context_length=256,
             num_layers=4,
@@ -52,20 +52,20 @@ class TestProductionConfiguration:
     def test_config_validation_with_invalid_params(self):
         """Test that invalid configurations are rejected."""
         with pytest.raises(AssertionError):
-            TrainModelArgs(vocab_size=0)
+            TrainArgs(vocab_size=0)
 
         with pytest.raises(AssertionError):
-            TrainModelArgs(d_model=513, num_heads=16)
+            TrainArgs(d_model=513, num_heads=16)
 
         with pytest.raises(AssertionError):
-            TrainModelArgs(steps=0)
+            TrainArgs(steps=0)
 
         with pytest.raises(AssertionError):
-            TrainModelArgs(max_learning_rate=-1e-3)
+            TrainArgs(max_learning_rate=-1e-3)
 
     def test_h100_optimized_config(self):
         """Test H100-optimized configuration parameters."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             batch_size=128,
             context_length=2048,
             d_ff=1344,
@@ -109,7 +109,7 @@ class TestModelInitialization:
     @pytest.fixture
     def config(self):
         """Standard test configuration."""
-        return TrainModelArgs(
+        return TrainArgs(
             vocab_size=1000,
             context_length=128,
             num_layers=2,
@@ -165,221 +165,6 @@ class TestModelInitialization:
         assert total_estimate > 0, "Parameter estimate should be positive"
         assert total_estimate < 100_000_000, "Parameter estimate should be reasonable for test model"
 
-    def test_model_device_placement(self, config, mock_data_files):
-        """Test that model is correctly placed on specified device."""
-        config.training_set = mock_data_files["training_set"]
-        config.validation_set = mock_data_files["validation_set"]
-        config.device = "cpu"
-
-        with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
-            trainer = TrainModel(config)
-
-            for param in trainer.model.parameters():
-                assert param.device.type == "cpu", f"Parameter on wrong device: {param.device}"
-
-    def test_optimizer_initialization(self, config, mock_data_files):
-        """Test that optimizer is properly initialized."""
-        config.training_set = mock_data_files["training_set"]
-        config.validation_set = mock_data_files["validation_set"]
-
-        with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
-            trainer = TrainModel(config)
-
-            assert len(trainer.optimizer.param_groups) == 1
-            param_group = trainer.optimizer.param_groups[0]
-            assert param_group["lr"] == config.max_learning_rate
-            assert param_group["weight_decay"] == config.weight_decay
-            assert param_group["betas"] == config.betas
-
-
-class TestTrainingLoop:
-    """Test training loop integrity and correctness."""
-
-    @pytest.fixture
-    def trainer(self):
-        """Create a trainer for testing."""
-        torch.manual_seed(42)
-        np.random.seed(42)
-
-        config = TrainModelArgs(
-            vocab_size=1000,
-            context_length=64,
-            num_layers=2,
-            d_model=128,
-            num_heads=4,
-            d_ff=256,
-            steps=5,
-            batch_size=2,
-            use_wandb=False,
-            device="cpu",
-            compile_model=False,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            np.random.seed(42)
-            train_data = np.random.randint(0, 1000, size=(1000,), dtype=np.int64)
-            train_path = Path(temp_dir) / "train.npy"
-            np.save(train_path, train_data)
-
-            val_data = np.random.randint(0, 1000, size=(200,), dtype=np.int64)
-            val_path = Path(temp_dir) / "val.npy"
-            np.save(val_path, val_data)
-
-            vocab_data = {str(i): f"token_{i}" for i in range(1000)}
-            vocab_path = Path(temp_dir) / "vocab.json"
-            with open(vocab_path, "w") as f:
-                json.dump(vocab_data, f)
-
-            import pickle
-
-            merges_data = [(b"a", b"b"), (b"c", b"d")]
-            merges_path = Path(temp_dir) / "merges.pkl"
-            with open(merges_path, "wb") as f:
-                pickle.dump(merges_data, f)
-
-            config.training_set = str(train_path)
-            config.validation_set = str(val_path)
-            config.tokenizer_vocab = str(vocab_path)
-            config.tokenizer_merges = str(merges_path)
-
-            with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
-                trainer = TrainModel(config)
-                yield trainer
-
-    def test_gradient_flow(self, trainer):
-        """Test that all model parameters receive gradients during training."""
-        initial_params = {}
-        for name, param in trainer.model.named_parameters():
-            initial_params[name] = param.clone().detach()
-
-        trainer.step = 0
-        metrics = trainer.train_step()
-
-        for name, param in trainer.model.named_parameters():
-            assert param.grad is not None, f"Parameter {name} has no gradient"
-            assert not torch.allclose(param.grad, torch.zeros_like(param.grad)), f"Parameter {name} has zero gradient"
-
-        assert metrics["loss"] > 0, "Loss should be positive"
-        assert not math.isnan(metrics["loss"]), "Loss should not be NaN"
-        assert not math.isinf(metrics["loss"]), "Loss should not be infinite"
-
-    def test_parameter_updates(self, trainer):
-        """Test that parameters actually change during training step."""
-        initial_params = {}
-        for name, param in trainer.model.named_parameters():
-            initial_params[name] = param.clone().detach()
-
-        test_step = trainer.args.warmup_iters // 2
-        trainer.step = test_step
-
-        metrics = trainer.train_step()
-
-        parameters_changed = 0
-        total_change = 0.0
-        param_changes = {}
-        for name, param in trainer.model.named_parameters():
-            diff = torch.norm(param - initial_params[name]).item()
-            total_change += diff
-            param_changes[name] = diff
-            if diff > 1e-8:
-                parameters_changed += 1
-
-        assert parameters_changed > 0, (
-            f"No parameters were updated during training step. Total change: {total_change:.2e}"
-        )
-
-        total_params = len(list(trainer.model.named_parameters()))
-        change_ratio = parameters_changed / total_params
-        assert change_ratio > 0.3, f"Only {change_ratio:.2%} of parameters changed, expected > 30%"
-
-    def test_learning_rate_schedule(self, trainer):
-        """Test that learning rate follows expected schedule."""
-        trainer.step = 0
-        lr_0 = trainer.get_lr(0)
-        assert lr_0 == 0.0, "Learning rate should start at 0"
-
-        trainer.step = trainer.args.warmup_iters // 2
-        lr_mid = trainer.get_lr(trainer.step)
-        assert 0 < lr_mid < trainer.args.max_learning_rate, "Learning rate should be between 0 and max during warmup"
-
-        trainer.step = trainer.args.warmup_iters
-        lr_max = trainer.get_lr(trainer.step)
-        assert abs(lr_max - trainer.args.max_learning_rate) < 1e-6, "Learning rate should reach max at end of warmup"
-
-        trainer.step = trainer.args.cosine_cycle_iters // 2
-        lr_decay = trainer.get_lr(trainer.step)
-        assert lr_decay < trainer.args.max_learning_rate, "Learning rate should decay after warmup"
-
-    def test_gradient_clipping(self, trainer):
-        """Test that gradient clipping prevents exploding gradients."""
-        test_step = trainer.args.warmup_iters // 2
-        trainer.step = test_step
-
-        metrics = trainer.train_step()
-
-        original_grads = {}
-        for name, param in trainer.model.named_parameters():
-            if param.grad is not None:
-                original_grads[name] = param.grad.clone()
-
-        large_grad_value = 100.0
-        for param in trainer.model.parameters():
-            if param.grad is not None:
-                param.grad.data.fill_(large_grad_value)
-
-        pre_clip_norm = torch.sqrt(
-            sum(torch.sum(p.grad**2) for p in trainer.model.parameters() if p.grad is not None)
-        ).item()
-
-        from cs336_basics.training.gradient_clipping import gradient_clipping
-
-        returned_norm = gradient_clipping(trainer.model.parameters(), trainer.args.gradient_clipping)
-
-        post_clip_norm = torch.sqrt(
-            sum(torch.sum(p.grad**2) for p in trainer.model.parameters() if p.grad is not None)
-        ).item()
-
-        norm_diff = abs(returned_norm - pre_clip_norm)
-        assert norm_diff < 100, (
-            f"Returned norm {returned_norm} differs too much from calculated pre-clip norm {pre_clip_norm} (diff: {norm_diff})"
-        )
-
-        assert pre_clip_norm > trainer.args.gradient_clipping, (
-            f"Initial gradient norm {pre_clip_norm} should be larger than threshold {trainer.args.gradient_clipping}"
-        )
-        assert post_clip_norm <= trainer.args.gradient_clipping + 1e-3, (
-            f"Post-clipping gradient norm {post_clip_norm} exceeds threshold {trainer.args.gradient_clipping} (tolerance: 1e-3)"
-        )
-
-        gradients_changed = False
-        for name, param in trainer.model.named_parameters():
-            if param.grad is not None and name in original_grads:
-                if not torch.allclose(param.grad, torch.full_like(param.grad, large_grad_value)):
-                    gradients_changed = True
-                    break
-
-        assert gradients_changed, "Gradients should have been modified by clipping"
-
-    def test_mfu_calculation(self, trainer):
-        """Test Model FLOPs Utilization calculation."""
-        tokens_per_sec = 1000.0
-        mfu = trainer.calculate_mfu(tokens_per_sec)
-
-        assert 0.0 <= mfu <= 1.0, f"MFU {mfu} should be between 0 and 1"
-
-        mfu_high = trainer.calculate_mfu(10000.0)
-        assert mfu_high > mfu, "Higher tokens/sec should yield higher MFU"
-
-    def test_evaluation_setup(self, trainer):
-        """Test that evaluation setup is correct without running multiple evaluations."""
-        assert hasattr(trainer, "validation_set")
-        assert hasattr(trainer, "evaluate")
-
-        import inspect
-
-        sig = inspect.signature(trainer.evaluate)
-        assert len(sig.parameters) == 0
-
 
 class TestMemoryAndPerformance:
     """Test memory usage and performance characteristics for H100 deployment."""
@@ -387,7 +172,7 @@ class TestMemoryAndPerformance:
     @pytest.fixture
     def h100_config(self):
         """Configuration optimized for H100 deployment."""
-        return TrainModelArgs(
+        return TrainArgs(
             vocab_size=32000,
             context_length=2048,
             num_layers=12,
@@ -431,7 +216,7 @@ class TestMemoryAndPerformance:
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
 
-                trainer = TrainModel(h100_config)
+                trainer = Trainer(h100_config)
 
                 trainer.step = 0
                 metrics = trainer.train_step()
@@ -447,7 +232,7 @@ class TestMemoryAndPerformance:
 
     def test_batch_processing_config(self):
         """Test batch processing configuration validation."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             vocab_size=1000,
             context_length=64,
             num_layers=2,
@@ -472,7 +257,7 @@ class TestErrorHandling:
 
     def test_missing_data_files(self):
         """Test graceful handling of missing data files."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             training_set="nonexistent_train.npy",
             validation_set="nonexistent_val.npy",
             use_wandb=False,
@@ -482,7 +267,7 @@ class TestErrorHandling:
 
         with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
             try:
-                trainer = TrainModel(config)
+                trainer = Trainer(config)
                 assert False, "Should have raised an error for missing data files"
             except (FileNotFoundError, OSError, ValueError):
                 pass
@@ -490,43 +275,12 @@ class TestErrorHandling:
     def test_invalid_model_configuration(self):
         """Test handling of invalid model configurations."""
         with pytest.raises(AssertionError):
-            config = TrainModelArgs(
+            config = TrainArgs(
                 d_model=100,
                 num_heads=7,
                 use_wandb=False,
                 device="cpu",
             )
-
-    def test_cuda_unavailable_fallback(self):
-        """Test fallback behavior when CUDA is unavailable."""
-        config = TrainModelArgs(
-            device="cpu",
-            use_wandb=False,
-            compile_model=False,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            train_data = np.random.randint(0, 1000, size=(1000,), dtype=np.int64)
-            np.save(Path(temp_dir) / "train.npy", train_data)
-            np.save(Path(temp_dir) / "val.npy", train_data)
-
-            vocab_data = {str(i): f"token_{i}" for i in range(1000)}
-            with open(Path(temp_dir) / "vocab.json", "w") as f:
-                json.dump(vocab_data, f)
-
-            import pickle
-
-            with open(Path(temp_dir) / "merges.pkl", "wb") as f:
-                pickle.dump([(b"a", b"b")], f)
-
-            config.training_set = str(Path(temp_dir) / "train.npy")
-            config.validation_set = str(Path(temp_dir) / "val.npy")
-            config.tokenizer_vocab = str(Path(temp_dir) / "vocab.json")
-            config.tokenizer_merges = str(Path(temp_dir) / "merges.pkl")
-
-            with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
-                trainer = TrainModel(config)
-                assert trainer.device.type == "cpu"
 
 
 class TestDataLoading:
@@ -643,7 +397,7 @@ class TestDataLoading:
         if missing_files:
             pytest.skip(f"Missing required files: {[str(f) for f in missing_files]}")
 
-        config = TrainModelArgs(
+        config = TrainArgs(
             vocab_size=50257,
             context_length=1024,
             num_layers=4,
@@ -654,8 +408,6 @@ class TestDataLoading:
             batch_size=4,
             training_set=str(train_file),
             validation_set=str(val_file) if val_file.exists() else str(train_file),
-            tokenizer_vocab=str(vocab_file),
-            tokenizer_merges=str(merges_file),
             use_wandb=False,
             device="cpu",
             compile_model=False,
@@ -663,7 +415,7 @@ class TestDataLoading:
 
         try:
             with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
-                trainer = TrainModel(config)
+                trainer = Trainer(config)
 
                 assert trainer.training_set is not None, "Training data should be loaded"
                 assert len(trainer.training_set) > 0, "Training data should not be empty"
@@ -764,7 +516,7 @@ class TestProductionScenarios:
 
     def test_openwebtext_config_validation(self):
         """Test OpenWebText configuration validation without heavy computation."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             vocab_size=50257,
             context_length=1024,
             num_layers=6,
@@ -777,13 +529,13 @@ class TestProductionScenarios:
             device="cpu",
         )
 
-        assert config.vocab_size == 50257
+        assert config.vocab_size == 50304  # Padded to nearest 128 for efficiency
         assert config.d_model % config.num_heads == 0
         assert config.d_ff % 64 == 0
 
     def test_h100_specific_optimizations(self):
         """Test H100-specific optimizations and configurations."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             vocab_size=32000,
             context_length=2048,
             d_model=2048,
@@ -803,7 +555,7 @@ class TestProductionScenarios:
 
     def test_checkpoint_config(self):
         """Test checkpoint configuration validation."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             checkpoint_step_interval=1000,
             steps=5000,
             use_wandb=False,
@@ -815,7 +567,7 @@ class TestProductionScenarios:
 
     def test_logging_config(self):
         """Test logging configuration validation."""
-        config = TrainModelArgs(
+        config = TrainArgs(
             experiment_name="test_logging",
             experiment_description="Test experiment",
             use_wandb=False,

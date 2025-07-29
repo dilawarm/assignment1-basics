@@ -1,0 +1,43 @@
+{
+    "vocab_size": 50304,
+    "context_length": 2048,
+    "num_layers": 24,
+    "d_model": 2048,
+    "num_heads": 32,
+    "d_ff": 8192,
+    "rope_theta": 10000,
+    
+    "weight_decay": 0.1,
+    "betas": [0.9, 0.95],
+    
+    "max_learning_rate": 0.006,
+    "min_learning_rate": 0.0006,
+    "warmup_iters": 500,
+    "cosine_cycle_iters": 5400,
+    
+    "training_set": "data/encoded/owt_train_tokens.npy",
+    "validation_set": "data/encoded/owt_valid_tokens.npy",
+    
+    "validation_step_interval": 200,
+    "checkpoint_step_interval": 2000,
+    "steps": 5400,
+    "batch_size": 24,
+    "gradient_accumulation_steps": 4,
+    "gradient_clipping": 1.0,
+    
+    "device": "cuda",
+    "compile_model": true,
+    "use_flex_attention": true,
+    "attention_window_size": 1024,
+    "use_muon_optimizer": true,
+    "use_advanced_arch": true,
+    "use_mixed_precision": true,
+    "use_fused_kernels": true,
+    
+    "experiment_name": "time_optimized_h100_training",
+    "experiment_description": "Time-optimized training for 1.5h budget on H100",
+    "use_wandb": true,
+    "wandb_project": "cs336-assignment1",
+    "wandb_entity": "",
+    "log_dir": "experiments"
+}

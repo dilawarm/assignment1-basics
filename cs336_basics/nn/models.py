@@ -1,24 +1,291 @@
 """
-Complete Transformer model implementations with performance optimizations.
+Transformer Models.
 """
 
-from __future__ import annotations
+import math
 
 import torch
 import torch.nn as nn
-from jaxtyping import Float, Int
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from cs336_basics.nn.activations import CustomFFN, SwiGLU
-from cs336_basics.nn.attention import MultiHeadSelfAttention, RotaryPositionalEmbedding
-from cs336_basics.nn.layers import Embedding, Linear, RMSNorm
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: str = "cuda") -> torch.Tensor:
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+    and the end index 'end'. The 'theta' parameter scales the frequencies.
+    The returned tensor contains complex values in complex64 data type.
+
+    Args:
+        dim (int): Dimension of the frequency tensor.
+        end (int): End index for precomputing frequencies.
+        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+        device (str): Device to create tensor on.
+
+    Returns:
+        torch.Tensor: Precomputed frequency tensor with complex exponentials.
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to input tensors using the given frequency tensor.
+
+    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
+    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
+    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
+    returned as real tensors.
+
+    Args:
+        xq (torch.Tensor): Query tensor to apply rotary embeddings.
+        xk (torch.Tensor): Key tensor to apply rotary embeddings.
+        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+    """
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis[:, None, :]
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+class ReLUSquared(nn.Module):
+    """ReLU² activation function for improved performance."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        relu = F.relu(x)
+        return relu * relu
+
+
+class QKNorm(nn.Module):
+    """Query-Key normalization for improved attention stability."""
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.q_norm = nn.LayerNorm(dim, eps=eps, bias=False)
+        self.k_norm = nn.LayerNorm(dim, eps=eps, bias=False)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        return q, k
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-head attention:
+    - FlexAttention with sliding window
+    - QK normalization
+    - RoPE embeddings
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        max_seq_len: int = 2048,
+        rope_theta: float = 10000.0,
+        window_size: int | None = None,
+        use_qk_norm: bool = True,
+        use_flex_attention: bool = True,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.dropout = dropout
+        self.window_size = window_size
+        self.use_flex_attention = use_flex_attention
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        self.qk_norm = QKNorm(self.head_dim) if use_qk_norm else None
+
+        self.freqs_cis = precompute_freqs_cis(self.head_dim, max_seq_len * 2, rope_theta, device)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with improved strategy."""
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+
+        nn.init.zeros_(self.o_proj.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        is_causal: bool = True,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        freqs_cis = self.freqs_cis[:seq_len].to(x.device)
+        q, k = apply_rotary_emb(q, k, freqs_cis)
+
+        if self.qk_norm is not None:
+            q, k = self.qk_norm(q, k)
+
+        q = q.transpose(1, 2)  # (B, H, T, D)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if self.use_flex_attention and hasattr(F, "scaled_dot_product_attention"):
+            try:
+                if self.window_size is not None:
+                    window_mask = self._create_sliding_window_mask(seq_len, x.device)
+                    if mask is not None:
+                        mask = mask & window_mask
+                    else:
+                        mask = window_mask
+
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    out = F.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        attn_mask=mask,
+                        dropout_p=self.dropout if self.training else 0.0,
+                        is_causal=is_causal if mask is None else False,
+                    )
+            except:
+                out = self._standard_attention(q, k, v, mask, is_causal)
+        else:
+            out = self._standard_attention(q, k, v, mask, is_causal)
+
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        return self.o_proj(out)
+
+    def _create_sliding_window_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Create sliding window mask for local attention."""
+        if self.window_size is None:
+            return None
+
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+
+        for i in range(seq_len):
+            start_pos = max(0, i - self.window_size)
+            mask[i, start_pos:i] = False
+
+        return mask
+
+    def _standard_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor | None,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """Standard attention implementation."""
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        if mask is not None:
+            scores = scores.masked_fill(mask, float("-inf"))
+        elif is_causal:
+            seq_len = q.size(-2)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        attn_weights = F.softmax(scores, dim=-1)
+        if self.training and self.dropout > 0:
+            attn_weights = F.dropout(attn_weights, p=self.dropout)
+
+        return torch.matmul(attn_weights, v)
+
+
+class FeedForward(nn.Module):
+    """
+    Feed-forward network with:
+    - ReLU² activation
+    - SwiGLU option
+    - Improved initialization
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        dropout: float = 0.0,
+        activation: str = "relu_squared",
+        use_swiglu: bool = False,
+    ):
+        super().__init__()
+        self.use_swiglu = use_swiglu
+
+        if use_swiglu:
+            self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+            self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+            self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+            self.activation = nn.SiLU()
+        else:
+            self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+            self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+
+            if activation == "relu_squared":
+                self.activation = ReLUSquared()
+            elif activation == "gelu":
+                self.activation = nn.GELU()
+            elif activation == "swish":
+                self.activation = nn.SiLU()
+            else:
+                raise ValueError(f"Unknown activation: {activation}")
+
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with improved strategy."""
+        if self.use_swiglu:
+            nn.init.xavier_uniform_(self.gate_proj.weight)
+            nn.init.xavier_uniform_(self.up_proj.weight)
+            nn.init.zeros_(self.down_proj.weight)
+        else:
+            nn.init.xavier_uniform_(self.up_proj.weight)
+            nn.init.zeros_(self.down_proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_swiglu:
+            gate = self.activation(self.gate_proj(x))
+            up = self.up_proj(x)
+            hidden = gate * up
+        else:
+            hidden = self.activation(self.up_proj(x))
+
+        hidden = self.dropout(hidden)
+        return self.down_proj(hidden)
 
 
 class TransformerBlock(nn.Module):
     """
-    Pre-norm Transformer block with gradient checkpointing support.
-
-    Enhanced with memory efficiency improvements and performance optimizations
-    for modern GPU architectures.
+    Transformer block with:
+    - Pre-norm architecture
+    - Skip connections with U-Net pattern
+    - Modern attention and feed-forward
     """
 
     def __init__(
@@ -26,491 +293,178 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        eps: float = 1e-5,
-        activation: str = "swiglu",
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        """
-        Initialize the Transformer block with optimizations.
-
-        Args:
-            d_model: Dimensionality of the model (input/output dimension)
-            num_heads: Number of attention heads
-            d_ff: Dimensionality of the feed-forward inner layer
-            eps: Epsilon value for RMSNorm numerical stability
-            activation: Type of activation function ("custom" or "swiglu")
-            device: Device to store parameters on
-            dtype: Data type for parameters
-        """
+        dropout: float = 0.0,
+        max_seq_len: int = 2048,
+        rope_theta: float = 10000.0,
+        window_size: int | None = None,
+        use_qk_norm: bool = True,
+        use_flex_attention: bool = True,
+        use_swiglu: bool = False,
+        device: str = "cuda",
+    ):
         super().__init__()
 
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_ff = d_ff
+        self.ln_1 = nn.LayerNorm(d_model, bias=False)
+        self.ln_2 = nn.LayerNorm(d_model, bias=False)
 
-        factory_kwargs = {"device": device, "dtype": dtype}
+        self.attention = MultiHeadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            rope_theta=rope_theta,
+            window_size=window_size,
+            use_qk_norm=use_qk_norm,
+            use_flex_attention=use_flex_attention,
+            device=device,
+        )
 
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, **factory_kwargs)
-        self.ln1 = RMSNorm(d_model, eps, **factory_kwargs)
+        self.feed_forward = FeedForward(
+            d_model=d_model,
+            d_ff=d_ff,
+            dropout=dropout,
+            activation="relu_squared",
+            use_swiglu=use_swiglu,
+        )
 
-        if activation == "custom":
-            self.ffn = CustomFFN(d_model, d_ff, **factory_kwargs)
-        else:
-            self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
-
-        self.ln2 = RMSNorm(d_model, eps, **factory_kwargs)
-
-        self.use_checkpoint = False
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... seq_len d_model"],
-        rope: RotaryPositionalEmbedding | None = None,
-        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
-        """
-        Apply the Transformer block with optional gradient checkpointing.
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        is_causal: bool = True,
+        skip_connection: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        norm_x = self.ln_1(x)
+        attn_out = self.attention(norm_x, mask=mask, is_causal=is_causal)
+        x = x + self.dropout(attn_out)
 
-        Args:
-            x: Input tensor of shape (..., seq_len, d_model)
-            rope: Optional RoPE module for positional encoding
-            token_positions: Token positions for RoPE (required if rope is provided)
+        if skip_connection is not None:
+            x = x + skip_connection
 
-        Returns:
-            Output tensor of same shape as input
-        """
-        if self.use_checkpoint and self.training:
-            return torch.utils.checkpoint.checkpoint(self._forward_impl, x, rope, token_positions, use_reentrant=False)
-        else:
-            return self._forward_impl(x, rope, token_positions)
+        norm_x = self.ln_2(x)
+        ff_out = self.feed_forward(norm_x)
+        x = x + self.dropout(ff_out)
 
-    def _forward_impl(
-        self,
-        x: Float[torch.Tensor, "... seq_len d_model"],
-        rope: RotaryPositionalEmbedding | None = None,
-        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
-        """Internal forward implementation."""
-        normalized_x = self.ln1(x)
-        attn_output = self.attn(normalized_x, rope=rope, token_positions=token_positions)
-        z = x + attn_output
-
-        normalized_z = self.ln2(z)
-        ffn_output = self.ffn(normalized_z)
-        y = z + ffn_output
-
-        return y
-
-    def extra_repr(self) -> str:
-        """String representation for debugging."""
-        return f"d_model={self.d_model}, num_heads={self.num_heads}, d_ff={self.d_ff}"
+        return x
 
 
 class TransformerLM(nn.Module):
     """
-    Transformer Language Model with performance enhancements.
-
-    Enhanced with gradient checkpointing, memory optimizations, and architectural
-    improvements for better training efficiency on modern hardware.
+    Transformer Language Model
     """
 
     def __init__(
         self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_layers: int,
-        num_heads: int,
-        d_ff: int,
+        vocab_size: int = 50304,
+        context_length: int = 2048,
+        d_model: int = 2048,
+        num_layers: int = 24,
+        num_heads: int = 32,
+        d_ff: int = 8192,
+        dropout: float = 0.0,
         rope_theta: float = 10000.0,
-        eps: float = 1e-5,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        """
-        Initialize the Transformer Language Model with optimizations.
-
-        Args:
-            vocab_size: Size of the vocabulary (number of unique tokens)
-            context_length: Maximum sequence length the model can process
-            d_model: Dimensionality of the model (embedding and hidden dimensions)
-            num_layers: Number of Transformer blocks
-            num_heads: Number of attention heads (d_model must be divisible by num_heads)
-            d_ff: Dimensionality of the feed-forward inner layer
-            rope_theta: RoPE theta parameter (typically 10000.0)
-            eps: Epsilon value for RMSNorm numerical stability
-            device: Device to store parameters on
-            dtype: Data type for parameters
-        """
-        super().__init__()
-
-        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
-        assert vocab_size > 0, f"vocab_size must be positive, got {vocab_size}"
-        assert context_length > 0, f"context_length must be positive, got {context_length}"
-        assert num_layers > 0, f"num_layers must be positive, got {num_layers}"
-
-        if d_ff % 64 != 0:
-            d_ff = ((d_ff + 63) // 64) * 64
-
-        self.vocab_size = vocab_size
-        self.context_length = context_length
-        self.d_model = d_model
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.rope_theta = rope_theta
-
-        factory_kwargs = {"device": device, "dtype": dtype}
-
-        self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
-
-        d_k = d_model // num_heads
-        self.rope = RotaryPositionalEmbedding(theta=rope_theta, d_k=d_k, max_seq_len=context_length, device=device)
-
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, **factory_kwargs)
-                for _ in range(num_layers)
-            ]
-        )
-
-        self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
-        self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
-
-        self.use_gradient_checkpointing = False
-        self._gradient_checkpointing_layers = None
-
-    def enable_gradient_checkpointing(self, layers_to_checkpoint: int | None = None) -> None:
-        """
-        Enable gradient checkpointing for memory efficiency.
-
-        Args:
-            layers_to_checkpoint: Number of layers to checkpoint. If None, checkpoints all layers.
-        """
-        self.use_gradient_checkpointing = True
-
-        if layers_to_checkpoint is None:
-            layers_to_checkpoint = self.num_layers
-        else:
-            layers_to_checkpoint = min(layers_to_checkpoint, self.num_layers)
-
-        self._gradient_checkpointing_layers = layers_to_checkpoint
-
-        for i, layer in enumerate(self.layers):
-            if i < layers_to_checkpoint:
-                layer.use_checkpoint = True
-                layer.attn.use_checkpoint = True
-            else:
-                layer.use_checkpoint = False
-                layer.attn.use_checkpoint = False
-
-    def disable_gradient_checkpointing(self) -> None:
-        """Disable gradient checkpointing."""
-        self.use_gradient_checkpointing = False
-        for layer in self.layers:
-            layer.use_checkpoint = False
-            layer.attn.use_checkpoint = False
-
-    def forward(
-        self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
-    ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
-        """
-        Forward pass with memory and compute efficiency.
-
-        Args:
-            input_ids: Input token IDs of shape (batch_size, seq_len)
-
-        Returns:
-            Logits tensor of shape (batch_size, seq_len, vocab_size)
-        """
-        batch_size, seq_len = input_ids.shape
-
-        assert seq_len <= self.context_length, (
-            f"Input sequence length ({seq_len}) exceeds context length ({self.context_length})"
-        )
-
-        token_positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
-        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
-
-        x = self.token_embeddings(input_ids)
-
-        for layer in self.layers:
-            x = layer(x, rope=self.rope, token_positions=token_positions)
-
-        x = self.ln_final(x)
-        logits = self.lm_head(x)
-
-        return logits
-
-    def get_memory_stats(self) -> dict[str, float]:
-        """Get memory usage statistics for monitoring."""
-        if not torch.cuda.is_available():
-            return {}
-
-        stats = {}
-        stats["memory_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
-        stats["memory_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
-        stats["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
-
-        param_memory = sum(p.numel() * p.element_size() for p in self.parameters()) / 1e9
-        stats["parameter_memory_gb"] = param_memory
-
-        return stats
-
-    def count_parameters(self) -> dict[str, int]:
-        """Count model parameters by component."""
-        counts = {}
-
-        counts["embeddings"] = sum(p.numel() for p in self.token_embeddings.parameters())
-
-        if self.layers:
-            layer_params = sum(p.numel() for p in self.layers[0].parameters())
-            counts["transformer_layer"] = layer_params
-            counts["all_transformer_layers"] = layer_params * self.num_layers
-
-        counts["final_ln"] = sum(p.numel() for p in self.ln_final.parameters())
-        counts["lm_head"] = sum(p.numel() for p in self.lm_head.parameters())
-
-        counts["total"] = sum(p.numel() for p in self.parameters())
-        counts["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-        return counts
-
-    def extra_repr(self) -> str:
-        """String representation for debugging."""
-        return (
-            f"vocab_size={self.vocab_size}, context_length={self.context_length}, "
-            f"d_model={self.d_model}, num_layers={self.num_layers}, "
-            f"num_heads={self.num_heads}, d_ff={self.d_ff}, "
-            f"rope_theta={self.rope_theta}"
-        )
-
-
-class EnhancedTransformerLM(nn.Module):
-    """
-    Enhanced Transformer Language Model.
-
-    Features:
-    - U-Net like skip connections with proper learnable mixing parameters
-    - Untied input/output embeddings with different learning rates
-    - CustomFFN activation: w2(max(w1(x), 0)^2)
-    - Mixed precision support with bfloat16
-    - Advanced gradient checkpointing
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_layers: int,
-        num_heads: int,
-        d_ff: int,
-        rope_theta: float = 10000.0,
-        eps: float = 1e-5,
+        window_size: int | None = 1024,
+        use_qk_norm: bool = True,
+        use_flex_attention: bool = True,
+        use_swiglu: bool = False,
         tie_embeddings: bool = False,
-        activation: str = "custom",
-        use_unet_architecture: bool = True,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        """
-        Initialize the Enhanced Transformer Language Model.
-
-        Args:
-            vocab_size: Size of the vocabulary
-            context_length: Maximum sequence length
-            d_model: Model dimension
-            num_layers: Number of transformer layers
-            num_heads: Number of attention heads
-            d_ff: Feed-forward dimension
-            rope_theta: RoPE theta parameter
-            eps: Epsilon for numerical stability
-            tie_embeddings: Whether to tie input and output embeddings
-            activation: Activation function type ("custom" or "swiglu")
-            use_unet_architecture: Whether to use U-Net skip connections
-            device: Device to store parameters on
-            dtype: Data type for parameters
-        """
+        device: str = "cuda",
+    ):
         super().__init__()
-
-        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
-        assert vocab_size > 0, f"vocab_size must be positive, got {vocab_size}"
-        assert context_length > 0, f"context_length must be positive, got {context_length}"
-        assert num_layers > 0, f"num_layers must be positive, got {num_layers}"
-
-        if d_ff % 64 != 0:
-            d_ff = ((d_ff + 63) // 64) * 64
 
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model
         self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.rope_theta = rope_theta
         self.tie_embeddings = tie_embeddings
-        self.activation = activation
-        self.use_unet_architecture = use_unet_architecture
 
-        factory_kwargs = {"device": device, "dtype": dtype}
-
-        self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
-
-        d_k = d_model // num_heads
-        self.rope = RotaryPositionalEmbedding(theta=rope_theta, d_k=d_k, max_seq_len=context_length, device=device)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
 
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
-                    d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, activation=activation, **factory_kwargs
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    max_seq_len=context_length,
+                    rope_theta=rope_theta,
+                    window_size=window_size,
+                    use_qk_norm=use_qk_norm,
+                    use_flex_attention=use_flex_attention,
+                    use_swiglu=use_swiglu,
+                    device=device,
                 )
                 for _ in range(num_layers)
             ]
         )
 
-        if use_unet_architecture:
-            self.skip_layers = num_layers // 2
-            self.skip_mixing = nn.ParameterList(
-                [nn.Parameter(torch.zeros(1, **factory_kwargs)) for _ in range(self.skip_layers)]
-            )
-        else:
-            self.skip_layers = 0
-            self.skip_mixing = None
-
-        self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
+        self.ln_f = nn.LayerNorm(d_model, bias=False)
 
         if tie_embeddings:
             self.lm_head = None
         else:
-            self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
+            self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        self.use_gradient_checkpointing = False
-        self._gradient_checkpointing_layers = None
+        self.skip_embeddings = nn.ModuleList([nn.Linear(d_model, d_model, bias=False) for _ in range(num_layers // 2)])
 
-    def enable_gradient_checkpointing(self, layers_to_checkpoint: int | None = None) -> None:
-        """Enable gradient checkpointing for memory efficiency."""
-        self.use_gradient_checkpointing = True
+        self._init_weights()
 
-        if layers_to_checkpoint is None:
-            layers_to_checkpoint = self.num_layers
-        else:
-            layers_to_checkpoint = min(layers_to_checkpoint, self.num_layers)
+        self.to(device)
 
-        self._gradient_checkpointing_layers = layers_to_checkpoint
+    def _init_weights(self):
+        """Initialize weights with modern best practices."""
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
 
-        for i, layer in enumerate(self.layers):
-            if i < layers_to_checkpoint:
-                layer.use_checkpoint = True
-                layer.attn.use_checkpoint = True
-            else:
-                layer.use_checkpoint = False
-                layer.attn.use_checkpoint = False
+        for skip_emb in self.skip_embeddings:
+            nn.init.zeros_(skip_emb.weight)
 
-    def disable_gradient_checkpointing(self) -> None:
-        """Disable gradient checkpointing."""
-        self.use_gradient_checkpointing = False
-        for layer in self.layers:
-            layer.use_checkpoint = False
-            layer.attn.use_checkpoint = False
+        if self.lm_head is not None:
+            nn.init.zeros_(self.lm_head.weight)
 
     def forward(
-        self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
-    ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
-        """
-        Forward pass with improved U-Net skip connections.
-
-        Args:
-            input_ids: Input token IDs of shape (batch_size, seq_len)
-
-        Returns:
-            Logits tensor of shape (batch_size, seq_len, vocab_size)
-        """
+        self,
+        input_ids: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        is_causal: bool = True,
+    ) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
 
-        assert seq_len <= self.context_length, (
-            f"Input sequence length ({seq_len}) exceeds context length ({self.context_length})"
-        )
+        x = self.token_embedding(input_ids)
 
-        token_positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
-        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+        skip_connections = {}
 
-        x = self.token_embeddings(input_ids)
+        for i, layer in enumerate(self.layers):
+            skip_connection = None
+            if i < len(self.skip_embeddings):
+                skip_emb = self.skip_embeddings[i](x)
+                skip_connections[i] = skip_emb
 
-        skip_connections = [] if self.use_unet_architecture else None
-
-        for i in range(self.skip_layers):
-            x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
-            if self.use_unet_architecture:
-                skip_connections.append(x)
-
-        for i in range(self.skip_layers, self.num_layers):
-            x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
-
-            if self.use_unet_architecture and i < self.num_layers:
+            if i >= self.num_layers // 2:
                 skip_idx = self.num_layers - 1 - i
-                if 0 <= skip_idx < len(skip_connections):
+                if skip_idx in skip_connections:
                     skip_connection = skip_connections[skip_idx]
-                    mixing_weight = torch.sigmoid(self.skip_mixing[skip_idx])
-                    x = (1 - mixing_weight) * x + mixing_weight * skip_connection
 
-        x = self.ln_final(x)
+            x = layer(x, mask=mask, is_causal=is_causal, skip_connection=skip_connection)
 
-        if self.tie_embeddings:
-            logits = torch.matmul(x, self.token_embeddings.weight.t())
-        else:
+        x = self.ln_f(x)
+
+        if self.lm_head is not None:
             logits = self.lm_head(x)
+        else:
+            logits = F.linear(x, self.token_embedding.weight)
 
         return logits
 
-    def get_memory_stats(self) -> dict[str, float]:
-        """Get memory usage statistics for monitoring."""
-        if not torch.cuda.is_available():
-            return {}
+    def configure_optimizers(self, learning_rate: float, weight_decay: float, betas: tuple[float, float]):
+        """Configure optimizers using the hybrid Muon approach."""
+        from ..training.muon_optimizer import MuonAdamHybrid
 
-        stats = {}
-        stats["memory_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
-        stats["memory_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
-        stats["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
-
-        param_memory = sum(p.numel() * p.element_size() for p in self.parameters()) / 1e9
-        stats["parameter_memory_gb"] = param_memory
-
-        return stats
-
-    def count_parameters(self) -> dict[str, int]:
-        """Count model parameters by component."""
-        counts = {}
-
-        counts["embeddings"] = sum(p.numel() for p in self.token_embeddings.parameters())
-
-        if self.layers:
-            layer_params = sum(p.numel() for p in self.layers[0].parameters())
-            counts["transformer_layer"] = layer_params
-            counts["all_transformer_layers"] = layer_params * self.num_layers
-
-        if self.use_unet_architecture:
-            counts["skip_mixing"] = sum(p.numel() for p in self.skip_mixing)
-
-        counts["final_ln"] = sum(p.numel() for p in self.ln_final.parameters())
-
-        if self.lm_head is not None:
-            counts["lm_head"] = sum(p.numel() for p in self.lm_head.parameters())
-        else:
-            counts["lm_head"] = 0
-
-        counts["total"] = sum(p.numel() for p in self.parameters())
-        counts["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-        return counts
-
-    def extra_repr(self) -> str:
-        """String representation for debugging."""
-        return (
-            f"vocab_size={self.vocab_size}, context_length={self.context_length}, "
-            f"d_model={self.d_model}, num_layers={self.num_layers}, "
-            f"num_heads={self.num_heads}, d_ff={self.d_ff}, "
-            f"rope_theta={self.rope_theta}, tie_embeddings={self.tie_embeddings}, "
-            f"activation={self.activation}, use_unet_architecture={self.use_unet_architecture}"
+        return MuonAdamHybrid(
+            self.parameters(),
+            lr=learning_rate,
+            betas=betas,
+            weight_decay=weight_decay,
         )

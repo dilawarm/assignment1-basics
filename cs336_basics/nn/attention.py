@@ -1,229 +1,206 @@
 """
-Attention mechanisms and positional embeddings with FlashAttention-2 optimization.
+Attention mechanisms for Transformer models.
+
+This module implements various attention mechanisms including scaled dot-product attention,
+multi-head self-attention, and rotary positional embedding (RoPE).
 """
 
-from __future__ import annotations
-
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from jaxtyping import Float, Int
-
-from cs336_basics.nn.activations import softmax
-from cs336_basics.nn.layers import Linear
+from torch import Tensor
 
 
 def scaled_dot_product_attention(
-    Q: Float[torch.Tensor, "... n_queries d_k"],
-    K: Float[torch.Tensor, "... n_keys d_k"],
-    V: Float[torch.Tensor, "... n_values d_v"],
-    mask: Float[torch.Tensor, "... n_queries n_key"] | None = None,
-    use_flash_attention: bool = True,
-) -> Float[torch.Tensor, "... n_queries d_v"]:
+    Q: Float[Tensor, "... queries d_k"],
+    K: Float[Tensor, "... keys d_k"],
+    V: Float[Tensor, "... values d_v"],
+    mask: Optional[Float[Tensor, "... queries keys"]] = None,
+) -> Float[Tensor, "... queries d_v"]:
     """
-    Scaled Dot-Product Attention with FlashAttention-2 optimization.
-
-    Uses PyTorch's scaled_dot_product_attention when available for better
-    memory efficiency and performance, especially on modern GPUs like H100.
+    Compute scaled dot-product attention.
 
     Args:
-        Q: Query tensor of shape (..., n_queries, d_k)
-        K: Key tensor of shape (..., n_keys, d_k)
-        V: Value tensor of shape (..., n_values, d_v)
-        mask: Optional attention mask
-        use_flash_attention: Whether to use attention when available
+        Q: Query tensor of shape (..., queries, d_k)
+        K: Key tensor of shape (..., keys, d_k)
+        V: Value tensor of shape (..., values, d_v)
+        mask: Optional mask tensor of shape (..., queries, keys)
 
     Returns:
-        Output tensor with shape (..., n_queries, d_v)
+        Output tensor of shape (..., queries, d_v)
     """
-    if use_flash_attention and hasattr(F, "scaled_dot_product_attention"):
-        if mask is None:
-            return F.scaled_dot_product_attention(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=True)
-        else:
-            return F.scaled_dot_product_attention(Q, K, V, attn_mask=mask, dropout_p=0.0, is_causal=False)
-    else:
-        d_k = Q.shape[-1]
-        scores = torch.einsum("...qd,...kd->...qk", Q, K) / math.sqrt(d_k)
+    d_k = Q.size(-1)
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
 
-        if mask is not None:
-            scores = scores.masked_fill(~mask, float("-inf"))
+    if mask is not None:
+        scores = scores + mask
 
-        attention_weights = softmax(scores, dim=-1)
-        output = torch.einsum("...qk,...kv->...qv", attention_weights, V)
-        return output
+    attn_weights = F.softmax(scores, dim=-1)
+
+    output = torch.matmul(attn_weights, V)
+
+    return output
 
 
 class RotaryPositionalEmbedding(nn.Module):
     """
-    Rotary Position Embedding (RoPE) implementation.
+    Rotary Positional Embedding (RoPE) implementation.
 
-    Enhanced with better memory efficiency and tensor core optimization.
+    RoPE applies rotation to query and key embeddings based on their position,
+    enabling the model to understand relative positions naturally.
     """
 
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None) -> None:
+    def __init__(
+        self,
+        theta: float,
+        d_k: int,
+        max_seq_len: int,
+        device: Optional[torch.device] = None,
+    ):
         """
-        Initialize the RoPE module with optimizations.
+        Initialize RoPE.
 
         Args:
-            theta: θ value for RoPE (typically 10000)
-            d_k: Dimension of query and key vectors
-            max_seq_len: Maximum sequence length for precomputing values
-            device: Device to store buffers on
+            theta: Base frequency for RoPE
+            d_k: Dimension of the key/query embeddings
+            max_seq_len: Maximum sequence length
+            device: Device to place tensors on
         """
         super().__init__()
-
         self.theta = theta
         self.d_k = d_k
         self.max_seq_len = max_seq_len
 
-        assert d_k % 2 == 0, f"d_k must be even, got {d_k}"
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, dtype=torch.float32) / d_k))
+        if device is not None:
+            inv_freq = inv_freq.to(device)
 
-        dim_indices = torch.arange(0, d_k // 2, dtype=torch.float32)
-        frequencies = 1.0 / (theta ** (2.0 * dim_indices / d_k))
-        positions = torch.arange(max_seq_len, dtype=torch.float32)
-        angles = torch.outer(positions, frequencies)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        cos_values = torch.cos(angles).contiguous()
-        sin_values = torch.sin(angles).contiguous()
+        position = torch.arange(max_seq_len, dtype=torch.float32)
+        if device is not None:
+            position = position.to(device)
 
-        self.register_buffer("cos_values", cos_values.to(device), persistent=False)
-        self.register_buffer("sin_values", sin_values.to(device), persistent=False)
+        freqs = torch.outer(position, inv_freq)
+        cos_freqs = torch.cos(freqs)
+        sin_freqs = torch.sin(freqs)
+
+        self.register_buffer("cos_freqs", cos_freqs, persistent=False)
+        self.register_buffer("sin_freqs", sin_freqs, persistent=False)
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... seq_len d_k"],
-        token_positions: Int[torch.Tensor, "... seq_len"],
-    ) -> Float[torch.Tensor, "... seq_len d_k"]:
+        x: Float[Tensor, "... sequence_length d_k"],
+        token_positions: Int[Tensor, "... sequence_length"],
+    ) -> Float[Tensor, "... sequence_length d_k"]:
         """
-        Apply rotary position embedding with memory access patterns.
+        Apply RoPE to input tensor.
 
         Args:
-            x: Input tensor with arbitrary batch dimensions (..., seq_len, d_k)
-            token_positions: Position indices for each token (..., seq_len)
+            x: Input tensor of shape (..., sequence_length, d_k)
+            token_positions: Position indices of shape (..., sequence_length)
 
         Returns:
-            Output tensor with same shape as input but with RoPE applied
+            Rotated tensor of shape (..., sequence_length, d_k)
         """
-        cos_vals = self.cos_values[token_positions]
-        sin_vals = self.sin_values[token_positions]
+        cos = self.cos_freqs[token_positions]  # (..., seq_len, d_k//2)
+        sin = self.sin_freqs[token_positions]  # (..., seq_len, d_k//2)
 
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
+        x_even = x[..., 0::2]  # (..., seq_len, d_k//2)
+        x_odd = x[..., 1::2]  # (..., seq_len, d_k//2)
 
-        x_new_even = cos_vals * x_even - sin_vals * x_odd
-        x_new_odd = sin_vals * x_even + cos_vals * x_odd
+        rotated_even = x_even * cos - x_odd * sin
+        rotated_odd = x_even * sin + x_odd * cos
 
-        result = torch.stack([x_new_even, x_new_odd], dim=-1)
-        return result.flatten(-2)
+        output = torch.stack([rotated_even, rotated_odd], dim=-1)
+        output = output.view_as(x)
 
-    def extra_repr(self) -> str:
-        """String representation for debugging."""
-        return f"theta={self.theta}, d_k={self.d_k}, max_seq_len={self.max_seq_len}"
+        return output
 
 
 class MultiHeadSelfAttention(nn.Module):
     """
-    Causal Multi-Head Self-Attention with FlashAttention-2.
+    Multi-Head Self-Attention mechanism with optional RoPE support.
 
-    Enhanced with memory-efficient implementations and better GPU utilization.
+    This implementation uses a fused QKV projection for efficiency.
     """
 
     def __init__(
         self,
         d_model: int,
         num_heads: int,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
         """
-        Initialize the Multi-Head Self-Attention layer with optimizations.
+        Initialize Multi-Head Self-Attention.
 
         Args:
-            d_model: Dimensionality of the model (input/output dimension)
+            d_model: Model dimension
             num_heads: Number of attention heads
-            device: Device to store parameters on
+            device: Device to place parameters on
             dtype: Data type for parameters
         """
         super().__init__()
 
-        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        assert d_model % num_heads == 0, f"d_model {d_model} must be divisible by num_heads {num_heads}"
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
-        self.d_v = d_model // num_heads
 
-        factory_kwargs = {"device": device, "dtype": dtype}
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False, device=device, dtype=dtype)
 
-        self.qkv_proj = Linear(d_model, 3 * d_model, **factory_kwargs)
-        self.output_proj = Linear(d_model, d_model, **factory_kwargs)
-
-        self.use_checkpoint = False
+        self.output_proj = nn.Linear(d_model, d_model, bias=False, device=device, dtype=dtype)
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... seq_len d_model"],
-        rope: RotaryPositionalEmbedding | None = None,
-        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        x: Float[Tensor, "... sequence_length d_model"],
+        rope: Optional[RotaryPositionalEmbedding] = None,
+        token_positions: Optional[Int[Tensor, "... sequence_length"]] = None,
+    ) -> Float[Tensor, "... sequence_length d_model"]:
         """
-        Apply causal multi-head self-attention with optimizations.
+        Forward pass of multi-head self-attention.
 
         Args:
-            x: Input tensor of shape (..., seq_len, d_model)
+            x: Input tensor of shape (..., sequence_length, d_model)
             rope: Optional RoPE module for positional encoding
-            token_positions: Token positions for RoPE (required if rope is provided)
+            token_positions: Optional position indices for RoPE
 
         Returns:
-            Output tensor of same shape as input
+            Output tensor of shape (..., sequence_length, d_model)
         """
-        if self.use_checkpoint and self.training:
-            return torch.utils.checkpoint.checkpoint(self._forward_impl, x, rope, token_positions, use_reentrant=False)
-        else:
-            return self._forward_impl(x, rope, token_positions)
+        batch_shape = x.shape[:-2]
+        seq_len = x.shape[-2]
 
-    def _forward_impl(
-        self,
-        x: Float[torch.Tensor, "... seq_len d_model"],
-        rope: RotaryPositionalEmbedding | None = None,
-        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
-        """Internal forward implementation."""
-        *batch_dims, seq_len, d_model = x.shape
+        qkv = self.qkv_proj(x)  # (..., seq_len, 3 * d_model)
 
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(*batch_dims, seq_len, 3, self.num_heads, self.d_k)
-        qkv = qkv.permute(*range(len(batch_dims)), -3, -2, -4, -1)
+        qkv = qkv.view(*batch_shape, seq_len, 3, self.num_heads, self.d_k)
+        qkv = qkv.permute(*range(len(batch_shape)), -3, -2, -4, -1)  # (..., 3, num_heads, seq_len, d_k)
 
-        Q, K, V = qkv.unbind(dim=len(batch_dims))
+        q, k, v = qkv.unbind(dim=-4)  # Each: (..., num_heads, seq_len, d_k)
 
         if rope is not None and token_positions is not None:
-            original_q_shape = Q.shape
-            original_k_shape = K.shape
+            q_rope = []
+            k_rope = []
+            for head in range(self.num_heads):
+                q_head = rope(q[..., head, :, :], token_positions)
+                k_head = rope(k[..., head, :, :], token_positions)
+                q_rope.append(q_head)
+                k_rope.append(k_head)
 
-            Q_flat = Q.reshape(-1, seq_len, self.d_k)
-            K_flat = K.reshape(-1, seq_len, self.d_k)
+            q = torch.stack(q_rope, dim=-3)  # (..., num_heads, seq_len, d_k)
+            k = torch.stack(k_rope, dim=-3)  # (..., num_heads, seq_len, d_k)
 
-            pos_expanded = token_positions.unsqueeze(-2)
-            pos_expanded = pos_expanded.expand(*batch_dims, self.num_heads, seq_len)
-            pos_flat = pos_expanded.reshape(-1, seq_len)
+        attn_output = scaled_dot_product_attention(q, k, v)  # (..., num_heads, seq_len, d_k)
 
-            Q_flat = rope(Q_flat, pos_flat)
-            K_flat = rope(K_flat, pos_flat)
-
-            Q = Q_flat.reshape(original_q_shape)
-            K = K_flat.reshape(original_k_shape)
-
-        attn_output = scaled_dot_product_attention(Q, K, V, mask=None, use_flash_attention=True)
-
-        attn_output = attn_output.transpose(-3, -2)
-        attn_output = attn_output.contiguous().view(*batch_dims, seq_len, self.d_model)
+        attn_output = attn_output.permute(*range(len(batch_shape)), -2, -3, -1)  # (..., seq_len, num_heads, d_k)
+        attn_output = attn_output.contiguous().view(*batch_shape, seq_len, self.d_model)
 
         output = self.output_proj(attn_output)
-        return output
 
-    def extra_repr(self) -> str:
-        """String representation for debugging."""
-        return f"d_model={self.d_model}, num_heads={self.num_heads}, d_k={self.d_k}"
+        return output
