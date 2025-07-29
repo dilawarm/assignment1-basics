@@ -7,6 +7,7 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -89,14 +90,20 @@ class TrainModel:
         self.step = 0
         self.device = torch.device(args.device)
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamped_experiment_name = f"{args.experiment_name}_{timestamp}"
+        self.experiment_timestamp = timestamp
+
         self.experiment_logger = ExperimentLogger(
-            experiment_name=args.experiment_name,
+            experiment_name=timestamped_experiment_name,
             description=args.experiment_description,
             log_dir=args.log_dir,
             use_wandb=args.use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity if args.wandb_entity else None,
         )
+
+        print(f"🔬 Experiment: {timestamped_experiment_name}")
 
         self.experiment_logger.log_hyperparameters(**asdict(args))
 
@@ -365,7 +372,7 @@ class TrainModel:
                 )
 
             if step > 0 and step % self.args.checkpoint_step_interval == 0:
-                checkpoint_path = f"checkpoint_step_{step}.pt"
+                checkpoint_path = f"checkpoint_{self.experiment_timestamp}_step_{step}.pt"
                 save_checkpoint(self.model, self.optimizer, step, checkpoint_path)
                 self.experiment_logger.add_note(f"Checkpoint saved: {checkpoint_path}")
                 print(f"Saved checkpoint: {checkpoint_path}")
@@ -390,7 +397,7 @@ class TrainModel:
             training_hours=final_elapsed_time / 3600,
         )
 
-        final_checkpoint = f"final_checkpoint_step_{self.args.steps}.pt"
+        final_checkpoint = f"final_checkpoint_{self.experiment_timestamp}_step_{self.args.steps}.pt"
         save_checkpoint(self.model, self.optimizer, self.args.steps, final_checkpoint)
         print(f"Saved final checkpoint: {final_checkpoint}")
 
