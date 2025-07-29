@@ -166,15 +166,40 @@ class MultiHeadAttention(nn.Module):
                     else:
                         mask = window_mask
 
-                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    out = F.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        attn_mask=mask,
-                        dropout_p=self.dropout if self.training else 0.0,
-                        is_causal=is_causal if mask is None else False,
-                    )
+                # Try multiple backends with fallback
+                try:
+                    # First try with flash attention
+                    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                        out = F.scaled_dot_product_attention(
+                            q,
+                            k,
+                            v,
+                            attn_mask=mask,
+                            dropout_p=self.dropout if self.training else 0.0,
+                            is_causal=is_causal if mask is None else False,
+                        )
+                except:
+                    # Fallback to efficient attention or math backend
+                    try:
+                        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                            out = F.scaled_dot_product_attention(
+                                q,
+                                k,
+                                v,
+                                attn_mask=mask,
+                                dropout_p=self.dropout if self.training else 0.0,
+                                is_causal=is_causal if mask is None else False,
+                            )
+                    except:
+                        # Final fallback: use default backend selection
+                        out = F.scaled_dot_product_attention(
+                            q,
+                            k,
+                            v,
+                            attn_mask=mask,
+                            dropout_p=self.dropout if self.training else 0.0,
+                            is_causal=is_causal if mask is None else False,
+                        )
             except:
                 out = self._standard_attention(q, k, v, mask, is_causal)
         else:

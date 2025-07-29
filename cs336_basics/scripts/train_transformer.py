@@ -200,6 +200,24 @@ class Trainer:
             except Exception as e:
                 self.experiment_logger.add_note(f"Model compilation failed: {e}")
                 print(f"⚠️ Model compilation failed: {e}")
+                print("🔄 Falling back to eager mode...")
+                # Try fallback compilation modes
+                try:
+                    print("⚡ Trying reduce-overhead compilation mode...")
+                    self.model = torch.compile(self.model, mode="reduce-overhead")
+                    self.experiment_logger.add_note("Model compiled with reduce-overhead mode")
+                    print("✅ Model compiled with reduce-overhead mode")
+                except Exception as e2:
+                    print(f"⚠️ Reduce-overhead compilation also failed: {e2}")
+                    print("🔄 Trying default compilation mode...")
+                    try:
+                        self.model = torch.compile(self.model, mode="default")
+                        self.experiment_logger.add_note("Model compiled with default mode")
+                        print("✅ Model compiled with default mode")
+                    except Exception as e3:
+                        print(f"⚠️ All compilation modes failed: {e3}")
+                        print("🏃 Running in eager mode (no compilation)")
+                        self.experiment_logger.add_note("Model compilation completely failed, running in eager mode")
 
         print("🔧 Initializing Muon optimizer...")
         self.optimizer = MuonAdamHybrid(
