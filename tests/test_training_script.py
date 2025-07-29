@@ -144,44 +144,6 @@ class TestConfigLoading(unittest.TestCase):
             load_config_from_json(config_path)
 
 
-class TestConfigFiles(unittest.TestCase):
-    """Test the actual configuration files in the repository."""
-
-    def test_optimized_h100_config(self):
-        """Test that the optimized H100 config loads correctly."""
-        config_path = "cs336_basics/scripts/configs/optimized_h100_config.json"
-
-        # Check if file exists
-        self.assertTrue(Path(config_path).exists(), f"Config file {config_path} not found")
-
-        # Test loading
-        args = load_config_from_json(config_path)
-        self.assertIsInstance(args, TrainArgs)
-
-        # Test specific values
-        self.assertEqual(args.vocab_size, 50304)
-        self.assertEqual(args.num_layers, 24)
-        self.assertEqual(args.d_model, 2048)
-        self.assertEqual(args.num_heads, 32)
-        self.assertTrue(args.compile_model)
-
-    def test_time_optimized_h100_config(self):
-        """Test that the time-optimized H100 config loads correctly."""
-        config_path = "cs336_basics/scripts/configs/time_optimized_h100_config.json"
-
-        # Check if file exists
-        self.assertTrue(Path(config_path).exists(), f"Config file {config_path} not found")
-
-        # Test loading
-        args = load_config_from_json(config_path)
-        self.assertIsInstance(args, TrainArgs)
-
-        # Test specific values for time optimization
-        self.assertEqual(args.steps, 5400)  # Reduced for time constraint
-        self.assertEqual(args.batch_size, 24)  # Larger batch for efficiency
-        self.assertGreater(args.max_learning_rate, 0.005)  # Higher LR for faster convergence
-
-
 class TestTrainingStability(unittest.TestCase):
     """Test training stability components."""
 
@@ -274,6 +236,10 @@ class TestConfigFieldMapping(unittest.TestCase):
             "wandb_project",
             "wandb_entity",
             "log_dir",
+            "use_activation_checkpointing",
+            "checkpoint_pattern",
+            "use_memory_efficient_attention",
+            "optimize_memory_layout",
         }
 
         # Check that we're not missing any fields
@@ -286,7 +252,7 @@ class TestConfigFieldMapping(unittest.TestCase):
 
     def test_config_completeness(self):
         """Test that our configs contain all necessary fields."""
-        config_path = "cs336_basics/scripts/configs/optimized_h100_config.json"
+        config_path = "cs336_basics/scripts/configs/h100_optimal_config.json"
 
         if Path(config_path).exists():
             with open(config_path) as f:

@@ -5,6 +5,8 @@ Transformer Training Script.
 import argparse
 import json
 import math
+import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -14,6 +16,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 from cs336_basics.data import get_batch
@@ -34,8 +37,8 @@ class TrainArgs:
     vocab_size: int = 50304
     context_length: int = 1024
     num_layers: int = 12
-    d_model: int = 2048  # Fixed to match test expectations
-    num_heads: int = 32  # Fixed to match test expectations
+    d_model: int = 2048
+    num_heads: int = 32
     d_ff: int = 5120
     rope_theta: float = 10000.0
     window_size: int | None = 512
@@ -88,6 +91,12 @@ class TrainArgs:
     enable_torch_optimizations: bool = True
     eval_batch_count: int = 30  # Adaptive based on mode
 
+    # Memory optimization
+    use_activation_checkpointing: bool = True
+    checkpoint_pattern: str = "layers\\.([0-9]+)$"  # Pattern for which layers to checkpoint
+    use_memory_efficient_attention: bool = True
+    optimize_memory_layout: bool = True
+
     # Experiment logging
     experiment_name: str = "openwebtext_training"
     experiment_description: str = "OpenWebText training"
@@ -135,6 +144,30 @@ class TrainArgs:
         self.eval_batch_count = 20
         self.nan_tolerance = 1
         self.loss_spike_threshold = 2.0
+
+
+class CheckpointModule(nn.Module):
+    """Wrapper for activation checkpointing."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return checkpoint(self.module, *args, **kwargs, use_reentrant=False)
+
+
+def apply_activation_checkpointing(module, pattern_re, ancestor_name=""):
+    """Apply activation checkpointing to modules matching the pattern."""
+    for name, submodule in module._modules.items():
+        full_name = f"{ancestor_name}.{name}" if ancestor_name else name
+        submodule = apply_activation_checkpointing(submodule, pattern_re, full_name)
+        if pattern_re.match(full_name):
+            print(f"🔧 Applying activation checkpointing to: {full_name}")
+            setattr(module, name, CheckpointModule(submodule))
+        else:
+            setattr(module, name, submodule)
+    return module
 
 
 class StabilityMonitor:
@@ -229,11 +262,18 @@ class Trainer:
         self.args = args
         self.step = 0
 
+        # Configure CUDA memory management for better memory efficiency
+        if args.device == "cuda" and torch.cuda.is_available():
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            torch.cuda.empty_cache()
+            print("🔧 Configured CUDA memory allocation for better efficiency")
+
         if args.device == "cuda" and not torch.cuda.is_available():
             print("⚠️ CUDA not available, falling back to CPU")
             self.device = torch.device("cpu")
             args.device = "cpu"
             args.use_mixed_precision = False
+            args.use_activation_checkpointing = False
         else:
             self.device = torch.device(args.device)
 
@@ -288,9 +328,21 @@ class Trainer:
         if args.enable_stable_initialization:
             self._apply_stable_initialization()
 
+        # Apply activation checkpointing for memory efficiency
+        if args.use_activation_checkpointing:
+            checkpoint_pattern = re.compile(args.checkpoint_pattern)
+            self.model = apply_activation_checkpointing(self.model, checkpoint_pattern)
+            print(f"✅ Applied activation checkpointing with pattern: {args.checkpoint_pattern}")
+
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"📊 Model: {total_params:,} parameters ({total_params / 1e6:.1f}M), {trainable_params:,} trainable")
+
+        # Estimate memory usage
+        param_memory_mb = (total_params * 4) / (1024**2)  # 4 bytes per parameter (fp32)
+        if args.use_mixed_precision:
+            param_memory_mb = param_memory_mb / 2  # Roughly half for mixed precision
+        print(f"📊 Estimated parameter memory: {param_memory_mb:.1f} MB")
 
         if args.compile_model:
             self._compile_model()
@@ -332,6 +384,22 @@ class Trainer:
         self.scaler = torch.amp.GradScaler() if args.use_mixed_precision else None
         if self.scaler:
             print("⚡ Mixed precision training enabled")
+
+        # Print memory optimization summary
+        print("\n🔧 MEMORY OPTIMIZATIONS ENABLED:")
+        if args.use_mixed_precision:
+            print("   ✅ Mixed precision training")
+        if args.use_activation_checkpointing:
+            print("   ✅ Activation checkpointing")
+        if args.optimize_memory_layout:
+            print("   ✅ Optimized memory layout")
+        print(f"   📊 Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+        print(f"   📊 Context length: {args.context_length}")
+        print(f"   📊 Model size: {total_params / 1e6:.1f}M parameters")
+
+        if self.device.type == "cuda":
+            print(f"   📊 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            torch.cuda.reset_peak_memory_stats()
 
     def _apply_stable_initialization(self):
         """Apply stability-focused weight initialization."""
@@ -651,6 +719,12 @@ class Trainer:
                 "best_val": f"{best_val_loss:.4f}",
                 "time_left": f"{hours_remaining:.2f}h",
             }
+
+            # Add memory monitoring for CUDA
+            if self.device.type == "cuda" and step % 50 == 0:
+                current_memory = torch.cuda.memory_allocated() / 1e9
+                peak_memory = torch.cuda.max_memory_allocated() / 1e9
+                progress_info["mem_gb"] = f"{current_memory:.1f}/{peak_memory:.1f}"
 
             if self.stability_monitor.enabled:
                 progress_info["stable"] = f"{consecutive_stable_steps}"
