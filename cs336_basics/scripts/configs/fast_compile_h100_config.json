@@ -1,0 +1,46 @@
+{
+    "vocab_size": 50304,
+    "context_length": 1024,
+    "num_layers": 12,
+    "d_model": 1280,
+    "num_heads": 20,
+    "d_ff": 5120,
+    "rope_theta": 10000,
+    "window_size": 512,
+    "use_qk_norm": true,
+    "use_flex_attention": false,
+    "use_swiglu": true,
+    "tie_embeddings": true,
+    
+    "weight_decay": 0.1,
+    "betas": [0.9, 0.95],
+    "muon_momentum": 0.95,
+    
+    "max_learning_rate": 0.01,
+    "min_learning_rate": 0.001,
+    "warmup_iters": 300,
+    "cosine_cycle_iters": 10000,
+    
+    "training_set": "data/encoded/owt_train_tokens.npy",
+    "validation_set": "data/encoded/owt_valid_tokens.npy",
+    
+    "validation_step_interval": 120,
+    "checkpoint_step_interval": 1200,
+    "steps": 10000,
+    "batch_size": 40,
+    "gradient_accumulation_steps": 2,
+    "gradient_clipping": 1.0,
+    
+    "device": "cuda",
+    "compile_model": true,
+    "use_mixed_precision": true,
+    "use_efficient_attention": true,
+    "use_fused_kernels": true,
+    
+    "experiment_name": "fast_compile_h100_training",
+    "experiment_description": "Fast compilation + maximum training steps in 1.5h",
+    "use_wandb": true,
+    "wandb_project": "cs336-assignment1",
+    "wandb_entity": "",
+    "log_dir": "experiments"
+}
