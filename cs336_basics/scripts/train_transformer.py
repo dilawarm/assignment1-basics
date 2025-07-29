@@ -1,14 +1,10 @@
 """
 Simple Transformer Training Script
-
-A clean and straightforward training setup similar to the Jupyter notebook implementation,
-but using the existing repository components.
 """
 
 import argparse
 import json
 import math
-import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -16,14 +12,14 @@ from typing import Any
 
 import numpy as np
 import torch
-import wandb
 from tqdm import tqdm
 
 from cs336_basics.data import get_batch
+from cs336_basics.experiments.exp_logging import ExperimentLogger, TrainingIntegrator
 from cs336_basics.loss.cross_entropy import cross_entropy
 from cs336_basics.nn.models import TransformerLM
 from cs336_basics.tokenization.tokenizer import Tokenizer
-from cs336_basics.training.checkpoint import load_checkpoint, save_checkpoint
+from cs336_basics.training.checkpoint import save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
 from cs336_basics.training.optimizers import AdamW
@@ -53,10 +49,10 @@ class TrainModelArgs:
     cosine_cycle_iters: int = 40960
 
     # Data paths
-    training_set: str = "owt_train_tokens.npy"
-    validation_set: str = "owt_valid_tokens.npy"
-    tokenizer_vocab: str = "openwebtext_vocab.json"
-    tokenizer_merges: str = "openwebtext_merges.pkl"
+    training_set: str = "data/encoded/owt_train_tokens.npy"
+    validation_set: str = "data/encoded/owt_valid_tokens.npy"
+    tokenizer_vocab: str = "data/encoded/openwebtext_vocab.json"
+    tokenizer_merges: str = "data/encoded/openwebtext_merges.pkl"
 
     # Training configuration
     validation_step_interval: int = 500
@@ -69,10 +65,13 @@ class TrainModelArgs:
     device: str = "cuda"
     compile_model: bool = True
 
-    # Wandb settings
-    wandb_active: bool = False
+    # Experiment logging settings
+    experiment_name: str = "transformer_training"
+    experiment_description: str = "Transformer language model training"
+    use_wandb: bool = True
     wandb_project: str = "cs336-assignment1"
-    wandb_run: str = ""
+    wandb_entity: str = ""
+    log_dir: str = "experiments"
 
     def __post_init__(self):
         """Validate configuration."""
@@ -86,14 +85,29 @@ class TrainModelArgs:
 
 
 class TrainModel:
-    """Simple trainer class similar to the notebook implementation."""
+    """Simple trainer class with comprehensive production logging."""
 
     def __init__(self, args: TrainModelArgs):
         self.args = args
         self.step = 0
         self.device = torch.device(args.device)
 
-        # Setup model
+        self.experiment_logger = ExperimentLogger(
+            experiment_name=args.experiment_name,
+            description=args.experiment_description,
+            log_dir=args.log_dir,
+            use_wandb=args.use_wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity if args.wandb_entity else None,
+        )
+
+        self.experiment_logger.log_hyperparameters(**asdict(args))
+
+        self.training_integrator = TrainingIntegrator(
+            experiment_logger=self.experiment_logger,
+            hardware_log_interval=50,
+        )
+
         self.model = TransformerLM(
             vocab_size=args.vocab_size,
             context_length=args.context_length,
@@ -105,39 +119,76 @@ class TrainModel:
             device=self.device,
         )
 
-        # Compile model if requested
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.experiment_logger.add_note(
+            f"Model initialized: {total_params:,} total parameters, {trainable_params:,} trainable"
+        )
+
         if args.compile_model and self.device.type == "cuda":
             try:
                 self.model = torch.compile(self.model)
+                self.experiment_logger.add_note("Model compiled successfully with torch.compile")
                 print("✅ Model compiled successfully")
             except Exception as e:
+                self.experiment_logger.add_note(f"Model compilation failed: {e}")
                 print(f"⚠️ Model compilation failed: {e}")
 
-        # Setup optimizer
         self.optimizer = AdamW(
             self.model.parameters(), lr=args.max_learning_rate, weight_decay=args.weight_decay, betas=args.betas
         )
 
-        # Setup tokenizer
         self.tokenizer = Tokenizer.from_files(args.tokenizer_vocab, args.tokenizer_merges, ["<|endoftext|>"])
 
-        # Load datasets
         print(f"Loading training data from {args.training_set}")
         self.training_set = np.load(args.training_set, mmap_mode="r")
         print(f"Training set size: {len(self.training_set):,} tokens")
+        self.experiment_logger.add_note(f"Training data loaded: {len(self.training_set):,} tokens")
 
         if Path(args.validation_set).exists():
             print(f"Loading validation data from {args.validation_set}")
             self.validation_set = np.load(args.validation_set, mmap_mode="r")
             print(f"Validation set size: {len(self.validation_set):,} tokens")
+            self.experiment_logger.add_note(f"Validation data loaded: {len(self.validation_set):,} tokens")
         else:
             self.validation_set = None
+            self.experiment_logger.add_note("No validation set found")
             print("No validation set found")
 
-        # Initialize wandb if requested
-        if args.wandb_active:
-            wandb.init(project=args.wandb_project, name=args.wandb_run, config=asdict(args))
-            wandb.watch(self.model, log="gradients", log_freq=10)
+    def calculate_mfu(self, tokens_per_sec: float) -> float:
+        """Calculate Model FLOPs Utilization (MFU) for performance monitoring."""
+        try:
+            N = sum(p.numel() for p in self.model.parameters())
+            L = self.args.num_layers
+            H = self.args.d_model
+            Q = self.args.context_length
+            V = self.args.vocab_size
+
+            flops_per_token_forward = 6 * N + 12 * L * H * Q
+
+            flops_per_token_training = 3 * flops_per_token_forward
+
+            model_flops_per_sec = tokens_per_sec * flops_per_token_training
+
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name()
+                if "H100" in gpu_name:
+                    peak_flops = 1979e12
+                elif "A100" in gpu_name:
+                    peak_flops = 624e12
+                elif "V100" in gpu_name:
+                    peak_flops = 125e12
+                else:
+                    peak_flops = 100e12
+            else:
+                peak_flops = 1e12
+
+            mfu = min(model_flops_per_sec / peak_flops, 1.0)
+            return mfu
+
+        except Exception as e:
+            self.experiment_logger.add_note(f"MFU calculation failed: {e}")
+            return 0.0
 
     def get_lr(self, step: int) -> float:
         """Get learning rate using cosine schedule."""
@@ -156,10 +207,11 @@ class TrainModel:
 
         self.model.eval()
         total_loss = 0.0
-        num_batches = 50  # Fixed number of eval batches
+        num_batches = 50
 
+        eval_start_time = time.time()
         with torch.no_grad():
-            for _ in range(num_batches):
+            for batch_idx in range(num_batches):
                 try:
                     inputs, targets = get_batch(
                         self.validation_set, self.args.batch_size, self.args.context_length, device=str(self.device)
@@ -174,129 +226,185 @@ class TrainModel:
                         num_batches -= 1
 
                 except Exception as e:
+                    self.experiment_logger.add_note(f"Evaluation batch {batch_idx} failed: {e}")
                     print(f"⚠️ Evaluation batch failed: {e}")
                     num_batches -= 1
+
+        eval_time = time.time() - eval_start_time
 
         if num_batches == 0:
             return float("inf"), float("inf")
 
         avg_loss = total_loss / num_batches
-        perplexity = math.exp(min(avg_loss, 10))  # Cap to prevent overflow
+        perplexity = math.exp(min(avg_loss, 10))
+
+        eval_tokens_per_sec = (num_batches * self.args.batch_size * self.args.context_length) / eval_time
+        self.experiment_logger.add_note(
+            f"Evaluation completed: {num_batches} batches, {eval_tokens_per_sec:.0f} tokens/sec"
+        )
 
         return avg_loss, perplexity
 
     def train_step(self) -> dict[str, Any]:
-        """Single training step."""
+        """Single training step with comprehensive logging."""
         self.model.train()
+        step_start_time = time.time()
 
-        # Get learning rate
         lr = self.get_lr(self.step)
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
-        # Zero gradients
         self.optimizer.zero_grad()
 
-        # Get batch
+        batch_start_time = time.time()
         inputs, targets = get_batch(
             self.training_set, self.args.batch_size, self.args.context_length, device=str(self.device)
         )
+        batch_time = time.time() - batch_start_time
 
-        # Forward pass
+        forward_start_time = time.time()
         logits = self.model(inputs)
         loss = cross_entropy(logits, targets)
+        forward_time = time.time() - forward_start_time
 
-        # Backward pass
+        backward_start_time = time.time()
         loss.backward()
+        backward_time = time.time() - backward_start_time
 
-        # Gradient clipping
         grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
 
-        # Optimizer step
+        optimizer_start_time = time.time()
         self.optimizer.step()
+        optimizer_time = time.time() - optimizer_start_time
+
+        step_time = time.time() - step_start_time
 
         return {
             "loss": loss.item(),
             "lr": lr,
             "grad_norm": grad_norm,
+            "step_time": step_time,
+            "batch_time": batch_time,
+            "forward_time": forward_time,
+            "backward_time": backward_time,
+            "optimizer_time": optimizer_time,
         }
 
     def train(self):
-        """Main training loop."""
+        """Main training loop with comprehensive logging."""
         print(f"\n🚀 Starting training for {self.args.steps} steps")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(f"Device: {self.device}")
 
-        # Initial evaluation
+        self.experiment_logger.add_note("Training started")
+        self.training_integrator.start_epoch(0)
+
         val_loss, val_perplexity = self.evaluate()
         print(f"Initial validation - loss: {val_loss:.4f}, perplexity: {val_perplexity:.2f}")
 
-        if self.args.wandb_active:
-            wandb.log({"val_loss": val_loss, "val_perplexity": val_perplexity, "step": 0})
+        self.training_integrator.log_validation_step(
+            step=0,
+            val_loss=val_loss,
+            perplexity=val_perplexity,
+            wallclock_time=0.0,
+        )
 
-        # Training loop
         pbar = tqdm(range(self.args.steps), desc="Training")
-        start_time = time.time()
+        training_start_time = time.time()
 
         for step in pbar:
             self.step = step
 
-            # Training step
             metrics = self.train_step()
 
-            # Calculate tokens per second
-            elapsed_time = time.time() - start_time
+            elapsed_time = time.time() - training_start_time
             tokens_processed = (step + 1) * self.args.batch_size * self.args.context_length
             tokens_per_sec = tokens_processed / elapsed_time if elapsed_time > 0 else 0
+            mfu = self.calculate_mfu(tokens_per_sec)
 
-            # Update progress bar
-            pbar.set_postfix(
-                {"loss": f"{metrics['loss']:.4f}", "lr": f"{metrics['lr']:.2e}", "tok/s": f"{tokens_per_sec:.0f}"}
+            self.training_integrator.log_training_step(
+                step=step,
+                train_loss=metrics["loss"],
+                learning_rate=metrics["lr"],
+                tokens_processed=self.args.batch_size * self.args.context_length,
+                samples_processed=self.args.batch_size,
+                step_time=metrics["step_time"],
+                tokens_per_sec=tokens_per_sec,
+                wallclock_time=elapsed_time / 3600,
+                grad_norm=metrics["grad_norm"],
+                mfu=mfu,
+                batch_time=metrics["batch_time"],
+                forward_time=metrics["forward_time"],
+                backward_time=metrics["backward_time"],
+                optimizer_time=metrics["optimizer_time"],
+                effective_batch_size=self.args.batch_size,
+                sequence_length=self.args.context_length,
             )
 
-            # Evaluation
+            pbar.set_postfix(
+                {
+                    "loss": f"{metrics['loss']:.4f}",
+                    "lr": f"{metrics['lr']:.2e}",
+                    "tok/s": f"{tokens_per_sec:.0f}",
+                    "MFU": f"{mfu:.3f}",
+                    "grad_norm": f"{metrics['grad_norm']:.3f}",
+                }
+            )
+
             if step > 0 and step % self.args.validation_step_interval == 0:
                 val_loss, val_perplexity = self.evaluate()
 
                 print(
                     f"\nStep {step}: train_loss={metrics['loss']:.4f}, "
-                    f"val_loss={val_loss:.4f}, val_perplexity={val_perplexity:.2f}"
+                    f"val_loss={val_loss:.4f}, val_perplexity={val_perplexity:.2f}, "
+                    f"MFU={mfu:.3f}, tok/s={tokens_per_sec:.0f}"
                 )
 
-                if self.args.wandb_active:
-                    wandb.log({"val_loss": val_loss, "val_perplexity": val_perplexity, "step": step})
+                self.training_integrator.log_validation_step(
+                    step=step,
+                    val_loss=val_loss,
+                    perplexity=val_perplexity,
+                    wallclock_time=elapsed_time / 3600,
+                    mfu_at_validation=mfu,
+                    tokens_per_sec_at_validation=tokens_per_sec,
+                )
 
-            # Checkpoint saving
             if step > 0 and step % self.args.checkpoint_step_interval == 0:
                 checkpoint_path = f"checkpoint_step_{step}.pt"
                 save_checkpoint(self.model, self.optimizer, step, checkpoint_path)
+                self.experiment_logger.add_note(f"Checkpoint saved: {checkpoint_path}")
                 print(f"Saved checkpoint: {checkpoint_path}")
 
-            # Log to wandb
-            if self.args.wandb_active:
-                wandb.log(
-                    {
-                        "train_loss": metrics["loss"],
-                        "train_perplexity": math.exp(min(metrics["loss"], 10)),
-                        "lr": metrics["lr"],
-                        "grad_norm": metrics["grad_norm"],
-                        "tokens_per_sec": tokens_per_sec,
-                        "step": step,
-                    }
-                )
-
-        # Final evaluation and checkpoint
+        final_elapsed_time = time.time() - training_start_time
         val_loss, val_perplexity = self.evaluate()
-        print(f"\nFinal evaluation - val_loss: {val_loss:.4f}, val_perplexity: {val_perplexity:.2f}")
+        final_tokens_per_sec = (self.args.steps * self.args.batch_size * self.args.context_length) / final_elapsed_time
+        final_mfu = self.calculate_mfu(final_tokens_per_sec)
 
-        # Save final checkpoint
+        print(f"\nFinal evaluation - val_loss: {val_loss:.4f}, val_perplexity: {val_perplexity:.2f}")
+        print(
+            f"Training completed - {final_elapsed_time / 3600:.2f} hours, {final_tokens_per_sec:.0f} tok/s, MFU: {final_mfu:.3f}"
+        )
+
+        self.training_integrator.log_validation_step(
+            step=self.args.steps,
+            val_loss=val_loss,
+            perplexity=val_perplexity,
+            wallclock_time=final_elapsed_time / 3600,
+            final_mfu=final_mfu,
+            final_tokens_per_sec=final_tokens_per_sec,
+            training_hours=final_elapsed_time / 3600,
+        )
+
         final_checkpoint = f"final_checkpoint_step_{self.args.steps}.pt"
         save_checkpoint(self.model, self.optimizer, self.args.steps, final_checkpoint)
         print(f"Saved final checkpoint: {final_checkpoint}")
 
-        if self.args.wandb_active:
-            wandb.log({"final_val_loss": val_loss, "final_val_perplexity": val_perplexity, "step": self.args.steps})
-            wandb.finish()
+        self.experiment_logger.add_note(
+            f"Training completed successfully. Final metrics: "
+            f"val_loss={val_loss:.4f}, MFU={final_mfu:.3f}, "
+            f"tokens/sec={final_tokens_per_sec:.0f}"
+        )
+        self.experiment_logger.mark_completed(success=True)
 
 
 def load_config_from_json(config_path: str) -> TrainModelArgs:
@@ -308,7 +416,7 @@ def load_config_from_json(config_path: str) -> TrainModelArgs:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Simple Transformer Training")
+    parser = argparse.ArgumentParser(description="Simple Transformer Training with Production Logging")
 
     parser.add_argument("--config", type=str, help="Path to JSON config file")
     parser.add_argument("--train_data", type=str, help="Path to training data")
@@ -316,37 +424,59 @@ def main():
     parser.add_argument("--steps", type=int, default=40960, help="Training steps")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=2e-3, help="Learning rate")
+
+    parser.add_argument("--experiment_name", type=str, default="transformer_training", help="Experiment name")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="cs336-assignment1", help="Wandb project")
-    parser.add_argument("--wandb_run", type=str, default="transformer_training", help="Wandb run name")
+    parser.add_argument("--wandb_entity", type=str, default="", help="Wandb entity")
+    parser.add_argument("--log_dir", type=str, default="experiments", help="Local logging directory")
     parser.add_argument("--no_compile", action="store_true", help="Disable model compilation")
 
     args = parser.parse_args()
 
-    # Load config or create from args
     if args.config:
         config = load_config_from_json(args.config)
-        # Override with command line args if provided
         if args.train_data:
             config.training_set = args.train_data
         if args.val_data:
             config.validation_set = args.val_data
+        if args.experiment_name != "transformer_training":
+            config.experiment_name = args.experiment_name
+        if args.wandb:
+            config.use_wandb = True
+        if args.wandb_project != "cs336-assignment1":
+            config.wandb_project = args.wandb_project
+        if args.wandb_entity:
+            config.wandb_entity = args.wandb_entity
+        if args.log_dir != "experiments":
+            config.log_dir = args.log_dir
     else:
         config = TrainModelArgs(
-            training_set=args.train_data or "owt_train_tokens.npy",
-            validation_set=args.val_data or "owt_valid_tokens.npy",
+            training_set=args.train_data or "data/encoded/owt_train_tokens.npy",
+            validation_set=args.val_data or "data/encoded/owt_valid_tokens.npy",
             steps=args.steps,
             batch_size=args.batch_size,
             max_learning_rate=args.lr,
-            wandb_active=args.wandb,
+            experiment_name=args.experiment_name,
+            use_wandb=args.wandb,
             wandb_project=args.wandb_project,
-            wandb_run=args.wandb_run,
+            wandb_entity=args.wandb_entity,
+            log_dir=args.log_dir,
             compile_model=not args.no_compile,
         )
 
-    # Create trainer and start training
     trainer = TrainModel(config)
-    trainer.train()
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("\n🛑 Training interrupted by user")
+        trainer.experiment_logger.add_note("Training interrupted by user")
+        trainer.experiment_logger.mark_completed(success=False)
+    except Exception as e:
+        print(f"\n❌ Training failed: {e}")
+        trainer.experiment_logger.add_note(f"Training failed with error: {e}")
+        trainer.experiment_logger.mark_completed(success=False)
+        raise
 
 
 if __name__ == "__main__":

@@ -15,10 +15,10 @@
     "warmup_iters": 2000,
     "cosine_cycle_iters": 40960,
     
-    "training_set": "owt_train_tokens.npy",
-    "validation_set": "owt_valid_tokens.npy",
-    "tokenizer_vocab": "openwebtext_vocab.json",
-    "tokenizer_merges": "openwebtext_merges.pkl",
+    "training_set": "data/encoded/owt_train_tokens.npy",
+    "validation_set": "data/encoded/owt_valid_tokens.npy",
+    "tokenizer_vocab": "data/encoded/openwebtext_vocab.json",
+    "tokenizer_merges": "data/encoded/openwebtext_merges.pkl",
     
     "validation_step_interval": 500,
     "checkpoint_step_interval": 10000,
@@ -29,7 +29,10 @@
     "device": "cuda",
     "compile_model": true,
     
-    "wandb_active": false,
+    "experiment_name": "simple_transformer_training",
+    "experiment_description": "Simple transformer training",
+    "use_wandb": true,
     "wandb_project": "cs336-assignment1",
-    "wandb_run": "simple_transformer_training"
+    "wandb_entity": "",
+    "log_dir": "experiments"
 } 
