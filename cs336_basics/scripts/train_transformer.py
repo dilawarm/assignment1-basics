@@ -18,7 +18,6 @@ from cs336_basics.data import get_batch
 from cs336_basics.experiments.exp_logging import ExperimentLogger, TrainingIntegrator
 from cs336_basics.loss.cross_entropy import cross_entropy
 from cs336_basics.nn.models import TransformerLM
-from cs336_basics.tokenization.tokenizer import Tokenizer
 from cs336_basics.training.checkpoint import save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
@@ -27,7 +26,7 @@ from cs336_basics.training.optimizers import AdamW
 
 @dataclass
 class TrainModelArgs:
-    """Training configuration - simplified like the notebook."""
+    """Training configuration"""
 
     # Model parameters
     vocab_size: int = 32000
@@ -51,8 +50,6 @@ class TrainModelArgs:
     # Data paths
     training_set: str = "data/encoded/owt_train_tokens.npy"
     validation_set: str = "data/encoded/owt_valid_tokens.npy"
-    tokenizer_vocab: str = "data/encoded/openwebtext_vocab.json"
-    tokenizer_merges: str = "data/encoded/openwebtext_merges.pkl"
 
     # Training configuration
     validation_step_interval: int = 500
@@ -137,8 +134,6 @@ class TrainModel:
         self.optimizer = AdamW(
             self.model.parameters(), lr=args.max_learning_rate, weight_decay=args.weight_decay, betas=args.betas
         )
-
-        self.tokenizer = Tokenizer.from_files(args.tokenizer_vocab, args.tokenizer_merges, ["<|endoftext|>"])
 
         print(f"Loading training data from {args.training_set}")
         self.training_set = np.load(args.training_set, mmap_mode="r")

@@ -17,8 +17,6 @@
     
     "training_set": "data/encoded/owt_train_tokens.npy",
     "validation_set": "data/encoded/owt_valid_tokens.npy",
-    "tokenizer_vocab": "data/encoded/openwebtext_vocab.json",
-    "tokenizer_merges": "data/encoded/openwebtext_merges.pkl",
     
     "validation_step_interval": 500,
     "checkpoint_step_interval": 10000,
