@@ -109,6 +109,10 @@ class RotaryPositionalEmbedding(nn.Module):
         cos_vals = self.cos_values[token_positions]
         sin_vals = self.sin_values[token_positions]
 
+        # Cast cos/sin values to match input dtype to avoid dtype mismatches
+        cos_vals = cos_vals.to(x.dtype)
+        sin_vals = sin_vals.to(x.dtype)
+
         x_even = x[..., 0::2]
         x_odd = x[..., 1::2]
 
