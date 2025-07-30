@@ -107,7 +107,7 @@ class EnhancedAdam(Optimizer):
                 # When beta^step becomes very small, it's effectively 0 anyway
                 max_step = 1000  # After 1000 steps, bias correction is minimal
                 capped_step = min(step, max_step)
-                
+
                 bias_correction1 = 1 - effective_beta1**capped_step
                 bias_correction2 = 1 - beta2**capped_step
 
