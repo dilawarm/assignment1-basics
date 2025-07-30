@@ -347,36 +347,42 @@ def run_transformer_block(
         num_heads=num_heads,
         d_ff=d_ff,
         device=in_features.device,
+        dtype=in_features.dtype,
     )
 
     d_k = d_model // num_heads
     rope = RotaryPositionalEmbedding(theta=theta, d_k=d_k, max_seq_len=max_seq_len, device=in_features.device)
 
     with torch.no_grad():
-        # Set individual projection weights
-        block.attention.q_proj.weight.copy_(weights["attn.q_proj.weight"])
-        block.attention.k_proj.weight.copy_(weights["attn.k_proj.weight"])
-        block.attention.v_proj.weight.copy_(weights["attn.v_proj.weight"])
-        block.attention.o_proj.weight.copy_(weights["attn.output_proj.weight"])
+        # Concatenate Q, K, V weights for the fused projection
+        qkv_weight = torch.cat(
+            [weights["attn.q_proj.weight"], weights["attn.k_proj.weight"], weights["attn.v_proj.weight"]], dim=0
+        )
+        block.attn.qkv_proj.weight.copy_(qkv_weight)
+        block.attn.output_proj.weight.copy_(weights["attn.output_proj.weight"])
 
-        block.ln_1.weight.copy_(weights["ln1.weight"])
-        block.ln_2.weight.copy_(weights["ln2.weight"])
+        block.ln1.weight.copy_(weights["ln1.weight"])
+        block.ln2.weight.copy_(weights["ln2.weight"])
 
         # Use SwiGLU if w3 weights are available (for test compatibility), CustomFFN otherwise
         if "ffn.w3.weight" in weights:
             # Override the block's FFN with SwiGLU for test compatibility
             from cs336_basics.nn.activations import SwiGLU
 
-            block.feed_forward = SwiGLU(d_model=d_model, d_ff=d_ff, device=in_features.device)
-            block.feed_forward.w1.weight.copy_(weights["ffn.w1.weight"])
-            block.feed_forward.w2.weight.copy_(weights["ffn.w2.weight"])
-            block.feed_forward.w3.weight.copy_(weights["ffn.w3.weight"])
+            block.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=in_features.device, dtype=in_features.dtype)
+            block.ffn.w1.weight.copy_(weights["ffn.w1.weight"])
+            block.ffn.w2.weight.copy_(weights["ffn.w2.weight"])
+            block.ffn.w3.weight.copy_(weights["ffn.w3.weight"])
         else:
-            # Use FeedForward (current default)
-            block.feed_forward.up_proj.weight.copy_(weights["ffn.w1.weight"])
-            block.feed_forward.down_proj.weight.copy_(weights["ffn.w2.weight"])
+            # Use CustomFFN (current default)
+            block.ffn.w1.weight.copy_(weights["ffn.w1.weight"])
+            block.ffn.w2.weight.copy_(weights["ffn.w2.weight"])
 
-    output = block(in_features)
+    batch_size, sequence_length, _ = in_features.shape
+    token_positions = torch.arange(sequence_length, device=in_features.device)
+    token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+
+    output = block(in_features, rope=rope, token_positions=token_positions)
     return output
 
 
@@ -468,10 +474,11 @@ def run_transformer_lm(
         d_ff=d_ff,
         rope_theta=rope_theta,
         device=in_indices.device,
+        dtype=torch.float32,
     )
 
     with torch.no_grad():
-        model.token_embedding.weight.copy_(weights["token_embeddings.weight"])
+        model.token_embeddings.weight.copy_(weights["token_embeddings.weight"])
 
         for layer_idx in range(num_layers):
             layer = model.layers[layer_idx]
@@ -485,29 +492,27 @@ def run_transformer_lm(
                 ],
                 dim=0,
             )
-            layer.attention.q_proj.weight.copy_(weights[f"layers.{layer_idx}.attn.q_proj.weight"])
-            layer.attention.k_proj.weight.copy_(weights[f"layers.{layer_idx}.attn.k_proj.weight"])
-            layer.attention.v_proj.weight.copy_(weights[f"layers.{layer_idx}.attn.v_proj.weight"])
-            layer.attention.o_proj.weight.copy_(weights[f"layers.{layer_idx}.attn.output_proj.weight"])
+            layer.attn.qkv_proj.weight.copy_(qkv_weight)
+            layer.attn.output_proj.weight.copy_(weights[f"layers.{layer_idx}.attn.output_proj.weight"])
 
-            layer.ln_1.weight.copy_(weights[f"layers.{layer_idx}.ln1.weight"])
-            layer.ln_2.weight.copy_(weights[f"layers.{layer_idx}.ln2.weight"])
+            layer.ln1.weight.copy_(weights[f"layers.{layer_idx}.ln1.weight"])
+            layer.ln2.weight.copy_(weights[f"layers.{layer_idx}.ln2.weight"])
 
-            # Use SwiGLU if w3 weights are available (for test compatibility), FeedForward otherwise
+            # Use SwiGLU if w3 weights are available (for test compatibility), CustomFFN otherwise
             if f"layers.{layer_idx}.ffn.w3.weight" in weights:
                 # Override the layer's FFN with SwiGLU for test compatibility
                 from cs336_basics.nn.activations import SwiGLU
 
-                layer.feed_forward = SwiGLU(d_model=d_model, d_ff=d_ff, device=in_indices.device)
-                layer.feed_forward.w1.weight.copy_(weights[f"layers.{layer_idx}.ffn.w1.weight"])
-                layer.feed_forward.w2.weight.copy_(weights[f"layers.{layer_idx}.ffn.w2.weight"])
-                layer.feed_forward.w3.weight.copy_(weights[f"layers.{layer_idx}.ffn.w3.weight"])
+                layer.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=in_indices.device, dtype=torch.float32)
+                layer.ffn.w1.weight.copy_(weights[f"layers.{layer_idx}.ffn.w1.weight"])
+                layer.ffn.w2.weight.copy_(weights[f"layers.{layer_idx}.ffn.w2.weight"])
+                layer.ffn.w3.weight.copy_(weights[f"layers.{layer_idx}.ffn.w3.weight"])
             else:
-                # Use FeedForward (current default)
-                layer.feed_forward.up_proj.weight.copy_(weights[f"layers.{layer_idx}.ffn.w1.weight"])
-                layer.feed_forward.down_proj.weight.copy_(weights[f"layers.{layer_idx}.ffn.w2.weight"])
+                # Use CustomFFN (current default)
+                layer.ffn.w1.weight.copy_(weights[f"layers.{layer_idx}.ffn.w1.weight"])
+                layer.ffn.w2.weight.copy_(weights[f"layers.{layer_idx}.ffn.w2.weight"])
 
-        model.ln_f.weight.copy_(weights["ln_final.weight"])
+        model.ln_final.weight.copy_(weights["ln_final.weight"])
         model.lm_head.weight.copy_(weights["lm_head.weight"])
 
     return model(in_indices)

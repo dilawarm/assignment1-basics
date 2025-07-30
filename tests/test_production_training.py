@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 import torch
 
-from cs336_basics.scripts.train_transformer import TrainArgs, Trainer, load_config_from_json
+from cs336_basics.scripts.train_transformer import TrainModel, TrainModelArgs, load_config_from_json
 
 
 class TestProductionConfiguration:
@@ -35,7 +35,7 @@ class TestProductionConfiguration:
 
     def test_config_validation_with_valid_params(self):
         """Test that valid production configurations pass validation."""
-        config = TrainArgs(
+        config = TrainModelArgs(
             vocab_size=32000,
             context_length=256,
             num_layers=4,
@@ -52,20 +52,20 @@ class TestProductionConfiguration:
     def test_config_validation_with_invalid_params(self):
         """Test that invalid configurations are rejected."""
         with pytest.raises(AssertionError):
-            TrainArgs(vocab_size=0)
+            TrainModelArgs(vocab_size=0)
 
         with pytest.raises(AssertionError):
-            TrainArgs(d_model=513, num_heads=16)
+            TrainModelArgs(d_model=513, num_heads=16)
 
         with pytest.raises(AssertionError):
-            TrainArgs(steps=0)
+            TrainModelArgs(steps=0)
 
         with pytest.raises(AssertionError):
-            TrainArgs(max_learning_rate=-1e-3)
+            TrainModelArgs(max_learning_rate=-1e-3)
 
     def test_h100_optimized_config(self):
         """Test H100-optimized configuration parameters."""
-        config = TrainArgs(
+        config = TrainModelArgs(
             batch_size=128,
             context_length=2048,
             d_ff=1344,
@@ -109,7 +109,7 @@ class TestModelInitialization:
     @pytest.fixture
     def config(self):
         """Standard test configuration."""
-        return TrainArgs(
+        return TrainModelArgs(
             vocab_size=1000,
             context_length=128,
             num_layers=2,
@@ -150,20 +150,258 @@ class TestModelInitialization:
             yield {
                 "training_set": str(train_path),
                 "validation_set": str(val_path),
+                "tokenizer_vocab": str(vocab_path),
+                "tokenizer_merges": str(merges_path),
             }
 
-    def test_model_parameter_calculation(self, config):
-        """Test parameter count calculation without creating full model."""
-        vocab_size = config.vocab_size
-        d_model = config.d_model
-        num_layers = config.num_layers
+    def test_model_parameter_count(self, config, mock_data_files):
+        """Test that model has expected parameter count."""
+        config.training_set = mock_data_files["training_set"]
+        config.validation_set = mock_data_files["validation_set"]
+        config.tokenizer_vocab = mock_data_files["tokenizer_vocab"]
+        config.tokenizer_merges = mock_data_files["tokenizer_merges"]
 
-        embedding_params = vocab_size * d_model
-        layer_params_estimate = num_layers * d_model * d_model * 4
-        total_estimate = embedding_params + layer_params_estimate
+        with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+            trainer = TrainModel(config)
 
-        assert total_estimate > 0, "Parameter estimate should be positive"
-        assert total_estimate < 100_000_000, "Parameter estimate should be reasonable for test model"
+            total_params = sum(p.numel() for p in trainer.model.parameters())
+            trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+
+            assert total_params > 0, "Model should have parameters"
+            assert trainable_params == total_params, "All parameters should be trainable"
+
+            expected_range = (100_000, 2_000_000)
+            assert expected_range[0] < total_params < expected_range[1], (
+                f"Parameter count {total_params} outside expected range"
+            )
+
+    def test_model_device_placement(self, config, mock_data_files):
+        """Test that model is correctly placed on specified device."""
+        config.training_set = mock_data_files["training_set"]
+        config.validation_set = mock_data_files["validation_set"]
+        config.tokenizer_vocab = mock_data_files["tokenizer_vocab"]
+        config.tokenizer_merges = mock_data_files["tokenizer_merges"]
+        config.device = "cpu"
+
+        with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+            trainer = TrainModel(config)
+
+            for param in trainer.model.parameters():
+                assert param.device.type == "cpu", f"Parameter on wrong device: {param.device}"
+
+    def test_optimizer_initialization(self, config, mock_data_files):
+        """Test that optimizer is properly initialized."""
+        config.training_set = mock_data_files["training_set"]
+        config.validation_set = mock_data_files["validation_set"]
+        config.tokenizer_vocab = mock_data_files["tokenizer_vocab"]
+        config.tokenizer_merges = mock_data_files["tokenizer_merges"]
+
+        with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+            trainer = TrainModel(config)
+
+            assert len(trainer.optimizer.param_groups) == 1
+            param_group = trainer.optimizer.param_groups[0]
+            assert param_group["lr"] == config.max_learning_rate
+            assert param_group["weight_decay"] == config.weight_decay
+            assert param_group["betas"] == config.betas
+
+
+class TestTrainingLoop:
+    """Test training loop integrity and correctness."""
+
+    @pytest.fixture
+    def trainer(self):
+        """Create a trainer for testing."""
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        config = TrainModelArgs(
+            vocab_size=1000,
+            context_length=64,
+            num_layers=2,
+            d_model=128,
+            num_heads=4,
+            d_ff=256,
+            steps=5,
+            batch_size=2,
+            use_wandb=False,
+            device="cpu",
+            compile_model=False,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            np.random.seed(42)
+            train_data = np.random.randint(0, 1000, size=(1000,), dtype=np.int64)
+            train_path = Path(temp_dir) / "train.npy"
+            np.save(train_path, train_data)
+
+            val_data = np.random.randint(0, 1000, size=(200,), dtype=np.int64)
+            val_path = Path(temp_dir) / "val.npy"
+            np.save(val_path, val_data)
+
+            vocab_data = {str(i): f"token_{i}" for i in range(1000)}
+            vocab_path = Path(temp_dir) / "vocab.json"
+            with open(vocab_path, "w") as f:
+                json.dump(vocab_data, f)
+
+            import pickle
+
+            merges_data = [(b"a", b"b"), (b"c", b"d")]
+            merges_path = Path(temp_dir) / "merges.pkl"
+            with open(merges_path, "wb") as f:
+                pickle.dump(merges_data, f)
+
+            config.training_set = str(train_path)
+            config.validation_set = str(val_path)
+            config.tokenizer_vocab = str(vocab_path)
+            config.tokenizer_merges = str(merges_path)
+
+            with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+                trainer = TrainModel(config)
+                yield trainer
+
+    def test_gradient_flow(self, trainer):
+        """Test that all model parameters receive gradients during training."""
+        initial_params = {}
+        for name, param in trainer.model.named_parameters():
+            initial_params[name] = param.clone().detach()
+
+        trainer.step = 0
+        metrics = trainer.train_step()
+
+        for name, param in trainer.model.named_parameters():
+            assert param.grad is not None, f"Parameter {name} has no gradient"
+            assert not torch.allclose(param.grad, torch.zeros_like(param.grad)), f"Parameter {name} has zero gradient"
+
+        assert metrics["loss"] > 0, "Loss should be positive"
+        assert not math.isnan(metrics["loss"]), "Loss should not be NaN"
+        assert not math.isinf(metrics["loss"]), "Loss should not be infinite"
+
+    def test_parameter_updates(self, trainer):
+        """Test that parameters actually change during training step."""
+        initial_params = {}
+        for name, param in trainer.model.named_parameters():
+            initial_params[name] = param.clone().detach()
+
+        test_step = trainer.args.warmup_iters // 2
+        trainer.step = test_step
+
+        metrics = trainer.train_step()
+
+        parameters_changed = 0
+        total_change = 0.0
+        param_changes = {}
+        for name, param in trainer.model.named_parameters():
+            diff = torch.norm(param - initial_params[name]).item()
+            total_change += diff
+            param_changes[name] = diff
+            if diff > 1e-8:
+                parameters_changed += 1
+
+        assert parameters_changed > 0, (
+            f"No parameters were updated during training step. Total change: {total_change:.2e}"
+        )
+
+        total_params = len(list(trainer.model.named_parameters()))
+        change_ratio = parameters_changed / total_params
+        assert change_ratio > 0.3, f"Only {change_ratio:.2%} of parameters changed, expected > 30%"
+
+    def test_learning_rate_schedule(self, trainer):
+        """Test that learning rate follows expected schedule."""
+        trainer.step = 0
+        lr_0 = trainer.get_lr(0)
+        assert lr_0 == 0.0, "Learning rate should start at 0"
+
+        trainer.step = trainer.args.warmup_iters // 2
+        lr_mid = trainer.get_lr(trainer.step)
+        assert 0 < lr_mid < trainer.args.max_learning_rate, "Learning rate should be between 0 and max during warmup"
+
+        trainer.step = trainer.args.warmup_iters
+        lr_max = trainer.get_lr(trainer.step)
+        assert abs(lr_max - trainer.args.max_learning_rate) < 1e-6, "Learning rate should reach max at end of warmup"
+
+        trainer.step = trainer.args.cosine_cycle_iters // 2
+        lr_decay = trainer.get_lr(trainer.step)
+        assert lr_decay < trainer.args.max_learning_rate, "Learning rate should decay after warmup"
+
+    def test_gradient_clipping(self, trainer):
+        """Test that gradient clipping prevents exploding gradients."""
+        test_step = trainer.args.warmup_iters // 2
+        trainer.step = test_step
+
+        metrics = trainer.train_step()
+
+        original_grads = {}
+        for name, param in trainer.model.named_parameters():
+            if param.grad is not None:
+                original_grads[name] = param.grad.clone()
+
+        large_grad_value = 100.0
+        for param in trainer.model.parameters():
+            if param.grad is not None:
+                param.grad.data.fill_(large_grad_value)
+
+        pre_clip_norm = torch.sqrt(
+            sum(torch.sum(p.grad**2) for p in trainer.model.parameters() if p.grad is not None)
+        ).item()
+
+        from cs336_basics.training.gradient_clipping import gradient_clipping
+
+        returned_norm = gradient_clipping(trainer.model.parameters(), trainer.args.gradient_clipping)
+
+        post_clip_norm = torch.sqrt(
+            sum(torch.sum(p.grad**2) for p in trainer.model.parameters() if p.grad is not None)
+        ).item()
+
+        norm_diff = abs(returned_norm - pre_clip_norm)
+        assert norm_diff < 100, (
+            f"Returned norm {returned_norm} differs too much from calculated pre-clip norm {pre_clip_norm} (diff: {norm_diff})"
+        )
+
+        assert pre_clip_norm > trainer.args.gradient_clipping, (
+            f"Initial gradient norm {pre_clip_norm} should be larger than threshold {trainer.args.gradient_clipping}"
+        )
+        assert post_clip_norm <= trainer.args.gradient_clipping + 1e-3, (
+            f"Post-clipping gradient norm {post_clip_norm} exceeds threshold {trainer.args.gradient_clipping} (tolerance: 1e-3)"
+        )
+
+        gradients_changed = False
+        for name, param in trainer.model.named_parameters():
+            if param.grad is not None and name in original_grads:
+                if not torch.allclose(param.grad, torch.full_like(param.grad, large_grad_value)):
+                    gradients_changed = True
+                    break
+
+        assert gradients_changed, "Gradients should have been modified by clipping"
+
+    def test_mfu_calculation(self, trainer):
+        """Test Model FLOPs Utilization calculation."""
+        tokens_per_sec = 1000.0
+        mfu = trainer.calculate_mfu(tokens_per_sec)
+
+        assert 0.0 <= mfu <= 1.0, f"MFU {mfu} should be between 0 and 1"
+
+        mfu_high = trainer.calculate_mfu(10000.0)
+        assert mfu_high > mfu, "Higher tokens/sec should yield higher MFU"
+
+    def test_evaluation_consistency(self, trainer):
+        """Test that evaluation produces consistent results with deterministic setup."""
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        trainer.model.eval()
+        results = []
+        for i in range(3):
+            torch.manual_seed(42)
+            np.random.seed(42)
+            val_loss, val_perplexity = trainer.evaluate()
+            results.append((val_loss, val_perplexity))
+
+        for i in range(1, len(results)):
+            loss_diff = abs(results[i][0] - results[0][0])
+            perp_diff = abs(results[i][1] - results[0][1])
+            assert loss_diff < 0.1, f"Evaluation loss difference too large: {loss_diff}"
+            assert perp_diff < 5.0, f"Evaluation perplexity difference too large: {perp_diff}"
 
 
 class TestMemoryAndPerformance:
@@ -172,7 +410,7 @@ class TestMemoryAndPerformance:
     @pytest.fixture
     def h100_config(self):
         """Configuration optimized for H100 deployment."""
-        return TrainArgs(
+        return TrainModelArgs(
             vocab_size=32000,
             context_length=2048,
             num_layers=12,
@@ -216,13 +454,13 @@ class TestMemoryAndPerformance:
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
 
-                trainer = Trainer(h100_config)
+                trainer = TrainModel(h100_config)
 
                 trainer.step = 0
                 metrics = trainer.train_step()
 
-                memory_allocated = torch.cuda.memory_allocated() / 1e9
-                memory_reserved = torch.cuda.memory_reserved() / 1e9
+                memory_allocated = torch.cuda.memory_allocated() / 1e9  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1e9  # GB
 
                 assert memory_allocated < 40.0, f"Memory usage {memory_allocated:.1f}GB too high for H100"
 
@@ -230,26 +468,61 @@ class TestMemoryAndPerformance:
                     efficiency = memory_allocated / memory_reserved
                     assert efficiency > 0.7, f"Memory efficiency {efficiency:.2f} too low"
 
-    def test_batch_processing_config(self):
-        """Test batch processing configuration validation."""
-        config = TrainArgs(
-            vocab_size=1000,
-            context_length=64,
-            num_layers=2,
-            d_model=128,
-            num_heads=4,
-            d_ff=256,
-            batch_size=8,
-            steps=1,
+    def test_batch_processing_speed(self):
+        """Test that batch processing meets performance requirements."""
+        config = TrainModelArgs(
+            vocab_size=10000,
+            context_length=512,
+            num_layers=4,
+            d_model=512,
+            num_heads=8,
+            d_ff=1024,
+            batch_size=32,
+            steps=3,
             use_wandb=False,
+            compile_model=False,
             device="cpu",
         )
 
-        assert config.batch_size > 0
-        assert config.context_length > 0
-        total_tokens_per_batch = config.batch_size * config.context_length
-        assert total_tokens_per_batch > 0
-        assert total_tokens_per_batch < 100000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            train_data = np.random.randint(0, 10000, size=(50000,), dtype=np.int64)
+            train_path = Path(temp_dir) / "train.npy"
+            np.save(train_path, train_data)
+
+            config.training_set = str(train_path)
+            config.validation_set = str(train_path)
+
+            vocab_data = {str(i): f"token_{i}" for i in range(10000)}
+            vocab_path = Path(temp_dir) / "vocab.json"
+            with open(vocab_path, "w") as f:
+                json.dump(vocab_data, f)
+
+            import pickle
+
+            merges_data = [(b"a", b"b")]
+            merges_path = Path(temp_dir) / "merges.pkl"
+            with open(merges_path, "wb") as f:
+                pickle.dump(merges_data, f)
+
+            config.tokenizer_vocab = str(vocab_path)
+            config.tokenizer_merges = str(merges_path)
+
+            with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+                trainer = TrainModel(config)
+
+                times = []
+                for i in range(3):
+                    trainer.step = i
+                    start_time = time.time()
+                    metrics = trainer.train_step()
+                    step_time = time.time() - start_time
+                    times.append(step_time)
+
+                avg_time = sum(times) / len(times)
+                tokens_per_sec = (config.batch_size * config.context_length) / avg_time
+
+                min_tokens_per_sec = 100
+                assert tokens_per_sec > min_tokens_per_sec, f"Too slow: {tokens_per_sec:.0f} tokens/sec"
 
 
 class TestErrorHandling:
@@ -257,9 +530,11 @@ class TestErrorHandling:
 
     def test_missing_data_files(self):
         """Test graceful handling of missing data files."""
-        config = TrainArgs(
+        config = TrainModelArgs(
             training_set="nonexistent_train.npy",
             validation_set="nonexistent_val.npy",
+            tokenizer_vocab="nonexistent_vocab.json",
+            tokenizer_merges="nonexistent_merges.pkl",
             use_wandb=False,
             device="cpu",
             compile_model=False,
@@ -267,7 +542,7 @@ class TestErrorHandling:
 
         with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
             try:
-                trainer = Trainer(config)
+                trainer = TrainModel(config)
                 assert False, "Should have raised an error for missing data files"
             except (FileNotFoundError, OSError, ValueError):
                 pass
@@ -275,12 +550,43 @@ class TestErrorHandling:
     def test_invalid_model_configuration(self):
         """Test handling of invalid model configurations."""
         with pytest.raises(AssertionError):
-            config = TrainArgs(
+            config = TrainModelArgs(
                 d_model=100,
                 num_heads=7,
                 use_wandb=False,
                 device="cpu",
             )
+
+    def test_cuda_unavailable_fallback(self):
+        """Test fallback behavior when CUDA is unavailable."""
+        config = TrainModelArgs(
+            device="cpu",
+            use_wandb=False,
+            compile_model=False,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            train_data = np.random.randint(0, 1000, size=(1000,), dtype=np.int64)
+            np.save(Path(temp_dir) / "train.npy", train_data)
+            np.save(Path(temp_dir) / "val.npy", train_data)
+
+            vocab_data = {str(i): f"token_{i}" for i in range(1000)}
+            with open(Path(temp_dir) / "vocab.json", "w") as f:
+                json.dump(vocab_data, f)
+
+            import pickle
+
+            with open(Path(temp_dir) / "merges.pkl", "wb") as f:
+                pickle.dump([(b"a", b"b")], f)
+
+            config.training_set = str(Path(temp_dir) / "train.npy")
+            config.validation_set = str(Path(temp_dir) / "val.npy")
+            config.tokenizer_vocab = str(Path(temp_dir) / "vocab.json")
+            config.tokenizer_merges = str(Path(temp_dir) / "merges.pkl")
+
+            with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+                trainer = TrainModel(config)
+                assert trainer.device.type == "cpu"
 
 
 class TestDataLoading:
@@ -325,7 +631,7 @@ class TestDataLoading:
             try:
                 train_data = np.load(train_file, mmap_mode="r")
                 assert len(train_data.shape) == 1, f"Training data should be 1D, got shape {train_data.shape}"
-                assert train_data.dtype in [np.int64, np.int32, np.uint16], (
+                assert train_data.dtype == np.int64 or train_data.dtype == np.int32, (
                     f"Training data should be integer type, got {train_data.dtype}"
                 )
                 assert len(train_data) > 1000, f"Training data seems too small: {len(train_data)} tokens"
@@ -337,7 +643,7 @@ class TestDataLoading:
             try:
                 val_data = np.load(val_file, mmap_mode="r")
                 assert len(val_data.shape) == 1, f"Validation data should be 1D, got shape {val_data.shape}"
-                assert val_data.dtype in [np.int64, np.int32, np.uint16], (
+                assert val_data.dtype == np.int64 or val_data.dtype == np.int32, (
                     f"Validation data should be integer type, got {val_data.dtype}"
                 )
                 assert len(val_data) > 100, f"Validation data seems too small: {len(val_data)} tokens"
@@ -397,7 +703,7 @@ class TestDataLoading:
         if missing_files:
             pytest.skip(f"Missing required files: {[str(f) for f in missing_files]}")
 
-        config = TrainArgs(
+        config = TrainModelArgs(
             vocab_size=50257,
             context_length=1024,
             num_layers=4,
@@ -408,6 +714,8 @@ class TestDataLoading:
             batch_size=4,
             training_set=str(train_file),
             validation_set=str(val_file) if val_file.exists() else str(train_file),
+            tokenizer_vocab=str(vocab_file),
+            tokenizer_merges=str(merges_file),
             use_wandb=False,
             device="cpu",
             compile_model=False,
@@ -415,7 +723,7 @@ class TestDataLoading:
 
         try:
             with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
-                trainer = Trainer(config)
+                trainer = TrainModel(config)
 
                 assert trainer.training_set is not None, "Training data should be loaded"
                 assert len(trainer.training_set) > 0, "Training data should not be empty"
@@ -514,28 +822,66 @@ class TestDataLoading:
 class TestProductionScenarios:
     """Test specific production deployment scenarios."""
 
-    def test_openwebtext_config_validation(self):
-        """Test OpenWebText configuration validation without heavy computation."""
-        config = TrainArgs(
-            vocab_size=50257,
-            context_length=1024,
-            num_layers=6,
-            d_model=768,
-            num_heads=12,
-            d_ff=3072,
-            batch_size=8,
-            steps=1,
-            use_wandb=False,
-            device="cpu",
-        )
+    def test_openwebtext_data_compatibility(self):
+        """Test compatibility with OpenWebText data format."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vocab_size = 50257
 
-        assert config.vocab_size == 50304  # Padded to nearest 128 for efficiency
-        assert config.d_model % config.num_heads == 0
-        assert config.d_ff % 64 == 0
+            train_data = np.random.randint(0, vocab_size, size=(1000000,), dtype=np.int64)
+            train_path = Path(temp_dir) / "owt_train_tokens.npy"
+            np.save(train_path, train_data)
+
+            val_data = np.random.randint(0, vocab_size, size=(50000,), dtype=np.int64)
+            val_path = Path(temp_dir) / "owt_valid_tokens.npy"
+            np.save(val_path, val_data)
+
+            config = TrainModelArgs(
+                vocab_size=vocab_size,
+                context_length=1024,
+                num_layers=6,
+                d_model=768,
+                num_heads=12,
+                d_ff=3072,
+                batch_size=8,
+                steps=5,
+                training_set=str(train_path),
+                validation_set=str(val_path),
+                use_wandb=False,
+                compile_model=False,
+                device="cpu",
+            )
+
+            vocab_data = {str(i): f"token_{i}" for i in range(vocab_size)}
+            vocab_path = Path(temp_dir) / "vocab.json"
+            with open(vocab_path, "w") as f:
+                json.dump(vocab_data, f)
+
+            import pickle
+
+            merges_data = [(b"a", b"b")]
+            merges_path = Path(temp_dir) / "merges.pkl"
+            with open(merges_path, "wb") as f:
+                pickle.dump(merges_data, f)
+
+            config.tokenizer_vocab = str(vocab_path)
+            config.tokenizer_merges = str(merges_path)
+
+            with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+                trainer = TrainModel(config)
+
+                trainer.step = 0
+                metrics = trainer.train_step()
+
+                assert metrics["loss"] > 0
+                assert not math.isnan(metrics["loss"])
+
+                val_loss, val_perplexity = trainer.evaluate()
+                assert val_loss > 0
+                assert val_perplexity > 1.0
 
     def test_h100_specific_optimizations(self):
         """Test H100-specific optimizations and configurations."""
-        config = TrainArgs(
+        config = TrainModelArgs(
             vocab_size=32000,
             context_length=2048,
             d_model=2048,
@@ -553,32 +899,133 @@ class TestProductionScenarios:
         assert config.d_model % config.num_heads == 0
         assert config.d_model >= 512, "Should use reasonable model size for H100"
 
-    def test_checkpoint_config(self):
-        """Test checkpoint configuration validation."""
-        config = TrainArgs(
-            checkpoint_step_interval=1000,
-            steps=5000,
+    def test_checkpoint_functionality(self):
+        """Test checkpoint saving and loading functionality."""
+        config = TrainModelArgs(
+            vocab_size=1000,
+            context_length=64,
+            num_layers=2,
+            d_model=128,
+            num_heads=4,
+            d_ff=256,
+            steps=2,
+            batch_size=2,
+            checkpoint_step_interval=1,
             use_wandb=False,
+            device="cpu",
+            compile_model=False,
         )
 
-        assert config.checkpoint_step_interval > 0
-        assert config.steps > 0
-        assert config.checkpoint_step_interval <= config.steps
+        with tempfile.TemporaryDirectory() as temp_dir:
+            train_data = np.random.randint(0, 1000, size=(1000,), dtype=np.int64)
+            np.save(Path(temp_dir) / "train.npy", train_data)
+            np.save(Path(temp_dir) / "val.npy", train_data)
 
-    def test_logging_config(self):
-        """Test logging configuration validation."""
-        config = TrainArgs(
+            vocab_data = {str(i): f"token_{i}" for i in range(1000)}
+            with open(Path(temp_dir) / "vocab.json", "w") as f:
+                json.dump(vocab_data, f)
+
+            import pickle
+
+            with open(Path(temp_dir) / "merges.pkl", "wb") as f:
+                pickle.dump([(b"a", b"b")], f)
+
+            config.training_set = str(Path(temp_dir) / "train.npy")
+            config.validation_set = str(Path(temp_dir) / "val.npy")
+            config.tokenizer_vocab = str(Path(temp_dir) / "vocab.json")
+            config.tokenizer_merges = str(Path(temp_dir) / "merges.pkl")
+
+            old_cwd = os.getcwd()
+            os.chdir(temp_dir)
+
+            try:
+                with patch("cs336_basics.experiments.exp_logging.ExperimentLogger"):
+                    trainer = TrainModel(config)
+
+                    trainer.step = 0
+                    trainer.train_step()
+
+                    from cs336_basics.training.checkpoint import save_checkpoint
+
+                    checkpoint_path = "test_checkpoint.pt"
+                    save_checkpoint(trainer.model, trainer.optimizer, trainer.step, checkpoint_path)
+
+                    assert Path(checkpoint_path).exists(), "Checkpoint file should be created"
+
+                    from cs336_basics.training.checkpoint import load_checkpoint
+
+                    new_model = type(trainer.model)(
+                        vocab_size=config.vocab_size,
+                        context_length=config.context_length,
+                        d_model=config.d_model,
+                        num_layers=config.num_layers,
+                        num_heads=config.num_heads,
+                        d_ff=config.d_ff,
+                        device=trainer.device,
+                    )
+                    new_optimizer = type(trainer.optimizer)(new_model.parameters())
+
+                    loaded_step = load_checkpoint(checkpoint_path, new_model, new_optimizer)
+                    assert loaded_step == trainer.step, "Loaded step should match saved step"
+
+            finally:
+                os.chdir(old_cwd)
+
+    def test_logging_integration(self):
+        """Test comprehensive logging functionality."""
+        config = TrainModelArgs(
+            vocab_size=1000,
+            context_length=32,
+            num_layers=2,
+            d_model=64,
+            num_heads=4,
+            d_ff=128,
+            steps=2,
+            batch_size=2,
+            use_wandb=False,
+            device="cpu",
             experiment_name="test_logging",
-            experiment_description="Test experiment",
-            use_wandb=False,
-            wandb_project="test_project",
-            wandb_entity="test_entity",
-            log_dir="experiments",
         )
 
-        assert config.experiment_name == "test_logging"
-        assert config.experiment_description == "Test experiment"
-        assert config.use_wandb == False
-        assert config.wandb_project == "test_project"
-        assert config.wandb_entity == "test_entity"
-        assert config.log_dir == "experiments"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            train_data = np.random.randint(0, 1000, size=(500,), dtype=np.int64)
+            np.save(Path(temp_dir) / "train.npy", train_data)
+            np.save(Path(temp_dir) / "val.npy", train_data)
+
+            vocab_data = {str(i): f"token_{i}" for i in range(1000)}
+            with open(Path(temp_dir) / "vocab.json", "w") as f:
+                json.dump(vocab_data, f)
+
+            import pickle
+
+            with open(Path(temp_dir) / "merges.pkl", "wb") as f:
+                pickle.dump([(b"a", b"b")], f)
+
+            config.training_set = str(Path(temp_dir) / "train.npy")
+            config.validation_set = str(Path(temp_dir) / "val.npy")
+            config.tokenizer_vocab = str(Path(temp_dir) / "vocab.json")
+            config.tokenizer_merges = str(Path(temp_dir) / "merges.pkl")
+            config.log_dir = temp_dir
+
+            trainer = TrainModel(config)
+
+            log_dir = Path(temp_dir) / "test_logging"
+            assert log_dir.exists(), "Experiment log directory should be created"
+
+            metadata_file = log_dir / "metadata.json"
+            assert metadata_file.exists(), "Metadata file should be created"
+
+            with open(metadata_file, "r") as f:
+                metadata = json.load(f)
+
+            assert metadata["name"] == "test_logging"
+            assert "hyperparameters" in metadata
+            assert "system_info" in metadata
+
+            trainer.step = 0
+            metrics = trainer.train_step()
+
+            assert "loss" in metrics
+            assert "lr" in metrics
+            assert "grad_norm" in metrics
+            assert "step_time" in metrics

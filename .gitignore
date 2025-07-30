@@ -168,4 +168,3 @@ checkpoints/
 experiments/
 wandb/
 train_owt.ipynb
-setup.md

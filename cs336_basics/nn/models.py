@@ -1,298 +1,24 @@
 """
-Transformer models with advanced stability features.
-
-This module implements state-of-the-art transformer architectures with:
-- Adaptive gradient clipping (ZClip/AdaGC)
-- Outlier-safe initialization
-- Stable attention mechanisms
-- Memory-efficient implementations for H100 GPU
+Complete Transformer model implementations with performance optimizations.
 """
 
-import math
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from jaxtyping import Float, Int
 
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: str = "cuda") -> torch.Tensor:
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
-
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
-        device (str): Device to create tensor on.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-    """
-    # Handle device availability - fall back to CPU if CUDA is not available
-    if device == "cuda" and not torch.cuda.is_available():
-        device = "cpu"
-
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs_cis
-
-
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
-
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
-
-    Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-    """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:, None, :]
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-class RMSNorm(nn.Module):
-    """
-    Stable RMSNorm implementation that prevents channel-wise amplification.
-    Based on latest 2025 research for outlier-safe training.
-    """
-
-    def __init__(self, d_model: int, eps: float = 1e-8):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Single-scale RMSNorm to prevent outliers
-        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        return (x / rms) * self.weight
-
-
-class QKNorm(nn.Module):
-    """Query-Key normalization for stable attention."""
-
-    def __init__(self, head_dim: int):
-        super().__init__()
-        self.q_norm = RMSNorm(head_dim)
-        self.k_norm = RMSNorm(head_dim)
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        return q, k
-
-
-class MultiHeadAttention(nn.Module):
-    """
-    Stable multi-head attention with:
-    - No sliding window (removes instability)
-    - Improved numerical stability
-    - Outlier-safe implementation
-    - QK normalization
-    - RoPE embeddings
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        max_seq_len: int = 2048,
-        rope_theta: float = 10000.0,
-        use_qk_norm: bool = True,
-        device: str = "cuda",
-    ):
-        super().__init__()
-        assert d_model % num_heads == 0
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.dropout = dropout
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-        # Use bias=False for better stability
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
-
-        self.qk_norm = QKNorm(self.head_dim) if use_qk_norm else None
-
-        self.freqs_cis = precompute_freqs_cis(self.head_dim, max_seq_len * 2, rope_theta, device)
-
-        self._init_stable_weights()
-
-    def _init_stable_weights(self):
-        """Outlier-safe weight initialization."""
-        # Conservative Xavier initialization with gain < 1.0
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.8)
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.8)
-        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.8)
-
-        # Zero initialization for output projection (residual path)
-        nn.init.zeros_(self.o_proj.weight)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        is_causal: bool = True,
-    ) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-
-        # Project to Q, K, V
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-
-        # Apply RoPE
-        freqs_cis = self.freqs_cis[:seq_len].to(x.device)
-        q, k = apply_rotary_emb(q, k, freqs_cis)
-
-        # Apply QK normalization for stability
-        if self.qk_norm is not None:
-            q, k = self.qk_norm(q, k)
-
-        # Reshape for attention computation
-        q = q.transpose(1, 2)  # (B, H, T, D)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Stable attention computation
-        out = self._stable_attention(q, k, v, mask, is_causal)
-
-        # Reshape and project output
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        return self.o_proj(out)
-
-    def _stable_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: torch.Tensor | None,
-        is_causal: bool,
-    ) -> torch.Tensor:
-        """Numerically stable attention computation."""
-        # Compute attention scores with temperature scaling
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Apply causal mask if needed (remove sliding window completely)
-        if is_causal:
-            seq_len = q.size(-2)
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
-            scores = scores.masked_fill(causal_mask, -1e4)  # Use -1e4 instead of -inf for stability
-
-        # Apply additional mask if provided
-        if mask is not None:
-            scores = scores.masked_fill(mask, -1e4)
-
-        # Stable softmax with temperature control
-        attn_weights = F.softmax(scores, dim=-1)
-
-        # Apply dropout if training
-        if self.training and self.dropout > 0:
-            attn_weights = F.dropout(attn_weights, p=self.dropout)
-
-        # Compute output
-        output = torch.matmul(attn_weights, v)
-        return output
-
-
-class FeedForward(nn.Module):
-    """
-    Stable feed-forward network with:
-    - Outlier-safe activations
-    - Conservative initialization
-    - Optional SwiGLU activation
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        d_ff: int,
-        dropout: float = 0.0,
-        activation: str = "relu",
-        use_swiglu: bool = False,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.use_swiglu = use_swiglu
-
-        if use_swiglu:
-            # SwiGLU implementation
-            self.w1 = nn.Linear(d_model, d_ff, bias=False)
-            self.w2 = nn.Linear(d_ff, d_model, bias=False)
-            self.w3 = nn.Linear(d_model, d_ff, bias=False)
-        else:
-            self.linear1 = nn.Linear(d_model, d_ff, bias=False)
-            self.linear2 = nn.Linear(d_ff, d_model, bias=False)
-
-        self.dropout = nn.Dropout(dropout)
-        self.activation_fn = self._get_activation(activation)
-
-        self._init_stable_weights()
-
-    def _init_stable_weights(self):
-        """Conservative weight initialization."""
-        if self.use_swiglu:
-            nn.init.xavier_uniform_(self.w1.weight, gain=0.8)
-            nn.init.zeros_(self.w2.weight)  # Zero init for residual path
-            nn.init.xavier_uniform_(self.w3.weight, gain=0.8)
-        else:
-            nn.init.xavier_uniform_(self.linear1.weight, gain=0.8)
-            nn.init.zeros_(self.linear2.weight)  # Zero init for residual path
-
-    def _get_activation(self, activation: str):
-        """Get activation function."""
-        if activation == "relu":
-            return F.relu
-        elif activation == "gelu":
-            return F.gelu
-        elif activation == "relu_squared":
-            return lambda x: F.relu(x) ** 2
-        else:
-            raise ValueError(f"Unknown activation: {activation}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_swiglu:
-            # SwiGLU: x * sigmoid(W1 @ x) * (W3 @ x)
-            gate = torch.sigmoid(self.w1(x))
-            hidden = gate * self.w3(x)
-            output = self.w2(hidden)
-        else:
-            hidden = self.activation_fn(self.linear1(x))
-            hidden = self.dropout(hidden)
-            output = self.linear2(hidden)
-
-        return self.dropout(output)
+from cs336_basics.nn.activations import CustomFFN, SwiGLU
+from cs336_basics.nn.attention import MultiHeadSelfAttention, RotaryPositionalEmbedding
+from cs336_basics.nn.layers import Embedding, Linear, RMSNorm
 
 
 class TransformerBlock(nn.Module):
     """
-    Stable transformer block with:
-    - Pre-norm architecture
-    - Stable residual connections
-    - Conservative initialization
+    Pre-norm Transformer block with gradient checkpointing support.
+
+    Enhanced with memory efficiency improvements and performance optimizations
+    for modern GPU architectures.
     """
 
     def __init__(
@@ -300,65 +26,93 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        dropout: float = 0.0,
-        max_seq_len: int = 2048,
-        rope_theta: float = 10000.0,
-        use_qk_norm: bool = True,
-        use_swiglu: bool = False,
-        device: str = "cuda",
-    ):
+        eps: float = 1e-5,
+        activation: str = "swiglu",
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        Initialize the Transformer block with optimizations.
+
+        Args:
+            d_model: Dimensionality of the model (input/output dimension)
+            num_heads: Number of attention heads
+            d_ff: Dimensionality of the feed-forward inner layer
+            eps: Epsilon value for RMSNorm numerical stability
+            activation: Type of activation function ("custom" or "swiglu")
+            device: Device to store parameters on
+            dtype: Data type for parameters
+        """
         super().__init__()
 
-        self.ln_1 = RMSNorm(d_model)
-        self.ln_2 = RMSNorm(d_model)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
 
-        self.attention = MultiHeadAttention(
-            d_model=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            max_seq_len=max_seq_len,
-            rope_theta=rope_theta,
-            use_qk_norm=use_qk_norm,
-            device=device,
-        )
+        factory_kwargs = {"device": device, "dtype": dtype}
 
-        self.feed_forward = FeedForward(
-            d_model=d_model,
-            d_ff=d_ff,
-            dropout=dropout,
-            activation="gelu",  # Use GELU for better stability
-            use_swiglu=use_swiglu,
-        )
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, **factory_kwargs)
+        self.ln1 = RMSNorm(d_model, eps, **factory_kwargs)
 
-        self.dropout = nn.Dropout(dropout)
+        if activation == "custom":
+            self.ffn = CustomFFN(d_model, d_ff, **factory_kwargs)
+        else:
+            self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
+
+        self.ln2 = RMSNorm(d_model, eps, **factory_kwargs)
+
+        self.use_checkpoint = False
 
     def forward(
         self,
-        x: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        is_causal: bool = True,
-        skip_connection: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Pre-norm attention with residual
-        norm_x = self.ln_1(x)
-        attn_out = self.attention(norm_x, mask=mask, is_causal=is_causal)
-        x = x + self.dropout(attn_out)
+        x: Float[torch.Tensor, "... seq_len d_model"],
+        rope: RotaryPositionalEmbedding | None = None,
+        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
+    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        """
+        Apply the Transformer block with optional gradient checkpointing.
 
-        # Optional U-Net style skip connection
-        if skip_connection is not None:
-            x = x + skip_connection
+        Args:
+            x: Input tensor of shape (..., seq_len, d_model)
+            rope: Optional RoPE module for positional encoding
+            token_positions: Token positions for RoPE (required if rope is provided)
 
-        # Pre-norm feedforward with residual
-        norm_x = self.ln_2(x)
-        ff_out = self.feed_forward(norm_x)
-        x = x + self.dropout(ff_out)
+        Returns:
+            Output tensor of same shape as input
+        """
+        if self.use_checkpoint and self.training:
+            return torch.utils.checkpoint.checkpoint(self._forward_impl, x, rope, token_positions, use_reentrant=False)
+        else:
+            return self._forward_impl(x, rope, token_positions)
 
-        return x
+    def _forward_impl(
+        self,
+        x: Float[torch.Tensor, "... seq_len d_model"],
+        rope: RotaryPositionalEmbedding | None = None,
+        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
+    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        """Internal forward implementation."""
+        normalized_x = self.ln1(x)
+        attn_output = self.attn(normalized_x, rope=rope, token_positions=token_positions)
+        z = x + attn_output
+
+        normalized_z = self.ln2(z)
+        ffn_output = self.ffn(normalized_z)
+        y = z + ffn_output
+
+        return y
+
+    def extra_repr(self) -> str:
+        """String representation for debugging."""
+        return f"d_model={self.d_model}, num_heads={self.num_heads}, d_ff={self.d_ff}"
 
 
 class TransformerLM(nn.Module):
     """
-    Stable Transformer Language Model with outlier-safe training.
+    Transformer Language Model with performance enhancements.
+
+    Enhanced with gradient checkpointing, memory optimizations, and architectural
+    improvements for better training efficiency on modern hardware.
     """
 
     def __init__(
@@ -370,86 +124,393 @@ class TransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float = 10000.0,
-        use_qk_norm: bool = True,
-        use_swiglu: bool = False,
-        tie_embeddings: bool = True,
-        dropout: float = 0.0,
-        device: str = "cuda",
-    ):
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        Initialize the Transformer Language Model with optimizations.
+
+        Args:
+            vocab_size: Size of the vocabulary (number of unique tokens)
+            context_length: Maximum sequence length the model can process
+            d_model: Dimensionality of the model (embedding and hidden dimensions)
+            num_layers: Number of Transformer blocks
+            num_heads: Number of attention heads (d_model must be divisible by num_heads)
+            d_ff: Dimensionality of the feed-forward inner layer
+            rope_theta: RoPE theta parameter (typically 10000.0)
+            eps: Epsilon value for RMSNorm numerical stability
+            device: Device to store parameters on
+            dtype: Data type for parameters
+        """
         super().__init__()
+
+        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        assert vocab_size > 0, f"vocab_size must be positive, got {vocab_size}"
+        assert context_length > 0, f"context_length must be positive, got {context_length}"
+        assert num_layers > 0, f"num_layers must be positive, got {num_layers}"
+
+        if d_ff % 64 != 0:
+            d_ff = ((d_ff + 63) // 64) * 64
 
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model
         self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
+
+        d_k = d_model // num_heads
+        self.rope = RotaryPositionalEmbedding(theta=rope_theta, d_k=d_k, max_seq_len=context_length, device=device)
+
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, **factory_kwargs)
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
+        self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
+
+        self.use_gradient_checkpointing = False
+        self._gradient_checkpointing_layers = None
+
+    def enable_gradient_checkpointing(self, layers_to_checkpoint: int | None = None) -> None:
+        """
+        Enable gradient checkpointing for memory efficiency.
+
+        Args:
+            layers_to_checkpoint: Number of layers to checkpoint. If None, checkpoints all layers.
+        """
+        self.use_gradient_checkpointing = True
+
+        if layers_to_checkpoint is None:
+            layers_to_checkpoint = self.num_layers
+        else:
+            layers_to_checkpoint = min(layers_to_checkpoint, self.num_layers)
+
+        self._gradient_checkpointing_layers = layers_to_checkpoint
+
+        for i, layer in enumerate(self.layers):
+            if i < layers_to_checkpoint:
+                layer.use_checkpoint = True
+                layer.attn.use_checkpoint = True
+            else:
+                layer.use_checkpoint = False
+                layer.attn.use_checkpoint = False
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self.use_gradient_checkpointing = False
+        for layer in self.layers:
+            layer.use_checkpoint = False
+            layer.attn.use_checkpoint = False
+
+    def forward(
+        self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
+    ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
+        """
+        Forward pass with memory and compute efficiency.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len)
+
+        Returns:
+            Logits tensor of shape (batch_size, seq_len, vocab_size)
+        """
+        batch_size, seq_len = input_ids.shape
+
+        assert seq_len <= self.context_length, (
+            f"Input sequence length ({seq_len}) exceeds context length ({self.context_length})"
+        )
+
+        token_positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
+
+        x = self.token_embeddings(input_ids)
+
+        for layer in self.layers:
+            x = layer(x, rope=self.rope, token_positions=token_positions)
+
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
+
+        return logits
+
+    def get_memory_stats(self) -> dict[str, float]:
+        """Get memory usage statistics for monitoring."""
+        if not torch.cuda.is_available():
+            return {}
+
+        stats = {}
+        stats["memory_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
+        stats["memory_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+        stats["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+
+        param_memory = sum(p.numel() * p.element_size() for p in self.parameters()) / 1e9
+        stats["parameter_memory_gb"] = param_memory
+
+        return stats
+
+    def count_parameters(self) -> dict[str, int]:
+        """Count model parameters by component."""
+        counts = {}
+
+        counts["embeddings"] = sum(p.numel() for p in self.token_embeddings.parameters())
+
+        if self.layers:
+            layer_params = sum(p.numel() for p in self.layers[0].parameters())
+            counts["transformer_layer"] = layer_params
+            counts["all_transformer_layers"] = layer_params * self.num_layers
+
+        counts["final_ln"] = sum(p.numel() for p in self.ln_final.parameters())
+        counts["lm_head"] = sum(p.numel() for p in self.lm_head.parameters())
+
+        counts["total"] = sum(p.numel() for p in self.parameters())
+        counts["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        return counts
+
+    def extra_repr(self) -> str:
+        """String representation for debugging."""
+        return (
+            f"vocab_size={self.vocab_size}, context_length={self.context_length}, "
+            f"d_model={self.d_model}, num_layers={self.num_layers}, "
+            f"num_heads={self.num_heads}, d_ff={self.d_ff}, "
+            f"rope_theta={self.rope_theta}"
+        )
+
+
+class EnhancedTransformerLM(nn.Module):
+    """
+    Enhanced Transformer Language Model.
+
+    Features:
+    - U-Net like skip connections with proper learnable mixing parameters
+    - Untied input/output embeddings with different learning rates
+    - CustomFFN activation: w2(max(w1(x), 0)^2)
+    - Mixed precision support with bfloat16
+    - Advanced gradient checkpointing
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float = 10000.0,
+        eps: float = 1e-5,
+        tie_embeddings: bool = False,
+        activation: str = "custom",
+        use_unet_architecture: bool = True,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """
+        Initialize the Enhanced Transformer Language Model.
+
+        Args:
+            vocab_size: Size of the vocabulary
+            context_length: Maximum sequence length
+            d_model: Model dimension
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            d_ff: Feed-forward dimension
+            rope_theta: RoPE theta parameter
+            eps: Epsilon for numerical stability
+            tie_embeddings: Whether to tie input and output embeddings
+            activation: Activation function type ("custom" or "swiglu")
+            use_unet_architecture: Whether to use U-Net skip connections
+            device: Device to store parameters on
+            dtype: Data type for parameters
+        """
+        super().__init__()
+
+        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        assert vocab_size > 0, f"vocab_size must be positive, got {vocab_size}"
+        assert context_length > 0, f"context_length must be positive, got {context_length}"
+        assert num_layers > 0, f"num_layers must be positive, got {num_layers}"
+
+        if d_ff % 64 != 0:
+            d_ff = ((d_ff + 63) // 64) * 64
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
         self.tie_embeddings = tie_embeddings
+        self.activation = activation
+        self.use_unet_architecture = use_unet_architecture
 
-        # Embedding layers
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        factory_kwargs = {"device": device, "dtype": dtype}
 
-        # Learnable embedding projection for outlier redistribution
-        self.embedding_proj = nn.Linear(d_model, d_model, bias=False)
+        self.token_embeddings = Embedding(vocab_size, d_model, **factory_kwargs)
 
-        # Transformer layers
+        d_k = d_model // num_heads
+        self.rope = RotaryPositionalEmbedding(theta=rope_theta, d_k=d_k, max_seq_len=context_length, device=device)
+
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    dropout=dropout,
-                    max_seq_len=context_length,
-                    rope_theta=rope_theta,
-                    use_qk_norm=use_qk_norm,
-                    use_swiglu=use_swiglu,
-                    device=device,
+                    d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, activation=activation, **factory_kwargs
                 )
                 for _ in range(num_layers)
             ]
         )
 
-        # Final layer norm
-        self.ln_f = RMSNorm(d_model)
-
-        # Output projection
-        if tie_embeddings:
-            self.lm_head = None  # Will use embedding weights
+        if use_unet_architecture:
+            self.skip_layers = num_layers // 2
+            self.skip_mixing = nn.ParameterList(
+                [nn.Parameter(torch.zeros(1, **factory_kwargs)) for _ in range(self.skip_layers)]
+            )
         else:
-            self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+            self.skip_layers = 0
+            self.skip_mixing = None
 
-        self._init_stable_weights()
+        self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
 
-    def _init_stable_weights(self):
-        """Outlier-safe weight initialization."""
-        # Conservative embedding initialization
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        if tie_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
 
-        # Zero init for embedding projection
-        nn.init.zeros_(self.embedding_proj.weight)
+        self.use_gradient_checkpointing = False
+        self._gradient_checkpointing_layers = None
 
-        # LM head initialization
-        if self.lm_head is not None:
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+    def enable_gradient_checkpointing(self, layers_to_checkpoint: int | None = None) -> None:
+        """Enable gradient checkpointing for memory efficiency."""
+        self.use_gradient_checkpointing = True
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if layers_to_checkpoint is None:
+            layers_to_checkpoint = self.num_layers
+        else:
+            layers_to_checkpoint = min(layers_to_checkpoint, self.num_layers)
+
+        self._gradient_checkpointing_layers = layers_to_checkpoint
+
+        for i, layer in enumerate(self.layers):
+            if i < layers_to_checkpoint:
+                layer.use_checkpoint = True
+                layer.attn.use_checkpoint = True
+            else:
+                layer.use_checkpoint = False
+                layer.attn.use_checkpoint = False
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self.use_gradient_checkpointing = False
+        for layer in self.layers:
+            layer.use_checkpoint = False
+            layer.attn.use_checkpoint = False
+
+    def forward(
+        self, input_ids: Int[torch.Tensor, "... batch_size seq_len"]
+    ) -> Float[torch.Tensor, "batch_size seq_len vocab_size"]:
+        """
+        Forward pass with improved U-Net skip connections.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len)
+
+        Returns:
+            Logits tensor of shape (batch_size, seq_len, vocab_size)
+        """
         batch_size, seq_len = input_ids.shape
 
-        # Embedding with projection for outlier redistribution
-        x = self.embedding(input_ids)
-        x = x + self.embedding_proj(x)  # Learnable residual projection
+        assert seq_len <= self.context_length, (
+            f"Input sequence length ({seq_len}) exceeds context length ({self.context_length})"
+        )
 
-        # Apply transformer layers
-        for i, layer in enumerate(self.layers):
-            x = layer(x, is_causal=True)
+        token_positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+        token_positions = token_positions.unsqueeze(0).expand(batch_size, -1)
 
-        # Final layer norm
-        x = self.ln_f(x)
+        x = self.token_embeddings(input_ids)
 
-        # Output projection
+        skip_connections = [] if self.use_unet_architecture else None
+
+        for i in range(self.skip_layers):
+            x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
+            if self.use_unet_architecture:
+                skip_connections.append(x)
+
+        for i in range(self.skip_layers, self.num_layers):
+            x = self.layers[i](x, rope=self.rope, token_positions=token_positions)
+
+            if self.use_unet_architecture and i < self.num_layers:
+                skip_idx = self.num_layers - 1 - i
+                if 0 <= skip_idx < len(skip_connections):
+                    skip_connection = skip_connections[skip_idx]
+                    mixing_weight = torch.sigmoid(self.skip_mixing[skip_idx])
+                    x = (1 - mixing_weight) * x + mixing_weight * skip_connection
+
+        x = self.ln_final(x)
+
         if self.tie_embeddings:
-            # Use embedding weights for output projection
-            logits = F.linear(x, self.embedding.weight)
+            logits = torch.matmul(x, self.token_embeddings.weight.t())
         else:
             logits = self.lm_head(x)
 
         return logits
+
+    def get_memory_stats(self) -> dict[str, float]:
+        """Get memory usage statistics for monitoring."""
+        if not torch.cuda.is_available():
+            return {}
+
+        stats = {}
+        stats["memory_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
+        stats["memory_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+        stats["max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
+
+        param_memory = sum(p.numel() * p.element_size() for p in self.parameters()) / 1e9
+        stats["parameter_memory_gb"] = param_memory
+
+        return stats
+
+    def count_parameters(self) -> dict[str, int]:
+        """Count model parameters by component."""
+        counts = {}
+
+        counts["embeddings"] = sum(p.numel() for p in self.token_embeddings.parameters())
+
+        if self.layers:
+            layer_params = sum(p.numel() for p in self.layers[0].parameters())
+            counts["transformer_layer"] = layer_params
+            counts["all_transformer_layers"] = layer_params * self.num_layers
+
+        if self.use_unet_architecture:
+            counts["skip_mixing"] = sum(p.numel() for p in self.skip_mixing)
+
+        counts["final_ln"] = sum(p.numel() for p in self.ln_final.parameters())
+
+        if self.lm_head is not None:
+            counts["lm_head"] = sum(p.numel() for p in self.lm_head.parameters())
+        else:
+            counts["lm_head"] = 0
+
+        counts["total"] = sum(p.numel() for p in self.parameters())
+        counts["trainable"] = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        return counts
+
+    def extra_repr(self) -> str:
+        """String representation for debugging."""
+        return (
+            f"vocab_size={self.vocab_size}, context_length={self.context_length}, "
+            f"d_model={self.d_model}, num_layers={self.num_layers}, "
+            f"num_heads={self.num_heads}, d_ff={self.d_ff}, "
+            f"rope_theta={self.rope_theta}, tie_embeddings={self.tie_embeddings}, "
+            f"activation={self.activation}, use_unet_architecture={self.use_unet_architecture}"
+        )

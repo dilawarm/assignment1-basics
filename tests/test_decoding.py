@@ -75,7 +75,6 @@ def small_model() -> TransformerLM:
         num_heads=4,
         d_ff=64,
         rope_theta=10000.0,
-        device="cpu",
     )
 
 

@@ -1,298 +1,128 @@
 """
-Advanced gradient clipping utilities with state-of-the-art adaptive methods.
+Gradient clipping utilities with advanced AdaGC support.
 
-This module provides:
-- ZClip: Adaptive gradient clipping with z-score anomaly detection (2025)
-- AdaGC: Parameter-specific adaptive gradient clipping with EMA (2025)
-- Traditional gradient clipping with robust device handling
-- Proactive loss spike detection and recovery
+This module provides both traditional gradient clipping and Adaptive Gradient Clipping (AdaGC)
+which tracks per-parameter gradient statistics for more stable training.
 """
 
 import math
-import warnings
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 
-class ZClipGradientClipper:
+class AdaptiveGradientClipper:
     """
-    ZClip: Adaptive gradient clipping using z-score anomaly detection.
+    Adaptive Gradient Clipping (AdaGC) implementation.
 
-    Based on "ZClip: Adaptive Spike Mitigation for LLM Pre-Training" (2025).
-    Dynamically adjusts clipping threshold based on statistical properties
-    of gradient norms to prevent malignant loss spikes.
-    """
+    Tracks exponential moving averages of gradient norms per parameter
+    and applies adaptive thresholds. Based on arXiv:2502.11034.
 
-    def __init__(
-        self,
-        history_size: int = 100,
-        zscore_threshold: float = 3.0,
-        min_clip_value: float = 0.1,
-        max_clip_value: float = 10.0,
-        warmup_steps: int = 100,
-    ):
-        self.history_size = history_size
-        self.zscore_threshold = zscore_threshold
-        self.min_clip_value = min_clip_value
-        self.max_clip_value = max_clip_value
-        self.warmup_steps = warmup_steps
-
-        self.grad_norm_history = []
-        self.step_count = 0
-        self.current_threshold = max_clip_value
-
-    def clip_gradients(self, parameters: Iterable[torch.nn.Parameter]) -> Tuple[float, float, bool]:
-        """
-        Apply ZClip adaptive gradient clipping.
-
-        Returns:
-            Tuple of (global_norm, clip_threshold, was_clipped)
-        """
-        self.step_count += 1
-        param_list = list(parameters)
-
-        # Compute global gradient norm
-        global_norm = self._compute_global_norm(param_list)
-
-        if math.isnan(global_norm) or math.isinf(global_norm):
-            warnings.warn(f"NaN/Inf gradient norm detected at step {self.step_count}")
-            return global_norm, self.current_threshold, False
-
-        # Update history
-        self.grad_norm_history.append(global_norm)
-        if len(self.grad_norm_history) > self.history_size:
-            self.grad_norm_history.pop(0)
-
-        # Use warmup phase with conservative clipping
-        if self.step_count <= self.warmup_steps:
-            self.current_threshold = self.min_clip_value * 2.0
-            was_clipped = self._apply_clipping(param_list, global_norm, self.current_threshold)
-            return global_norm, self.current_threshold, was_clipped
-
-        # Adaptive threshold based on z-score anomaly detection
-        if len(self.grad_norm_history) >= 10:
-            mean_norm = np.mean(self.grad_norm_history)
-            std_norm = np.std(self.grad_norm_history) + 1e-8
-
-            # Detect anomaly using z-score
-            z_score = (global_norm - mean_norm) / std_norm
-
-            if z_score > self.zscore_threshold:
-                # Adaptive threshold based on recent statistics
-                self.current_threshold = mean_norm + self.zscore_threshold * std_norm
-                self.current_threshold = max(self.min_clip_value, min(self.current_threshold, self.max_clip_value))
-            else:
-                # Gradually increase threshold when stable
-                self.current_threshold = min(self.current_threshold * 1.01, self.max_clip_value)
-
-        was_clipped = self._apply_clipping(param_list, global_norm, self.current_threshold)
-        return global_norm, self.current_threshold, was_clipped
-
-    def _compute_global_norm(self, param_list) -> float:
-        """Compute global gradient norm."""
-        total_norm_squared = 0.0
-        device = None
-
-        for param in param_list:
-            if param.grad is not None:
-                if device is None:
-                    device = param.grad.device
-
-                param_norm = torch.norm(param.grad.data, dtype=torch.float32)
-                total_norm_squared += param_norm.item() ** 2
-
-        return math.sqrt(total_norm_squared + 1e-8)
-
-    def _apply_clipping(self, param_list, global_norm: float, threshold: float) -> bool:
-        """Apply gradient clipping if needed."""
-        if global_norm > threshold:
-            clip_coeff = threshold / global_norm
-            for param in param_list:
-                if param.grad is not None:
-                    param.grad.data.mul_(clip_coeff)
-            return True
-        return False
-
-
-class AdaGCGradientClipper:
-    """
-    AdaGC: Adaptive Gradient Clipping with parameter-specific thresholds.
-
-    Based on "AdaGC: Improving Training Stability for Large Language Model Pretraining" (2025).
-    Maintains per-parameter gradient norm statistics using exponential moving averages.
+    This prevents loss spikes more effectively than global gradient clipping.
     """
 
     def __init__(
         self,
-        beta: float = 0.99,
+        model: nn.Module,
+        max_global_norm: float = 1.0,
+        beta: float = 0.95,
         eps: float = 1e-8,
-        init_threshold: float = 1.0,
-        threshold_scale: float = 2.0,
+        device: Optional[torch.device] = None,
     ):
+        """
+        Initialize AdaGC clipper.
+
+        Args:
+            model: Model to clip gradients for
+            max_global_norm: Maximum global gradient norm
+            beta: Exponential moving average decay
+            eps: Small value for numerical stability
+            device: Device to place moving averages on
+        """
+        self.max_global_norm = max_global_norm
         self.beta = beta
         self.eps = eps
-        self.init_threshold = init_threshold
-        self.threshold_scale = threshold_scale
+        self.device = device or next(model.parameters()).device
 
-        self.param_stats = {}
+        self.moving_averages: Dict[str, torch.Tensor] = {}
         self.step_count = 0
 
-    def clip_gradients(self, parameters: Iterable[torch.nn.Parameter]) -> Tuple[float, Dict[str, float], int]:
-        """
-        Apply AdaGC adaptive gradient clipping.
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.moving_averages[name] = torch.zeros(1, device=self.device)
 
-        Returns:
-            Tuple of (global_norm, param_thresholds, num_clipped)
-        """
+    def update_moving_averages(self, model: nn.Module) -> None:
+        """Update moving averages of gradient norms."""
         self.step_count += 1
-        param_list = list(parameters)
 
-        global_norm_squared = 0.0
-        param_thresholds = {}
-        num_clipped = 0
-
-        for i, param in enumerate(param_list):
-            if param.grad is None:
+        for name, param in model.named_parameters():
+            if param.grad is None or not param.requires_grad:
                 continue
 
-            param_id = f"param_{i}"
-            param_norm = torch.norm(param.grad.data, dtype=torch.float32).item()
+            grad = param.grad.to(device=self.device)
 
-            # Initialize statistics if needed
-            if param_id not in self.param_stats:
-                self.param_stats[param_id] = {
-                    "ema_norm": param_norm,
-                    "ema_norm_sq": param_norm**2,
-                }
+            param_grad_norm = torch.norm(grad, dtype=torch.float32)
 
-            # Update EMA statistics
-            stats = self.param_stats[param_id]
-            stats["ema_norm"] = self.beta * stats["ema_norm"] + (1 - self.beta) * param_norm
-            stats["ema_norm_sq"] = self.beta * stats["ema_norm_sq"] + (1 - self.beta) * (param_norm**2)
+            if name not in self.moving_averages:
+                self.moving_averages[name] = torch.zeros(1, device=self.device)
 
-            # Bias correction
-            bias_correction_1 = 1 - self.beta**self.step_count
-            bias_correction_2 = 1 - self.beta**self.step_count
+            self.moving_averages[name] = self.beta * self.moving_averages[name] + (1 - self.beta) * param_grad_norm
 
-            corrected_mean = stats["ema_norm"] / bias_correction_1
-            corrected_second_moment = stats["ema_norm_sq"] / bias_correction_2
-
-            # Adaptive threshold
-            variance = corrected_second_moment - corrected_mean**2
-            std = math.sqrt(max(variance, 0) + self.eps)
-            threshold = corrected_mean + self.threshold_scale * std
-            threshold = max(threshold, self.init_threshold)
-
-            param_thresholds[param_id] = threshold
-
-            # Apply clipping if needed
-            if param_norm > threshold:
-                clip_coeff = threshold / param_norm
-                param.grad.data.mul_(clip_coeff)
-                param_norm = threshold
-                num_clipped += 1
-
-            global_norm_squared += param_norm**2
-
-        global_norm = math.sqrt(global_norm_squared + 1e-8)
-        return global_norm, param_thresholds, num_clipped
-
-
-class StabilityMonitor:
-    """
-    Advanced stability monitoring with proactive loss spike detection.
-    """
-
-    def __init__(
-        self,
-        loss_history_size: int = 50,
-        spike_threshold: float = 2.0,
-        nan_tolerance: int = 3,
-        recovery_lr_scale: float = 0.1,
-    ):
-        self.loss_history_size = loss_history_size
-        self.spike_threshold = spike_threshold
-        self.nan_tolerance = nan_tolerance
-        self.recovery_lr_scale = recovery_lr_scale
-
-        self.loss_history = []
-        self.nan_count = 0
-        self.spike_count = 0
-        self.last_stable_state = None
-
-    def update(
-        self, loss: float, grad_norm: float, step: int, model_state: Optional[Dict] = None
-    ) -> Tuple[bool, Dict, Optional[Dict]]:
+    def clip_gradients(self, model: nn.Module) -> float:
         """
-        Update stability monitoring.
+        Apply adaptive gradient clipping.
 
         Returns:
-            Tuple of (should_continue, stats, recovery_state)
+            The global gradient norm before clipping
         """
-        # Check for NaN
-        if math.isnan(loss) or math.isnan(grad_norm):
-            self.nan_count += 1
-            if self.nan_count > self.nan_tolerance:
-                return False, self._get_stats(), self.last_stable_state
-        else:
-            # Reset NaN count on stable step
-            self.nan_count = 0
+        self.update_moving_averages(model)
 
-            # Save stable state
-            if model_state is not None and len(self.loss_history) > 10:
-                recent_avg = np.mean(self.loss_history[-5:])
-                if not math.isnan(recent_avg) and recent_avg < float("inf"):
-                    self.last_stable_state = {
-                        "step": step,
-                        "loss": loss,
-                        "model_state": model_state.copy() if hasattr(model_state, "copy") else model_state,
-                        "lr_scale": 1.0,
-                    }
+        total_norm_squared = 0.0
+        param_count = 0
 
-        # Update loss history
-        if not math.isnan(loss):
-            self.loss_history.append(loss)
-            if len(self.loss_history) > self.loss_history_size:
-                self.loss_history.pop(0)
+        for name, param in model.named_parameters():
+            if param.grad is None or not param.requires_grad:
+                continue
 
-        # Detect loss spikes
-        if len(self.loss_history) >= 10:
-            recent_avg = np.mean(self.loss_history[-3:])
-            baseline_avg = np.mean(self.loss_history[-10:-3])
+            if param.grad.device != self.device:
+                param.grad = param.grad.to(device=self.device)
 
-            if recent_avg > baseline_avg * self.spike_threshold:
-                self.spike_count += 1
+            param_norm = torch.norm(param.grad, dtype=torch.float32)
+            total_norm_squared += param_norm.item() ** 2
+            param_count += 1
 
-                # Prepare recovery state with reduced learning rate
-                recovery_state = None
-                if self.last_stable_state is not None:
-                    recovery_state = self.last_stable_state.copy()
-                    recovery_state["lr_scale"] = self.recovery_lr_scale
+        global_norm = math.sqrt(total_norm_squared) if param_count > 0 else 0.0
 
-        return True, self._get_stats(), None
+        if global_norm > self.max_global_norm:
+            clip_coeff = self.max_global_norm / (global_norm + self.eps)
 
-    def _get_stats(self) -> Dict:
-        """Get monitoring statistics."""
-        return {
-            "nan_count": self.nan_count,
-            "spike_count": self.spike_count,
-            "avg_recent_loss": float(np.mean(self.loss_history[-5:]) if len(self.loss_history) >= 5 else 0.0),
-            "loss_trend": float(
-                np.mean(self.loss_history[-3:]) - np.mean(self.loss_history[-6:-3])
-                if len(self.loss_history) >= 6
-                else 0.0
-            ),
-        }
+            for name, param in model.named_parameters():
+                if param.grad is None or not param.requires_grad:
+                    continue
+
+                bias_corrected_ma = self.moving_averages[name] / (1 - self.beta**self.step_count)
+                adaptive_threshold = bias_corrected_ma + self.eps
+
+                param_norm = torch.norm(param.grad, dtype=torch.float32)
+
+                param_norm_scalar = param_norm.item()
+                adaptive_threshold_scalar = adaptive_threshold.item()
+
+                if param_norm_scalar > adaptive_threshold_scalar:
+                    local_clip_coeff = adaptive_threshold_scalar / (param_norm_scalar + self.eps)
+                    param.grad.mul_(min(clip_coeff, local_clip_coeff))
+                else:
+                    param.grad.mul_(clip_coeff)
+
+        return global_norm
 
 
 def gradient_clipping(
     parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, device: Optional[torch.device] = None
 ) -> float:
     """
-    Traditional gradient clipping by global L2 norm with robust device handling.
+    Clip gradients by global L2 norm with robust device handling.
 
     Args:
         parameters: Model parameters with gradients
@@ -340,67 +170,36 @@ def gradient_clipping(
     return global_norm.item()
 
 
-def create_adaptive_clipper(method: str = "zclip", **kwargs) -> object:
+def advanced_gradient_clipping(
+    model: nn.Module,
+    max_global_norm: float = 1.0,
+    use_adaptive: bool = True,
+    beta: float = 0.95,
+    eps: float = 1e-8,
+    adaptive_clipper: Optional[AdaptiveGradientClipper] = None,
+) -> float:
     """
-    Create an adaptive gradient clipper.
+    Apply advanced gradient clipping with optional AdaGC.
 
     Args:
-        method: "zclip" or "adagc"
-        **kwargs: Method-specific parameters
+        model: Model to clip gradients for
+        max_global_norm: Maximum global gradient norm
+        use_adaptive: Whether to use AdaGC
+        beta: AdaGC exponential moving average decay
+        eps: Small value for numerical stability
+        adaptive_clipper: Pre-existing AdaGC clipper to reuse
 
     Returns:
-        Gradient clipper instance
-    """
-    if method.lower() == "zclip":
-        return ZClipGradientClipper(**kwargs)
-    elif method.lower() == "adagc":
-        return AdaGCGradientClipper(**kwargs)
-    else:
-        raise ValueError(f"Unknown adaptive clipping method: {method}")
-
-
-def safe_gradient_step(
-    optimizer: torch.optim.Optimizer,
-    clipper: object,
-    parameters: Iterable[torch.nn.Parameter],
-    fallback_clip: float = 1.0,
-) -> Tuple[float, bool]:
-    """
-    Perform a safe gradient step with adaptive clipping and fallback.
-
-    Args:
-        optimizer: PyTorch optimizer
-        clipper: Adaptive gradient clipper (ZClip or AdaGC)
-        parameters: Model parameters
-        fallback_clip: Fallback clipping value if adaptive fails
-
-    Returns:
-        Tuple of (gradient_norm, was_clipped)
+        Global gradient norm before clipping
     """
     try:
-        if hasattr(clipper, "clip_gradients"):
-            if isinstance(clipper, ZClipGradientClipper):
-                grad_norm, threshold, was_clipped = clipper.clip_gradients(parameters)
-            elif isinstance(clipper, AdaGCGradientClipper):
-                grad_norm, thresholds, num_clipped = clipper.clip_gradients(parameters)
-                was_clipped = num_clipped > 0
-            else:
-                grad_norm = gradient_clipping(parameters, fallback_clip)
-                was_clipped = grad_norm > fallback_clip
+        if adaptive_clipper is not None:
+            return adaptive_clipper.clip_gradients(model)
+        elif use_adaptive:
+            temp_clipper = AdaptiveGradientClipper(model=model, max_global_norm=max_global_norm, beta=beta, eps=eps)
+            return temp_clipper.clip_gradients(model)
         else:
-            grad_norm = gradient_clipping(parameters, fallback_clip)
-            was_clipped = grad_norm > fallback_clip
-
-        # Check for problematic gradients
-        if math.isnan(grad_norm) or math.isinf(grad_norm):
-            warnings.warn(f"Problematic gradient norm: {grad_norm}, skipping step")
-            return grad_norm, False
-
-        optimizer.step()
-        return grad_norm, was_clipped
-
+            return gradient_clipping(model.parameters(), max_global_norm)
     except Exception as e:
-        warnings.warn(f"Gradient step failed: {e}, applying fallback clipping")
-        grad_norm = gradient_clipping(parameters, fallback_clip)
-        optimizer.step()
-        return grad_norm, True
+        print(f"Advanced gradient clipping failed, using standard clipping: {e}")
+        return gradient_clipping(model.parameters(), max_global_norm)
