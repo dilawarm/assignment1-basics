@@ -9,13 +9,13 @@
     "use_squared_relu": true,
     "tie_embeddings": false,
     
-    "optimizer_type": "enhanced_adam",
+    "optimizer_type": "lion",
     "weight_decay": 0.1,
-    "betas": [0.9, 0.95],
-    "base_lr": 0.001,
+    "betas": [0.9, 0.99],
+    "base_lr": 0.0006,
     
-    "min_learning_rate": 0.00003,
-    "warmup_iters": 1000,
+    "min_learning_rate": 0.00006,
+    "warmup_iters": 2000,
     "cosine_cycle_iters": 20000,
     
     "training_set": "data/encoded/owt_train_tokens.npy",
@@ -24,14 +24,14 @@
     "validation_step_interval": 250,
     "checkpoint_step_interval": 5000,
     "steps": 20000,
-    "batch_size": 64,
-    "gradient_accumulation_steps": 4,
+    "batch_size": 32,
+    "gradient_accumulation_steps": 2,
     "gradient_clipping": 1.0,
     
     "use_bfloat16": true,
     "use_amp": false,
-    "compile_model": true,
-    "compile_mode": "reduce-overhead",
+    "compile_model": false,
+    "compile_mode": "default",
     "use_flash_attention": true,
     "use_fused_optimizers": true,
     
@@ -39,10 +39,10 @@
     "dataloader_num_workers": 4,
     "pin_memory": true,
     
-    "experiment_name": "h100_optimized_unet_transformer",
-    "experiment_description": "Optimized U-Net transformer targeting val_loss < 3.0781 in 1.5 hours on H100",
+    "experiment_name": "h100_stable_unet_transformer",
+    "experiment_description": "Stable U-Net transformer configuration for H100",
     "use_wandb": true,
     "wandb_project": "cs336-assignment1",
     "wandb_entity": "",
-    "log_dir": "experiments/h100_optimized"
+    "log_dir": "experiments/h100_stable"
 }

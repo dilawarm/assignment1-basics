@@ -102,9 +102,14 @@ class EnhancedAdam(Optimizer):
                 else:
                     effective_beta1 = beta1
 
-                # Bias correction
-                bias_correction1 = 1 - effective_beta1**step
-                bias_correction2 = 1 - beta2**step
+                # Bias correction with numerical stability
+                # Cap step to prevent overflow in bias correction
+                # When beta^step becomes very small, it's effectively 0 anyway
+                max_step = 1000  # After 1000 steps, bias correction is minimal
+                capped_step = min(step, max_step)
+                
+                bias_correction1 = 1 - effective_beta1**capped_step
+                bias_correction2 = 1 - beta2**capped_step
 
                 # Update biased first moment estimate
                 exp_avg.mul_(effective_beta1).add_(grad, alpha=1 - effective_beta1)

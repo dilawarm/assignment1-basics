@@ -64,8 +64,10 @@ class Adam(Optimizer):
                 beta1, beta2 = group["betas"]
 
                 state["step"] += 1
-                bias_correction1 = 1 - beta1 ** state["step"]
-                bias_correction2 = 1 - beta2 ** state["step"]
+                # Cap step to prevent numerical overflow
+                capped_step = min(state["step"], 1000)
+                bias_correction1 = 1 - beta1 ** capped_step
+                bias_correction2 = 1 - beta2 ** capped_step
 
                 if group["weight_decay"] != 0:
                     grad = grad.add(p, alpha=group["weight_decay"])
@@ -134,8 +136,10 @@ class AdamW(Optimizer):
                 beta1, beta2 = group["betas"]
 
                 state["step"] += 1
-                bias_correction1 = 1 - beta1 ** state["step"]
-                bias_correction2 = 1 - beta2 ** state["step"]
+                # Cap step to prevent numerical overflow
+                capped_step = min(state["step"], 1000)
+                bias_correction1 = 1 - beta1 ** capped_step
+                bias_correction2 = 1 - beta2 ** capped_step
 
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
