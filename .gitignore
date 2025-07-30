@@ -167,4 +167,3 @@ output/
 checkpoints/
 experiments/
 wandb/
-train_owt.ipynb
