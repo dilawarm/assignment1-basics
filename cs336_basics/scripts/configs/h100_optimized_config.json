@@ -24,14 +24,14 @@
     "validation_step_interval": 250,
     "checkpoint_step_interval": 5000,
     "steps": 20000,
-    "batch_size": 128,
-    "gradient_accumulation_steps": 1,
+    "batch_size": 64,
+    "gradient_accumulation_steps": 4,
     "gradient_clipping": 1.0,
     
     "use_bfloat16": true,
     "use_amp": false,
     "compile_model": true,
-    "compile_mode": "max-autotune",
+    "compile_mode": "reduce-overhead",
     "use_flash_attention": true,
     "use_fused_optimizers": true,
     
