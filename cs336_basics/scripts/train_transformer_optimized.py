@@ -312,6 +312,9 @@ class OptimizedTrainer:
         eval_start_time = time.time()
 
         for batch_idx in range(num_batches):
+            # Mark CUDA graph step beginning if using reduce-overhead mode
+            if self.args.compile_model and self.args.compile_mode == "reduce-overhead" and self.device.type == "cuda":
+                torch.compiler.cudagraph_mark_step_begin()
             try:
                 inputs, targets = get_batch(
                     self.validation_set, self.args.batch_size, self.args.context_length, device=str(self.device)
@@ -354,6 +357,10 @@ class OptimizedTrainer:
         """Single training step with mixed precision."""
         self.model.train()
         step_start_time = time.time()
+
+        # Mark CUDA graph step beginning if using reduce-overhead mode
+        if self.args.compile_model and self.args.compile_mode == "reduce-overhead" and self.device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
 
         # Update learning rates for all parameter groups
         lr = self.get_lr(self.step)
