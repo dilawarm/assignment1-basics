@@ -206,8 +206,7 @@ class UNetTransformerLM(nn.Module):
         for module in self.modules():
             if isinstance(module, Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                # Note: our custom Linear layer doesn't have bias
             elif isinstance(module, UNetTransformerBlock):
                 # Special initialization for skip weights
                 nn.init.zeros_(module.skip_weight)

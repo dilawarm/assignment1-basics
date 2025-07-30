@@ -117,7 +117,11 @@ class OptimizedTrainer:
 
         # Set up CUDA optimizations
         if torch.cuda.is_available():
-            torch.cuda.set_device(self.device)
+            # Get device index - default to 0 if not specified
+            if self.device.type == "cuda":
+                device_idx = self.device.index if self.device.index is not None else 0
+                torch.cuda.set_device(device_idx)
+
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
@@ -517,6 +521,12 @@ class OptimizedTrainer:
                     mfu_at_validation=mfu,
                     tokens_per_sec_at_validation=tokens_per_sec,
                 )
+
+                # Early stopping if we hit target
+                if val_loss < 3.0781:
+                    print(f"🎉 Target validation loss achieved: {val_loss:.4f} < 3.0781")
+                    self.experiment_logger.add_note(f"Target achieved at step {step}: val_loss={val_loss:.4f}")
+                    break
 
             # Checkpointing
             if step > 0 and step % self.args.checkpoint_step_interval == 0:
