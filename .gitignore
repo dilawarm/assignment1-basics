@@ -167,3 +167,4 @@ output/
 checkpoints/
 experiments/
 wandb/
+setup.md
