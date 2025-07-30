@@ -42,7 +42,7 @@
     "experiment_name": "h100_optimized_unet_transformer",
     "experiment_description": "Optimized U-Net transformer targeting val_loss < 3.0781 in 1.5 hours on H100",
     "use_wandb": true,
-    "wandb_project": "cs336-h100-optimized",
+    "wandb_project": "cs336-assignment1",
     "wandb_entity": "",
     "log_dir": "experiments/h100_optimized"
 }
