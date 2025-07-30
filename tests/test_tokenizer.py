@@ -26,9 +26,6 @@ def memory_limit(max_mem):
                 result = f(*args, **kwargs)
                 return result
             finally:
-                # Even if the function above fails (e.g., it exceeds the
-                # memory limit), reset the memory limit back to the
-                # previous limit so other tests aren't affected.
                 resource.setrlimit(resource.RLIMIT_AS, prev_limits)
 
         return wrapper
@@ -50,14 +47,10 @@ def get_tokenizer_from_vocab_merges_path(
             cleaned_line = line.rstrip()
             if cleaned_line and len(cleaned_line.split(" ")) == 2:
                 gpt2_bpe_merges.append(tuple(cleaned_line.split(" ")))
-    # The GPT-2 tokenizer uses a remapped unicode encoding for bytes. Let's
-    # just return the original bytes, so we don't force students to use
-    # any particular encoding scheme.
     vocab = {
         gpt2_vocab_index: bytes([gpt2_byte_decoder[token] for token in gpt2_vocab_item])
         for gpt2_vocab_item, gpt2_vocab_index in gpt2_vocab.items()
     }
-    # If any of the special tokens don't exist in the vocab, append them to the vocab.
     if special_tokens:
         for special_token in special_tokens:
             byte_encoded_special_token = special_token.encode("utf-8")
@@ -223,7 +216,6 @@ def test_roundtrip_unicode_string_with_special_tokens():
     test_string = "Héllò hôw <|endoftext|><|endoftext|> are ü? 🙃<|endoftext|>"
     encoded_ids = tokenizer.encode(test_string)
     tokenized_string = [tokenizer.decode([x]) for x in encoded_ids]
-    # Ensure the special <|endoftext|> token is preserved
     assert tokenized_string.count("<|endoftext|>") == 3
 
     decoded_string = tokenizer.decode(encoded_ids)
@@ -255,10 +247,8 @@ def test_overlapping_special_tokens():
 
     ids = tokenizer.encode(test_string)
     tokenized_string = [tokenizer.decode([x]) for x in ids]
-    # Ensure the double <|endoftext|><|endoftext|> is preserved as a single token
     assert tokenized_string.count("<|endoftext|>") == 1
     assert tokenized_string.count("<|endoftext|><|endoftext|>") == 1
-    # Test roundtrip
     assert tokenizer.decode(ids) == test_string
 
 

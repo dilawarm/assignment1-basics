@@ -32,11 +32,9 @@ def test_train_bpe():
         special_tokens=["<|endoftext|>"],
     )
 
-    # Path to the reference tokenizer vocab and merges
     reference_vocab_path = FIXTURES_PATH / "train-bpe-reference-vocab.json"
     reference_merges_path = FIXTURES_PATH / "train-bpe-reference-merges.txt"
 
-    # Compare the learned merges to the expected output merges
     gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
     with open(reference_merges_path) as f:
         gpt2_reference_merges = [tuple(line.rstrip().split(" ")) for line in f]
@@ -49,15 +47,12 @@ def test_train_bpe():
         ]
     assert merges == reference_merges
 
-    # Compare the vocab to the expected output vocab
     with open(reference_vocab_path) as f:
         gpt2_reference_vocab = json.load(f)
         reference_vocab = {
             gpt2_vocab_index: bytes([gpt2_byte_decoder[token] for token in gpt2_vocab_item])
             for gpt2_vocab_item, gpt2_vocab_index in gpt2_reference_vocab.items()
         }
-    # Rather than checking that the vocabs exactly match (since they could
-    # have been constructed differently, we'll make sure that the vocab keys and values match)
     assert set(vocab.keys()) == set(reference_vocab.keys())
     assert set(vocab.values()) == set(reference_vocab.values())
 
@@ -74,7 +69,6 @@ def test_train_bpe_special_tokens(snapshot):
         special_tokens=["<|endoftext|>"],
     )
 
-    # Check that the special token is not in the vocab
     vocabs_without_specials = [word for word in vocab.values() if word != b"<|endoftext|>"]
     for word_bytes in vocabs_without_specials:
         assert b"<|" not in word_bytes

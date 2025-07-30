@@ -533,8 +533,6 @@ class TestErrorHandling:
         config = TrainModelArgs(
             training_set="nonexistent_train.npy",
             validation_set="nonexistent_val.npy",
-            tokenizer_vocab="nonexistent_vocab.json",
-            tokenizer_merges="nonexistent_merges.pkl",
             use_wandb=False,
             device="cpu",
             compile_model=False,
@@ -631,7 +629,7 @@ class TestDataLoading:
             try:
                 train_data = np.load(train_file, mmap_mode="r")
                 assert len(train_data.shape) == 1, f"Training data should be 1D, got shape {train_data.shape}"
-                assert train_data.dtype == np.int64 or train_data.dtype == np.int32, (
+                assert np.issubdtype(train_data.dtype, np.integer), (
                     f"Training data should be integer type, got {train_data.dtype}"
                 )
                 assert len(train_data) > 1000, f"Training data seems too small: {len(train_data)} tokens"
@@ -643,7 +641,7 @@ class TestDataLoading:
             try:
                 val_data = np.load(val_file, mmap_mode="r")
                 assert len(val_data.shape) == 1, f"Validation data should be 1D, got shape {val_data.shape}"
-                assert val_data.dtype == np.int64 or val_data.dtype == np.int32, (
+                assert np.issubdtype(val_data.dtype, np.integer), (
                     f"Validation data should be integer type, got {val_data.dtype}"
                 )
                 assert len(val_data) > 100, f"Validation data seems too small: {len(val_data)} tokens"

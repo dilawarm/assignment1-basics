@@ -21,22 +21,18 @@ class _TestNet(nn.Module):
 
 
 def are_optimizers_equal(optimizer1_state_dict, optimizer2_state_dict, atol=1e-8, rtol=1e-5):
-    # Check if the keys of the main dictionaries are equal (e.g., 'state', 'param_groups')
     if set(optimizer1_state_dict.keys()) != set(optimizer2_state_dict.keys()):
         return False
 
-    # Check parameter groups are identical
     if optimizer1_state_dict["param_groups"] != optimizer2_state_dict["param_groups"]:
         return False
 
-    # Check states
     state1 = optimizer1_state_dict["state"]
     state2 = optimizer2_state_dict["state"]
     if set(state1.keys()) != set(state2.keys()):
         return False
 
     for key in state1:
-        # Assuming state contents are also dictionaries
         if set(state1[key].keys()) != set(state2[key].keys()):
             return False
 
@@ -44,11 +40,9 @@ def are_optimizers_equal(optimizer1_state_dict, optimizer2_state_dict, atol=1e-8
             item1 = state1[key][sub_key]
             item2 = state2[key][sub_key]
 
-            # If both items are tensors, use torch.allclose
             if torch.is_tensor(item1) and torch.is_tensor(item2):
                 if not torch.allclose(item1, item2, atol=atol, rtol=rtol):
                     return False
-            # For non-tensor items, check for direct equality
             elif item1 != item2:
                 return False
     return True
@@ -68,7 +62,6 @@ def test_checkpointing(tmp_path):
         betas=(0.9, 0.999),
         eps=1e-8,
     )
-    # Use 1000 optimization steps for testing
     it = 0
     for _ in range(num_iters):
         optimizer.zero_grad()
@@ -81,7 +74,6 @@ def test_checkpointing(tmp_path):
         it += 1
 
     serialization_path = tmp_path / "checkpoint.pt"
-    # Save the model
     run_save_checkpoint(
         model,
         optimizer,
@@ -89,7 +81,6 @@ def test_checkpointing(tmp_path):
         out=serialization_path,
     )
 
-    # Load the model back again
     new_model = _TestNet(d_input=d_input, d_output=d_output)
     new_optimizer = get_adamw_cls()(
         new_model.parameters(),
@@ -101,21 +92,17 @@ def test_checkpointing(tmp_path):
     loaded_iterations = run_load_checkpoint(src=serialization_path, model=new_model, optimizer=new_optimizer)
     assert it == loaded_iterations
 
-    # Compare the loaded model state with the original model state
     original_model_state = model.state_dict()
     original_optimizer_state = optimizer.state_dict()
     new_model_state = new_model.state_dict()
     new_optimizer_state = new_optimizer.state_dict()
 
-    # Check that state dict keys match
     assert set(original_model_state.keys()) == set(new_model_state.keys())
     assert set(original_optimizer_state.keys()) == set(new_optimizer_state.keys())
 
-    # compare the model state dicts
     for key in original_model_state.keys():
         numpy.testing.assert_allclose(
             original_model_state[key].detach().numpy(),
             new_model_state[key].detach().numpy(),
         )
-    # compare the optimizer state dicts
     assert are_optimizers_equal(original_optimizer_state, new_optimizer_state)
