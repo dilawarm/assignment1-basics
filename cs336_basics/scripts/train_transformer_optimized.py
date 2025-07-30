@@ -132,9 +132,8 @@ class OptimizedTrainer:
                 torch.backends.cuda.enable_flash_sdp(args.use_flash_attention)
                 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-        # Set default dtype for bfloat16 training
-        if args.use_bfloat16:
-            torch.set_default_dtype(torch.bfloat16)
+        # Note: We don't set default dtype to bfloat16 globally
+        # Instead, we'll be explicit about dtypes to avoid issues with indexing
 
         # Initialize logging
         self.experiment_logger = ExperimentLogger(
@@ -180,24 +179,26 @@ class OptimizedTrainer:
         # Compile model with optimized settings
         if args.compile_model and self.device.type == "cuda":
             try:
+                # Set torch._dynamo config to handle edge cases better
+                import torch._dynamo
+
+                torch._dynamo.config.suppress_errors = True
+
                 compile_kwargs = {
                     "mode": args.compile_mode,
-                    "fullgraph": True,
-                    "dynamic": False,
+                    "fullgraph": False,  # Allow graph breaks for better compatibility
+                    "dynamic": True,  # Allow dynamic shapes
                 }
 
-                # Compile critical functions
-                self.model.forward = torch.compile(self.model.forward, **compile_kwargs)
-
-                # Optionally compile individual components for better optimization
-                for i, layer in enumerate(self.model.layers):
-                    layer.forward = torch.compile(layer.forward, **compile_kwargs)
+                # Only compile the main forward function
+                self.model = torch.compile(self.model, **compile_kwargs)
 
                 self.experiment_logger.add_note(f"Model compiled successfully with mode: {args.compile_mode}")
                 print(f"✅ Model compiled with {args.compile_mode} mode")
             except Exception as e:
                 self.experiment_logger.add_note(f"Model compilation failed: {e}")
                 print(f"⚠️ Model compilation failed: {e}")
+                print(f"⚠️ Continuing without compilation...")
 
         # Initialize optimizer with parameter groups
         param_groups = self.model.get_parameter_groups(base_lr=args.base_lr)
@@ -317,10 +318,9 @@ class OptimizedTrainer:
                     self.validation_set, self.args.batch_size, self.args.context_length, device=str(self.device)
                 )
 
-                # Use bfloat16 for evaluation too
-                if self.args.use_bfloat16:
-                    inputs = inputs.to(torch.bfloat16)
-                    targets = targets.to(torch.bfloat16)
+                # Note: inputs should remain as long integers for indexing
+                # Only convert targets to bfloat16 if needed
+                # inputs stay as torch.long for embedding indexing
 
                 logits = self.model(inputs)
                 loss = cross_entropy(logits, targets)
@@ -392,9 +392,8 @@ class OptimizedTrainer:
                 self.scaler.scale(loss).backward()
             else:
                 # Manual bfloat16
-                if self.args.use_bfloat16:
-                    inputs = inputs.to(torch.bfloat16)
-                    targets = targets.to(torch.bfloat16)
+                # Note: inputs must remain as long integers for embedding indexing
+                # Do NOT convert inputs to bfloat16
 
                 logits = self.model(inputs)
                 loss = cross_entropy(logits, targets)
@@ -643,6 +642,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Reset default dtype in case it was changed
-    torch.set_default_dtype(torch.float32)
     main()

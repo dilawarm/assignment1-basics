@@ -119,7 +119,8 @@ class Embedding(nn.Module):
             Embedded vectors of shape (..., embedding_dim) where ... matches
             the input batch dimension
         """
-        return self.weight[token_ids]
+        # Use torch.embedding for better compile compatibility
+        return torch.embedding(self.weight, token_ids)
 
     def extra_repr(self):
         """String representation for debugging."""
