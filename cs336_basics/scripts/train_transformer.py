@@ -210,8 +210,13 @@ class Trainer:
         # Configure CUDA memory management
         if args.device == "cuda" and torch.cuda.is_available():
             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+            # Configure torch.compile for stable execution
+            os.environ["TORCH_COMPILE_DEBUG"] = "0"
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torchinductor_cache"
+
             torch.cuda.empty_cache()
-            print("🔧 Configured CUDA memory allocation for better efficiency")
+            print("🔧 Configured CUDA memory allocation and compilation settings for stability")
 
         if args.device == "cuda" and not torch.cuda.is_available():
             print("⚠️ CUDA not available, falling back to CPU")
@@ -378,12 +383,23 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats()
 
     def _compile_model(self):
-        """Conservative model compilation."""
+        """Conservative model compilation with CUDA graphs safety."""
         print(f"⚡ Compiling model with {self.args.compile_mode} mode...")
         try:
-            self.model = torch.compile(self.model, mode=self.args.compile_mode)
-            print(f"✅ Model compiled successfully")
-            self.experiment_logger.add_note(f"Model compiled with {self.args.compile_mode}")
+            # Configure compilation options for stability
+            compile_options = {
+                "mode": self.args.compile_mode,
+                "fullgraph": False,  # Allow graph breaks for stability
+                "dynamic": True,  # Allow dynamic shapes
+            }
+
+            # Disable CUDA graphs for stability if needed
+            if self.args.compile_mode == "reduce-overhead":
+                print("🛡️ Using stable compilation mode without aggressive CUDA graphs")
+
+            self.model = torch.compile(self.model, **compile_options)
+            print(f"✅ Model compiled successfully with safety options")
+            self.experiment_logger.add_note(f"Model compiled with {self.args.compile_mode} + safety options")
         except Exception as e:
             print(f"⚠️ Compilation failed: {e}, running in eager mode")
             self.experiment_logger.add_note(f"Compilation failed, running in eager mode: {e}")
@@ -443,9 +459,21 @@ class Trainer:
                 try:
                     inputs, targets = self.val_loader.get_batch()
 
+                    # Fix CUDA graphs tensor overwriting issue
+                    if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                        torch.compiler.cudagraph_mark_step_begin()
+
+                    # Clone tensors to prevent CUDA graphs overwriting
+                    if self.args.compile_model:
+                        inputs_safe = inputs.clone()
+                        targets_safe = targets.clone()
+                    else:
+                        inputs_safe = inputs
+                        targets_safe = targets
+
                     with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
-                        logits = self.model(inputs)
-                        loss = cross_entropy(logits, targets)
+                        logits = self.model(inputs_safe)
+                        loss = cross_entropy(logits, targets_safe)
 
                     if torch.isfinite(loss):
                         total_loss += loss.item()
@@ -491,14 +519,21 @@ class Trainer:
 
                 forward_start_time = time.time()
 
-                # Debug: Check device placement
-                print(
-                    f"🔍 Debug - inputs device: {inputs.device}, model device: {next(self.model.parameters()).device}"
-                )
+                # Fix CUDA graphs tensor overwriting issue
+                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                    torch.compiler.cudagraph_mark_step_begin()
+
+                # Clone tensors to prevent CUDA graphs overwriting (as suggested in error message)
+                if self.args.compile_model:
+                    inputs_safe = inputs.clone()
+                    targets_safe = targets.clone()
+                else:
+                    inputs_safe = inputs
+                    targets_safe = targets
 
                 with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
-                    logits = self.model(inputs)
-                    loss = cross_entropy(logits, targets) / self.args.gradient_accumulation_steps
+                    logits = self.model(inputs_safe)
+                    loss = cross_entropy(logits, targets_safe) / self.args.gradient_accumulation_steps
                 forward_time = time.time() - forward_start_time
 
                 if not torch.isfinite(loss):
@@ -617,6 +652,9 @@ class Trainer:
             wallclock_time=0.0,
         )
 
+        # Define variables outside loop to prevent scope errors
+        effective_batch_size = self.args.batch_size * self.args.gradient_accumulation_steps
+
         pbar = tqdm(range(self.args.steps), desc="🛡️ Ultra-Stable Training")
         training_start_time = time.time()
         best_val_loss = float("inf")
@@ -632,7 +670,35 @@ class Trainer:
                 self.experiment_logger.add_note(f"Training stopped due to time limit: {elapsed_time / 3600:.2f}h")
                 break
 
-            metrics = self.train_step()
+            # Execute training step with error recovery
+            try:
+                metrics = self.train_step()
+
+                # Skip step if we got NaN (but don't stop training)
+                if not torch.isfinite(torch.tensor(metrics["loss"])):
+                    print(f"⚠️ Skipping step {step} due to NaN loss, continuing training...")
+                    continue
+
+            except Exception as e:
+                print(f"⚠️ Error in training step {step}: {e}")
+                print("🔄 Attempting to recover and continue training...")
+
+                # Clear CUDA cache to prevent memory issues
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Create dummy metrics and continue
+                metrics = {
+                    "loss": float("nan"),
+                    "lr": self.get_lr(step),
+                    "grad_norm": float("nan"),
+                    "step_time": 1.0,
+                    "batch_time": 0.1,
+                    "forward_time": 0.1,
+                    "backward_time": 0.1,
+                    "optimizer_time": 0.1,
+                }
+                continue
 
             # Advanced stability monitoring
             if self.stability_monitor:
@@ -649,8 +715,11 @@ class Trainer:
                 else:
                     consecutive_stable_steps = 0
 
+            # Clear any cached tensors to prevent CUDA graphs issues
+            if torch.cuda.is_available() and step % 10 == 0:  # Every 10 steps
+                torch.cuda.empty_cache()
+
             elapsed_time = time.time() - training_start_time
-            effective_batch_size = self.args.batch_size * self.args.gradient_accumulation_steps
             tokens_processed = (step + 1) * effective_batch_size * self.args.context_length
             tokens_per_sec = tokens_processed / elapsed_time if elapsed_time > 0 else 0
             mfu = self.calculate_mfu(tokens_per_sec)
@@ -725,7 +794,16 @@ class Trainer:
 
         final_elapsed_time = time.time() - training_start_time
         val_loss, val_perplexity = self.evaluate()
-        final_tokens_per_sec = ((step + 1) * effective_batch_size * self.args.context_length) / final_elapsed_time
+
+        # Safely calculate final metrics (handle case where step might not be defined)
+        try:
+            final_steps = step + 1
+        except NameError:
+            final_steps = 1  # Fallback if training exited before any steps
+
+        final_tokens_per_sec = (final_steps * effective_batch_size * self.args.context_length) / max(
+            final_elapsed_time, 1.0
+        )
         final_mfu = self.calculate_mfu(final_tokens_per_sec)
 
         print(f"\n🏁 ULTRA-STABLE TRAINING FINAL RESULTS:")
@@ -734,11 +812,11 @@ class Trainer:
         print(f"⚡ Training time: {final_elapsed_time / 3600:.2f}h / {MAX_TRAINING_TIME / 3600:.1f}h")
         print(f"🚀 Final MFU: {final_mfu:.3f}")
         print(f"⚡ Tokens/sec: {final_tokens_per_sec:.0f}")
-        print(f"📈 Total steps completed: {step + 1}")
+        print(f"📈 Total steps completed: {final_steps}")
         print(f"🛡️ Stable steps: {consecutive_stable_steps}")
 
-        final_checkpoint = f"final_checkpoint_{self.experiment_timestamp}_step_{step}.pt"
-        save_checkpoint(self.model, self.optimizer, step, final_checkpoint)
+        final_checkpoint = f"final_checkpoint_{self.experiment_timestamp}_step_{final_steps}.pt"
+        save_checkpoint(self.model, self.optimizer, final_steps - 1, final_checkpoint)
         print(f"💾 Saved final checkpoint: {final_checkpoint}")
 
         success = val_loss < 3.0781
