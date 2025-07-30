@@ -286,6 +286,10 @@ class Trainer:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"📊 Model: {total_params:,} parameters ({total_params / 1e6:.1f}M), {trainable_params:,} trainable")
 
+        # Move model to device BEFORE compilation
+        self.model = self.model.to(self.device)
+        print(f"📍 Model moved to device: {self.device}")
+
         # Model compilation with stability
         if args.compile_model:
             self._compile_model()
@@ -335,7 +339,7 @@ class Trainer:
             args.training_set,
             args.batch_size,
             args.context_length,
-            device=str(self.device),
+            device=args.device,  # Use device string directly instead of converting torch.device
         )
 
         if Path(args.validation_set).exists():
@@ -344,7 +348,7 @@ class Trainer:
                 args.validation_set,
                 args.batch_size,
                 args.context_length,
-                device=str(self.device),
+                device=args.device,  # Use device string directly instead of converting torch.device
             )
         else:
             self.val_loader = None
@@ -486,6 +490,12 @@ class Trainer:
                 batch_time = time.time() - batch_start_time
 
                 forward_start_time = time.time()
+
+                # Debug: Check device placement
+                print(
+                    f"🔍 Debug - inputs device: {inputs.device}, model device: {next(self.model.parameters()).device}"
+                )
+
                 with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler is not None):
                     logits = self.model(inputs)
                     loss = cross_entropy(logits, targets) / self.args.gradient_accumulation_steps

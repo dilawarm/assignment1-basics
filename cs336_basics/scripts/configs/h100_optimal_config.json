@@ -39,7 +39,7 @@
   
   "device": "cuda",
   "compile_model": true,
-  "compile_mode": "max-autotune",
+  "compile_mode": "reduce-overhead",
   "use_mixed_precision": true,
   "use_efficient_attention": true,
   "use_fused_kernels": true,
