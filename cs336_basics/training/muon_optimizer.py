@@ -1,128 +1,103 @@
 """
-Muon Optimizer - Advanced optimizer for neural network training.
+Muon optimizer implementation for outlier-safe training.
 
-Based on the reference implementation from:
-https://medium.com/@kyeg/building-the-muon-optimizer-in-pytorch-a-geometric-approach-to-neural-network-optimization-17f4601be548
-
-Provides significant speedups for transformer training with proper geometric optimization.
+Based on "Outlier-Safe Pre-Training for Robust 4-Bit Quantization of Large Language Models" (2025).
+Implements Muon optimizer and MuonAdamHybrid for geometric optimization approach
+that prevents activation outliers during training.
 """
 
-from typing import Callable, Iterator, Optional
+import math
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.optim.optimizer import Optimizer
 
 
-def newton_schulz_orthogonalize(X: torch.Tensor, num_iters: int = 5) -> torch.Tensor:
+def newton_schulz_iteration(G: torch.Tensor, num_iters: int = 5) -> torch.Tensor:
     """
-    Apply Newton-Schulz iterations to approximate orthogonalization.
+    Compute the matrix square root using Newton-Schulz iteration.
 
-    This function applies the polynomial f(X) = (3X - X^3)/2 repeatedly to a normalized matrix,
-    which gradually forces all singular values to 1 while preserving singular vectors.
-
-    For non-square matrices, we work with the Gram matrix to ensure proper dimensions.
+    For a positive definite matrix G, computes G^{-1/2} using:
+    Y_{k+1} = Y_k * (3I - G * Y_k^2) / 2
 
     Args:
-        X (torch.Tensor): Input matrix to orthogonalize
-        num_iters (int): Number of Newton-Schulz iterations
+        G: Positive definite matrix
+        num_iters: Number of Newton-Schulz iterations
 
     Returns:
-        torch.Tensor: Orthogonalized matrix
+        Approximation of G^{-1/2}
     """
-    # Handle edge cases
-    if X.numel() == 0:
-        return X
+    # Initialize Y_0 = I / ||G||_2
+    spectral_norm = torch.norm(G, p=2)
+    Y = torch.eye(G.size(0), device=G.device, dtype=G.dtype) / spectral_norm
 
-    # First, normalize the input matrix to get spectral norm close to 1
-    # We use Frobenius norm as a simple approximation for initialization
-    norm = torch.norm(X, p="fro")
-    if norm < 1e-8:
-        return X  # Avoid division by zero
+    # Newton-Schulz iterations
+    for _ in range(num_iters):
+        # Y_{k+1} = Y_k * (3I - G * Y_k^2) / 2
+        Y_squared = Y @ Y
+        GY_squared = G @ Y_squared
+        I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+        Y = Y @ (3 * I - GY_squared) / 2
 
-    X = X / norm
-
-    # For square matrices, apply Newton-Schulz directly
-    if X.shape[0] == X.shape[1]:
-        # Apply Newton-Schulz iterations: f(X) = (3X - X^3)/2
-        for _ in range(num_iters):
-            X = (3 * X - torch.matmul(torch.matmul(X, X), X)) / 2
-    else:
-        # For non-square matrices, work with Gram matrix
-        # This is a simplified approach that preserves the directional information
-        if X.shape[0] > X.shape[1]:
-            # Tall matrix: work with X.T @ X
-            gram = torch.matmul(X.T, X)
-            # Normalize gram matrix
-            gram_norm = torch.norm(gram, p="fro")
-            if gram_norm > 1e-8:
-                gram = gram / gram_norm
-
-                # Apply Newton-Schulz to gram matrix
-                for _ in range(num_iters):
-                    gram = (3 * gram - torch.matmul(torch.matmul(gram, gram), gram)) / 2
-
-                # Reconstruct X using the orthogonalized gram matrix
-                # This is an approximation that maintains the shape
-                X = torch.matmul(X, gram)
-        else:
-            # Wide matrix: work with X @ X.T
-            gram = torch.matmul(X, X.T)
-            # Normalize gram matrix
-            gram_norm = torch.norm(gram, p="fro")
-            if gram_norm > 1e-8:
-                gram = gram / gram_norm
-
-                # Apply Newton-Schulz to gram matrix
-                for _ in range(num_iters):
-                    gram = (3 * gram - torch.matmul(torch.matmul(gram, gram), gram)) / 2
-
-                # Reconstruct X using the orthogonalized gram matrix
-                # This is an approximation that maintains the shape
-                X = torch.matmul(gram, X)
-
-    return X
+    return Y
 
 
 class Muon(Optimizer):
     """
-    Implements the Muon optimization algorithm for linear layers.
+    Muon optimizer for geometric optimization approach.
 
     Muon uses a geometric approach to optimization, specifically addressing
     how changes in weight matrices affect neural network behavior.
+    Eliminates privileged bases and prevents outlier formation.
 
     Args:
-        params (iterable): iterable of parameters to optimize or dicts defining parameter groups
-        lr (float, optional): learning rate (default: 1e-3)
-        ns_iters (int, optional): number of Newton-Schulz iterations (default: 5)
-        momentum (float, optional): momentum factor (default: 0.9)
-        weight_decay (float, optional): weight decay coefficient (default: 0)
+        params: Parameters to optimize
+        lr: Learning rate (default: 1e-3)
+        ns_iters: Number of Newton-Schulz iterations (default: 5)
+        momentum: Momentum factor (default: 0.9)
+        weight_decay: Weight decay coefficient (default: 0)
     """
 
     def __init__(
         self,
-        params: Iterator[torch.nn.Parameter],
+        params: Iterable[torch.nn.Parameter],
         lr: float = 1e-3,
         ns_iters: int = 5,
         momentum: float = 0.9,
-        weight_decay: float = 0,
+        weight_decay: float = 0.0,
     ):
-        defaults = dict(lr=lr, ns_iters=ns_iters, momentum=momentum, weight_decay=weight_decay)
-        super(Muon, self).__init__(params, defaults)
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= momentum <= 1.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not ns_iters >= 1:
+            raise ValueError(f"Invalid ns_iters value: {ns_iters}")
+
+        defaults = dict(
+            lr=lr,
+            ns_iters=ns_iters,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+
+        super().__init__(params, defaults)
 
     def get_dimension_scaling(self, shape: torch.Size) -> float:
         """
-        Get the dimension scaling factor for RMS-to-RMS operator norm.
+        Get dimension-based scaling factor for different parameter types.
 
         Args:
-            shape: Parameter shape
+            shape: Parameter tensor shape
 
         Returns:
-            Scaling factor sqrt(d_x * d_y)
+            Scaling factor
         """
         if len(shape) >= 2:
-            # For matrices: sqrt(input_dim * output_dim)
-            d_in, d_out = shape[-1], shape[0]
-            return (d_in * d_out) ** 0.5
+            # For matrices: scale by 1/sqrt(fan_in)
+            fan_in = shape[1] if len(shape) == 2 else shape[1] * shape[2] * shape[3]
+            return 1.0 / math.sqrt(fan_in)
         else:
             # For vectors: no scaling needed
             return 1.0
@@ -133,7 +108,7 @@ class Muon(Optimizer):
         Performs a single optimization step.
 
         Args:
-            closure (callable, optional): A closure that reevaluates the model and returns the loss
+            closure: A closure that reevaluates the model and returns the loss
 
         Returns:
             Optional[float]: Loss value if closure is provided, else None
@@ -174,137 +149,275 @@ class Muon(Optimizer):
                 momentum_buffer.mul_(momentum_factor).add_(grad, alpha=1 - momentum_factor)
 
                 # Apply Muon update based on parameter type
-                if len(p.shape) >= 2:  # For matrices and higher-dimensional tensors
-                    # Reshape to matrix for higher dimensions
-                    original_shape = p.shape
-                    if len(p.shape) > 2:
-                        p_flat = p.reshape(p.shape[0], -1)
-                        momentum_flat = momentum_buffer.reshape(momentum_buffer.shape[0], -1)
-                    else:
-                        p_flat = p
-                        momentum_flat = momentum_buffer
-
-                    # Apply Newton-Schulz orthogonalization to momentum buffer
-                    ortho_momentum = newton_schulz_orthogonalize(momentum_flat, ns_iters)
-
-                    # Get dimension scaling: sqrt(d_x * d_y)
-                    dim_scaling = self.get_dimension_scaling(original_shape)
-
-                    # Calculate Frobenius norm of momentum buffer
-                    buffer_norm = torch.norm(momentum_flat, p="fro")
-
-                    if buffer_norm > 1e-8:
-                        # Apply Muon update rule: W ← W - α · (sqrt(d_x * d_y) / |G|_F) · NS(G)
-                        scaling = dim_scaling / buffer_norm
-                        update = ortho_momentum * scaling
-
-                        # Reshape back if needed
-                        if len(p.shape) > 2:
-                            update = update.reshape(original_shape)
-
-                        # Apply the update
-                        p.add_(update, alpha=-lr)
-
+                if len(p.shape) >= 2:
+                    # For matrices: apply geometric update
+                    self._apply_matrix_update(p, momentum_buffer, lr, ns_iters)
                 else:
-                    # For non-matrix parameters (embeddings, biases), use standard momentum update
-                    p.add_(momentum_buffer, alpha=-lr)
+                    # For vectors: apply standard update
+                    scaling = self.get_dimension_scaling(p.shape)
+                    p.add_(momentum_buffer, alpha=-lr * scaling)
 
         return loss
+
+    def _apply_matrix_update(self, param: torch.Tensor, grad: torch.Tensor, lr: float, ns_iters: int):
+        """
+        Apply geometric matrix update using Muon approach.
+
+        Args:
+            param: Parameter matrix to update
+            grad: Gradient matrix
+            lr: Learning rate
+            ns_iters: Number of Newton-Schulz iterations
+        """
+        # Get parameter matrix dimensions
+        if len(param.shape) == 2:
+            # Standard linear layer: (out_features, in_features)
+            W = param
+            G = grad
+        else:
+            # For higher-dimensional tensors, flatten to 2D
+            original_shape = param.shape
+            W = param.view(param.size(0), -1)
+            G = grad.view(grad.size(0), -1)
+
+        # Compute Gram matrix G^T @ G
+        gram_matrix = G.T @ G
+
+        # Add regularization for numerical stability
+        reg_term = 1e-8 * torch.eye(gram_matrix.size(0), device=gram_matrix.device, dtype=gram_matrix.dtype)
+        gram_matrix = gram_matrix + reg_term
+
+        # Compute matrix square root using Newton-Schulz iteration
+        try:
+            gram_inv_sqrt = newton_schulz_iteration(gram_matrix, ns_iters)
+
+            # Apply geometric update: W = W - lr * G * (G^T G)^{-1/2}
+            update = G @ gram_inv_sqrt
+            scaling = self.get_dimension_scaling(W.shape)
+            W.add_(update, alpha=-lr * scaling)
+
+        except Exception:
+            # Fallback to standard update if geometric update fails
+            scaling = self.get_dimension_scaling(W.shape)
+            W.add_(G, alpha=-lr * scaling)
+
+        # Reshape back to original shape if needed
+        if len(param.shape) > 2:
+            param.data = W.view(original_shape)
 
 
 class MuonAdamHybrid(Optimizer):
     """
-    Hybrid optimizer that uses corrected Muon for linear layers and Adam for other parameters.
+    Hybrid optimizer combining Muon geometric updates with Adam's adaptive learning rates.
 
-    This provides the best of both worlds - Muon's efficiency for linear transformations
-    and Adam's stability for embeddings and other parameter types.
+    Uses Muon for matrix parameters (weights) and Adam for vector parameters (biases, norms).
+    This provides outlier-safe training while maintaining adaptive optimization benefits.
+
+    Args:
+        params: Parameters to optimize
+        lr: Learning rate (default: 1e-3)
+        betas: Coefficients for Adam momentum (default: (0.9, 0.999))
+        eps: Term for numerical stability (default: 1e-8)
+        weight_decay: Weight decay coefficient (default: 0.01)
+        muon_momentum: Momentum factor for Muon updates (default: 0.95)
+        ns_iters: Number of Newton-Schulz iterations (default: 5)
     """
 
     def __init__(
         self,
-        params,
+        params: Iterable[torch.nn.Parameter],
         lr: float = 1e-3,
-        betas: tuple[float, float] = (0.9, 0.999),
+        betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
-        weight_decay: float = 0.0,
+        weight_decay: float = 0.01,
         muon_momentum: float = 0.95,
-        newton_schulz_steps: int = 5,
+        ns_iters: int = 5,
     ):
-        self.muon_params = []
-        self.adam_params = []
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= muon_momentum <= 1.0:
+            raise ValueError(f"Invalid muon_momentum value: {muon_momentum}")
 
-        # Convert params to a list if it's an iterator
-        if hasattr(params, "__iter__") and not isinstance(params, (list, tuple)):
-            params = list(params)
-
-        # Handle both individual parameters and parameter groups
-        if len(params) > 0 and isinstance(params[0], dict):
-            # Parameter groups format: [{"params": [p1, p2, ...]}, ...]
-            for param_group in params:
-                param_list = param_group["params"]
-                for p in param_list:
-                    if len(p.shape) >= 2 and min(p.shape) >= 16:
-                        self.muon_params.append(p)
-                    else:
-                        self.adam_params.append(p)
-        else:
-            # Individual parameters format: [p1, p2, p3, ...]
-            for p in params:
-                if len(p.shape) >= 2 and min(p.shape) >= 16:
-                    self.muon_params.append(p)
-                else:
-                    self.adam_params.append(p)
-
-        if len(self.muon_params) == 0 and len(self.adam_params) == 0:
-            raise ValueError("No parameters to optimize! Check if model parameters are being passed correctly.")
-
-        # Use corrected Muon implementation
-        self.muon = Muon(
-            self.muon_params,
-            lr=lr,
-            momentum=muon_momentum,
-            ns_iters=newton_schulz_steps,
-        )
-
-        self.adam = torch.optim.AdamW(
-            self.adam_params,
+        defaults = dict(
             lr=lr,
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
+            muon_momentum=muon_momentum,
+            ns_iters=ns_iters,
         )
 
-        self.param_groups = self.muon.param_groups + self.adam.param_groups
+        super().__init__(params, defaults)
 
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super().__init__(self.param_groups, defaults)
+    def get_dimension_scaling(self, shape: torch.Size) -> float:
+        """Get dimension-based scaling factor."""
+        if len(shape) >= 2:
+            fan_in = shape[1] if len(shape) == 2 else shape[1] * shape[2] * shape[3]
+            return 1.0 / math.sqrt(fan_in)
+        else:
+            return 1.0
 
-    def step(self, closure=None):
-        """Perform optimization step with both optimizers."""
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        """
+        Performs a single optimization step.
+
+        Args:
+            closure: A closure that reevaluates the model and returns the loss
+
+        Returns:
+            Optional[float]: Loss value if closure is provided, else None
+        """
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
-        if self.muon_params:
-            self.muon.step()
-        if self.adam_params:
-            self.adam.step()
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            muon_momentum = group["muon_momentum"]
+            ns_iters = group["ns_iters"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+
+                # Apply weight decay
+                if weight_decay != 0:
+                    grad = grad.add(p, alpha=weight_decay)
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    if len(p.shape) >= 2:
+                        # For matrices: use Muon momentum
+                        state["muon_momentum_buffer"] = torch.zeros_like(grad)
+                    else:
+                        # For vectors: use Adam moments
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+
+                state["step"] += 1
+
+                if len(p.shape) >= 2:
+                    # Matrix parameters: use Muon geometric update
+                    self._apply_muon_update(p, grad, state, lr, muon_momentum, ns_iters)
+                else:
+                    # Vector parameters: use Adam update
+                    self._apply_adam_update(p, grad, state, lr, beta1, beta2, eps)
 
         return loss
 
-    def zero_grad(self, set_to_none: bool = False):
-        """Zero gradients for both optimizers."""
-        self.muon.zero_grad(set_to_none=set_to_none)
-        self.adam.zero_grad(set_to_none=set_to_none)
+    def _apply_muon_update(
+        self, param: torch.Tensor, grad: torch.Tensor, state: Dict[str, Any], lr: float, momentum: float, ns_iters: int
+    ):
+        """Apply Muon geometric update for matrix parameters."""
+        # Update momentum buffer
+        momentum_buffer = state["muon_momentum_buffer"]
+        momentum_buffer.mul_(momentum).add_(grad, alpha=1 - momentum)
 
-    def state_dict(self):
-        """Return combined state dict."""
-        return {
-            "muon": self.muon.state_dict(),
-            "adam": self.adam.state_dict(),
-        }
+        # Get parameter matrix dimensions
+        if len(param.shape) == 2:
+            W = param
+            G = momentum_buffer
+        else:
+            # For higher-dimensional tensors, flatten to 2D
+            original_shape = param.shape
+            W = param.view(param.size(0), -1)
+            G = momentum_buffer.view(momentum_buffer.size(0), -1)
 
-    def load_state_dict(self, state_dict):
-        """Load combined state dict."""
-        self.muon.load_state_dict(state_dict["muon"])
-        self.adam.load_state_dict(state_dict["adam"])
+        # Compute Gram matrix G^T @ G
+        gram_matrix = G.T @ G
+
+        # Add regularization for numerical stability
+        reg_term = 1e-8 * torch.eye(gram_matrix.size(0), device=gram_matrix.device, dtype=gram_matrix.dtype)
+        gram_matrix = gram_matrix + reg_term
+
+        # Apply geometric update
+        try:
+            gram_inv_sqrt = newton_schulz_iteration(gram_matrix, ns_iters)
+            update = G @ gram_inv_sqrt
+            scaling = self.get_dimension_scaling(W.shape)
+            W.add_(update, alpha=-lr * scaling)
+        except Exception:
+            # Fallback to standard update
+            scaling = self.get_dimension_scaling(W.shape)
+            W.add_(G, alpha=-lr * scaling)
+
+        # Reshape back if needed
+        if len(param.shape) > 2:
+            param.data = W.view(original_shape)
+
+    def _apply_adam_update(
+        self,
+        param: torch.Tensor,
+        grad: torch.Tensor,
+        state: Dict[str, Any],
+        lr: float,
+        beta1: float,
+        beta2: float,
+        eps: float,
+    ):
+        """Apply Adam update for vector parameters."""
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        step = state["step"]
+
+        # Exponential moving average of gradient values
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+        # Exponential moving average of squared gradient values
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+        # Bias correction
+        bias_correction1 = 1 - beta1**step
+        bias_correction2 = 1 - beta2**step
+
+        # Compute update
+        denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+        step_size = lr / bias_correction1
+
+        # Apply update
+        param.addcdiv_(exp_avg, denom, value=-step_size)
+
+
+def create_muon_optimizer(
+    parameters: Iterable[torch.nn.Parameter], optimizer_type: str = "hybrid", **kwargs
+) -> Optimizer:
+    """
+    Create a Muon-based optimizer.
+
+    Args:
+        parameters: Model parameters
+        optimizer_type: "muon" or "hybrid"
+        **kwargs: Optimizer-specific arguments
+
+    Returns:
+        Muon optimizer instance
+    """
+    if optimizer_type.lower() == "muon":
+        return Muon(parameters, **kwargs)
+    elif optimizer_type.lower() == "hybrid":
+        return MuonAdamHybrid(parameters, **kwargs)
+    else:
+        raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+
+
+# Aliases for backward compatibility
+MuonOptimizer = Muon
+HybridOptimizer = MuonAdamHybrid

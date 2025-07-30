@@ -17,9 +17,9 @@ class TestTrainArgs(unittest.TestCase):
     def test_default_trainargs_creation(self):
         """Test that TrainArgs can be created with defaults."""
         config = TrainArgs()
-        self.assertEqual(config.vocab_size, 50304)
-        self.assertEqual(config.d_model, 2048)
-        self.assertEqual(config.num_heads, 32)
+        self.assertEqual(config.vocab_size, 32000)
+        self.assertEqual(config.d_model, 1280)
+        self.assertEqual(config.num_heads, 20)
 
     def test_trainargs_validation_valid_config(self):
         """Test TrainArgs with valid configuration."""
@@ -240,6 +240,15 @@ class TestConfigFieldMapping(unittest.TestCase):
             "checkpoint_pattern",
             "use_memory_efficient_attention",
             "optimize_memory_layout",
+            "use_adaptive_gradient_clipping",
+            "adaptive_clipping_method",
+            "zclip_zscore_threshold",
+            "zclip_min_clip",
+            "zclip_max_clip",
+            "zclip_warmup_steps",
+            "use_muon_optimizer",
+            "muon_ns_iters",
+            "enable_outlier_safe_training",
         }
 
         # Check that we're not missing any fields

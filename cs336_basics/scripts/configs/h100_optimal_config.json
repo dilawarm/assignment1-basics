@@ -1,29 +1,30 @@
 {
-  "training_mode": "fast",
-  "experiment_name": "h100_optimal_training",
-  "experiment_description": "Optimal H100 80GB configuration to beat val_loss 3.0781 in 1.5h with maximum stability and MFU",
+  "training_mode": "stable",
+  "experiment_name": "open_webtext_training",
+  "experiment_description": "open webtext training",
+  
   
   "vocab_size": 32000,
   "context_length": 1024,
-  "num_layers": 18,
-  "d_model": 1536,
-  "num_heads": 24,
-  "d_ff": 6144,
+  "num_layers": 20,
+  "d_model": 1408,
+  "num_heads": 22,
+  "d_ff": 5632,
   "rope_theta": 10000.0,
-  "window_size": 512,
+  "window_size": null,
   "use_qk_norm": true,
   "use_flex_attention": false,
-  "use_swiglu": false,
-  "tie_embeddings": false,
+  "use_swiglu": true,
+  "tie_embeddings": true,
   
-  "weight_decay": 0.1,
+  "weight_decay": 0.05,
   "betas": [0.9, 0.95],
   "muon_momentum": 0.95,
   "eps": 1e-8,
   
-  "max_learning_rate": 0.003,
-  "min_learning_rate": 0.0003,
-  "warmup_iters": 300,
+  "max_learning_rate": 0.0003,
+  "min_learning_rate": 0.00005,
+  "warmup_iters": 800,
   "cosine_cycle_iters": 5400,
   
   "training_set": "data/encoded/owt_train_tokens.npy",
@@ -32,9 +33,9 @@
   "validation_step_interval": 100,
   "checkpoint_step_interval": 1000,
   "steps": 5400,
-  "batch_size": 32,
+  "batch_size": 56,
   "gradient_accumulation_steps": 4,
-  "gradient_clipping": 1.0,
+  "gradient_clipping": 0.3,
   
   "device": "cuda",
   "compile_model": true,
@@ -44,9 +45,9 @@
   "use_fused_kernels": true,
   
   "enable_stability_monitoring": true,
-  "gradient_norm_threshold": 15.0,
-  "loss_spike_threshold": 4.0,
-  "nan_tolerance": 3,
+  "gradient_norm_threshold": 3.0,
+  "loss_spike_threshold": 1.8,
+  "nan_tolerance": 0,
   "enable_stable_initialization": true,
   "enable_torch_optimizations": true,
   "eval_batch_count": 30,
@@ -56,8 +57,19 @@
   "use_memory_efficient_attention": true,
   "optimize_memory_layout": true,
   
+  "use_adaptive_gradient_clipping": true,
+  "adaptive_clipping_method": "zclip",
+  "zclip_zscore_threshold": 2.0,
+  "zclip_min_clip": 0.05,
+  "zclip_max_clip": 1.0,
+  "zclip_warmup_steps": 300,
+  
+  "use_muon_optimizer": true,
+  "muon_ns_iters": 5,
+  "enable_outlier_safe_training": true,
+  
   "use_wandb": true,
   "wandb_project": "cs336-assignment1",
   "wandb_entity": "",
   "log_dir": "experiments"
-} 
+}
