@@ -171,16 +171,15 @@ class RMSNorm(nn.Module):
         Returns:
             Output tensor of the same shape as input with RMSNorm applied
         """
-        in_dtype = x.dtype
-        x = x.to(torch.float32)
-
+        # Work directly in the input dtype (e.g., bfloat16)
+        # This avoids dtype mismatches in torch.compile graphs
         mean_squared = torch.mean(x.pow(2), dim=-1, keepdim=True)
         rms = torch.sqrt(mean_squared + self.eps)
 
         normalized = x / rms
         result = normalized * self.weight
 
-        return result.to(in_dtype)
+        return result
 
     def extra_repr(self) -> str:
         """String representation for debugging."""
