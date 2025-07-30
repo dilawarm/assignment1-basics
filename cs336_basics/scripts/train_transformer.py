@@ -670,35 +670,7 @@ class Trainer:
                 self.experiment_logger.add_note(f"Training stopped due to time limit: {elapsed_time / 3600:.2f}h")
                 break
 
-            # Execute training step with error recovery
-            try:
-                metrics = self.train_step()
-
-                # Skip step if we got NaN (but don't stop training)
-                if not torch.isfinite(torch.tensor(metrics["loss"])):
-                    print(f"⚠️ Skipping step {step} due to NaN loss, continuing training...")
-                    continue
-
-            except Exception as e:
-                print(f"⚠️ Error in training step {step}: {e}")
-                print("🔄 Attempting to recover and continue training...")
-
-                # Clear CUDA cache to prevent memory issues
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                # Create dummy metrics and continue
-                metrics = {
-                    "loss": float("nan"),
-                    "lr": self.get_lr(step),
-                    "grad_norm": float("nan"),
-                    "step_time": 1.0,
-                    "batch_time": 0.1,
-                    "forward_time": 0.1,
-                    "backward_time": 0.1,
-                    "optimizer_time": 0.1,
-                }
-                continue
+            metrics = self.train_step()
 
             # Advanced stability monitoring
             if self.stability_monitor:
