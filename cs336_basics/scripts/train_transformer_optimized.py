@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -180,8 +181,6 @@ class OptimizedTrainer:
         if args.compile_model and self.device.type == "cuda":
             try:
                 # Set torch._dynamo config to handle edge cases better
-                import torch._dynamo
-
                 torch._dynamo.config.suppress_errors = True
 
                 compile_kwargs = {
