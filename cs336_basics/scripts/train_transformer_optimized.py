@@ -246,24 +246,46 @@ class OptimizedTrainer:
                     else:
                         adam_params.append(p)
 
+            # Ensure we have parameters for each optimizer
+            if not muon_params:
+                self.experiment_logger.add_note("Warning: No parameters found for Muon optimizer")
+                print("⚠️ Warning: No parameters found for Muon optimizer")
+            if not adam_params:
+                self.experiment_logger.add_note("Warning: No parameters found for Adam optimizer")
+                print("⚠️ Warning: No parameters found for Adam optimizer")
+
             # Create separate optimizers
-            muon_optimizer = MuonOptimizer(
-                muon_params,
-                lr=args.muon_lr,
-                momentum=args.muon_momentum,
-                nesterov=True,
-                ns_steps=5,
-                weight_decay=args.weight_decay,
-            )
+            if muon_params:
+                muon_optimizer = MuonOptimizer(
+                    muon_params,
+                    lr=args.muon_lr,
+                    momentum=args.muon_momentum,
+                    nesterov=True,
+                    ns_steps=5,
+                    weight_decay=args.weight_decay,
+                )
+            else:
+                # Create dummy optimizer if no muon params
+                muon_optimizer = MuonOptimizer(
+                    [torch.zeros(1, requires_grad=True, device=self.device)],
+                    lr=args.muon_lr,
+                    momentum=args.muon_momentum,
+                    nesterov=True,
+                    ns_steps=5,
+                    weight_decay=args.weight_decay,
+                )
 
             # Use standard Adam (not AdamW) as the winner mentioned Adam was slightly better
             from cs336_basics.training.optimizers import Adam
 
             # Recreate parameter groups for Adam with different learning rates
             adam_param_groups = []
+            # Create a set of parameter ids for efficient lookup
+            adam_param_ids = {id(p) for p in adam_params}
+
             for group in param_groups:
                 group_name = group.get("name", "")
-                group_params = [p for p in group["params"] if p in adam_params]
+                group_params = [p for p in group["params"] if id(p) in adam_param_ids]
 
                 if not group_params:
                     continue
@@ -328,9 +350,9 @@ class OptimizedTrainer:
         # Log optimizer info
         if args.optimizer_type == "muon_adam":
             # Log Muon and Adam parameters separately
-            muon_params = sum(p.numel() for p in muon_params)
+            muon_params_count = sum(p.numel() for p in muon_params)
             adam_params_count = sum(p.numel() for p in adam_params)
-            self.experiment_logger.add_note(f"Muon optimizer: {muon_params:,} params, lr={args.muon_lr:.2e}")
+            self.experiment_logger.add_note(f"Muon optimizer: {muon_params_count:,} params, lr={args.muon_lr:.2e}")
             self.experiment_logger.add_note(f"Adam optimizer: {adam_params_count:,} params")
             for group in adam_param_groups:
                 name = group.get("name", "unknown")
