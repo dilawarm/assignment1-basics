@@ -80,8 +80,10 @@ def diagnose_model():
 
         # Test forward pass
         try:
+            dummy_input = torch.randint(0, 32000, (config["batch_size"], config["context_length"]), device=device)
+
+            # Test without gradients first
             with torch.no_grad():
-                dummy_input = torch.randint(0, 32000, (config["batch_size"], config["context_length"]), device=device)
                 output = model(dummy_input)
                 print(f"  ✓ Forward pass successful: output shape {output.shape}")
 
@@ -100,8 +102,11 @@ def diagnose_model():
         # Test loss computation
         try:
             targets = torch.randint(0, 32000, (config["batch_size"], config["context_length"]), device=device)
-            loss = cross_entropy(output, targets)
-            print(f"  ✓ Loss computation successful: {loss.item():.4f}")
+
+            # Compute loss with the no-grad output for reporting
+            with torch.no_grad():
+                loss_value = cross_entropy(output, targets).item()
+            print(f"  ✓ Loss computation successful: {loss_value:.4f}")
 
             # Expected initial loss
             expected_loss = np.log(32000)  # Random prediction
@@ -112,7 +117,20 @@ def diagnose_model():
 
         # Test backward pass
         try:
-            loss.backward()
+            # Check if parameters require gradients
+            params_with_grad = sum(1 for p in model.parameters() if p.requires_grad)
+            total_params = sum(1 for p in model.parameters())
+            print(f"  Parameters requiring grad: {params_with_grad}/{total_params}")
+
+            # Create loss that requires grad
+            if output.requires_grad:
+                loss.backward()
+            else:
+                # Recompute with gradients enabled
+                model.train()
+                output = model(dummy_input)
+                loss = cross_entropy(output, targets)
+                loss.backward()
 
             # Check gradients
             grad_norms = []
@@ -127,6 +145,8 @@ def diagnose_model():
 
             if grad_norms:
                 print(f"  ✓ Gradients computed - mean norm: {np.mean(grad_norms):.4f}")
+            else:
+                print(f"  ✗ No gradients computed!")
 
         except Exception as e:
             print(f"  ✗ Backward pass failed: {e}")
