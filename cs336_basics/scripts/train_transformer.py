@@ -6,12 +6,14 @@ import argparse
 import json
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from torch.optim import AdamW as TorchAdamW
 from tqdm import tqdm
 
 from cs336_basics.data import get_batch
@@ -21,7 +23,9 @@ from cs336_basics.nn.models import TransformerLM
 from cs336_basics.training.checkpoint import save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
-from cs336_basics.training.optimizers import AdamW
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
 
 
 @dataclass
@@ -88,6 +92,8 @@ class TrainModel:
         self.args = args
         self.step = 0
         self.device = torch.device(args.device)
+        self.autocast = torch.autocast if torch.cuda.is_available() else nullcontext
+        self.dtype = torch.bfloat16
 
         self.experiment_logger = ExperimentLogger(
             experiment_name=args.experiment_name,
@@ -114,7 +120,21 @@ class TrainModel:
             d_ff=args.d_ff,
             rope_theta=args.rope_theta,
             device=self.device,
+            dtype=self.dtype,
         )
+
+        self.model.token_embeddings.float()
+        self.model.lm_head.float()
+        self.model.enable_gradient_checkpointing(layers_to_checkpoint=args.num_layers // 2)
+
+        if args.compile_model and self.device.type == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="max-autotune", fullgraph=True)
+                self.experiment_logger.add_note("Model compiled successfully with torch.compile")
+                print("✅ Model compiled successfully")
+            except Exception as e:
+                self.experiment_logger.add_note(f"Model compilation failed: {e}")
+                print(f"⚠️ Model compilation failed: {e}")
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -122,17 +142,13 @@ class TrainModel:
             f"Model initialized: {total_params:,} total parameters, {trainable_params:,} trainable"
         )
 
-        if args.compile_model and self.device.type == "cuda":
-            try:
-                self.model = torch.compile(self.model)
-                self.experiment_logger.add_note("Model compiled successfully with torch.compile")
-                print("✅ Model compiled successfully")
-            except Exception as e:
-                self.experiment_logger.add_note(f"Model compilation failed: {e}")
-                print(f"⚠️ Model compilation failed: {e}")
-
-        self.optimizer = AdamW(
-            self.model.parameters(), lr=args.max_learning_rate, weight_decay=args.weight_decay, betas=args.betas
+        use_fused = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
+        self.optimizer = TorchAdamW(
+            self.model.parameters(),
+            lr=args.max_learning_rate,
+            betas=args.betas,
+            weight_decay=args.weight_decay,
+            fused=use_fused,
         )
 
         print(f"Loading training data from {args.training_set}")
@@ -212,8 +228,9 @@ class TrainModel:
                         self.validation_set, self.args.batch_size, self.args.context_length, device=str(self.device)
                     )
 
-                    logits = self.model(inputs)
-                    loss = cross_entropy(logits, targets)
+                    with self.autocast(device_type="cuda", dtype=self.dtype):
+                        logits = self.model(inputs)
+                    loss = cross_entropy(logits.float(), targets)
 
                     if torch.isfinite(loss):
                         total_loss += loss.item()
@@ -249,7 +266,7 @@ class TrainModel:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         batch_start_time = time.time()
         inputs, targets = get_batch(
@@ -258,8 +275,11 @@ class TrainModel:
         batch_time = time.time() - batch_start_time
 
         forward_start_time = time.time()
-        logits = self.model(inputs)
-        loss = cross_entropy(logits, targets)
+
+        with self.autocast(device_type="cuda", dtype=self.dtype):
+            logits = self.model(inputs)
+        loss = cross_entropy(logits.float(), targets)
+
         forward_time = time.time() - forward_start_time
 
         backward_start_time = time.time()

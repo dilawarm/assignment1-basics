@@ -170,6 +170,8 @@ class TransformerLM(nn.Module):
             ]
         )
 
+        self.mix_param = nn.Parameter(torch.zeros(1))
+
         self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
         self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
 
@@ -230,8 +232,18 @@ class TransformerLM(nn.Module):
 
         x = self.token_embeddings(input_ids)
 
-        for layer in self.layers:
-            x = layer(x, rope=self.rope, token_positions=token_positions)
+        skip: list[torch.Tensor] = []
+        half = len(self.layers) // 2
+        for i, layer in enumerate(self.layers):
+            if i < half:
+                x = layer(x, rope=self.rope, token_positions=token_positions)
+                skip.append(x)
+            else:
+                if skip:
+                    residual = torch.sigmoid(self.mix_param) * skip.pop()
+                    x = layer(x + residual, rope=self.rope, token_positions=token_positions)
+                else:
+                    x = layer(x, rope=self.rope, token_positions=token_positions)
 
         x = self.ln_final(x)
         logits = self.lm_head(x)
