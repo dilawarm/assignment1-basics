@@ -1,0 +1,50 @@
+{
+    "vocab_size": 32000,
+    "context_length": 256,
+    "num_layers": 10,
+    "d_model": 512,
+    "num_heads": 8,
+    "d_ff": 1408,
+    "rope_theta": 10000,
+    "use_squared_relu": true,
+    "tie_embeddings": true,
+    
+    "optimizer_type": "enhanced_adam",
+    "weight_decay": 0.02,
+    "betas": [0.9, 0.98],
+    "base_lr": 0.002,
+    "muon_lr": 0.02,
+    "muon_momentum": 0.95,
+    
+    "min_learning_rate": 0.0002,
+    "warmup_iters": 50,
+    "cosine_cycle_iters": 8000,
+    
+    "training_set": "data/encoded/owt_train_tokens.npy",
+    "validation_set": "data/encoded/owt_valid_tokens.npy",
+    
+    "validation_step_interval": 100,
+    "checkpoint_step_interval": 2000,
+    "steps": 8000,
+    "batch_size": 256,
+    "gradient_accumulation_steps": 2,
+    "gradient_clipping": 1.0,
+    
+    "use_bfloat16": true,
+    "use_amp": false,
+    "compile_model": true,
+    "compile_mode": "reduce-overhead",
+    "use_flash_attention": true,
+    "use_fused_optimizers": true,
+    
+    "device": "cuda",
+    "dataloader_num_workers": 4,
+    "pin_memory": true,
+    
+    "experiment_name": "h100_winning_solution",
+    "experiment_description": "Optimized config to beat 3.0781 val loss on H100 in 1.5 hours",
+    "use_wandb": false,
+    "wandb_project": "cs336-assignment1",
+    "wandb_entity": "",
+    "log_dir": "experiments/h100_winning"
+}

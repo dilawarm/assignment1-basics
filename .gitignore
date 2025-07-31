@@ -168,5 +168,5 @@ checkpoints/
 experiments/
 wandb/
 setup.md
-setup.sh
+setup*.sh
 muon.md
