@@ -214,3 +214,133 @@ class LionOptimizer(Optimizer):
                 exp_avg.mul_(beta2).add(grad, alpha=1 - beta2)
 
         return loss
+
+
+class MuonOptimizer(Optimizer):
+    """
+    Muon optimizer - MomentUm Orthogonalized by Newton-schulz.
+
+    Muon is specifically designed for 2D parameters (linear layers) in neural networks.
+    It orthogonalizes the momentum using Newton-Schulz iterations to achieve better
+    convergence properties.
+
+    Paper: "Muon: An optimizer for hidden layers in neural networks"
+
+    Args:
+        params: iterable of parameters to optimize or dicts defining parameter groups
+        lr: learning rate (default: 0.02)
+        momentum: momentum factor (default: 0.95)
+        nesterov: use Nesterov momentum (default: True)
+        ns_steps: number of Newton-Schulz iterations (default: 5)
+        weight_decay: weight decay coefficient (default: 0)
+    """
+
+    def __init__(
+        self,
+        params: Iterator[torch.nn.Parameter],
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        weight_decay: float = 0.0,
+    ) -> None:
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if not isinstance(ns_steps, int) or ns_steps < 1:
+            raise ValueError(f"Invalid ns_steps: {ns_steps}")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            weight_decay=weight_decay,
+        )
+        super().__init__(params, defaults)
+
+    def newton_schulz_orthogonalize(self, G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+        """
+        Apply Newton-Schulz iterations to orthogonalize a matrix.
+
+        This uses optimized coefficients (3.4445, -4.7750, 2.0315) for faster convergence.
+        """
+        assert G.ndim == 2
+        a, b, c = (3.4445, -4.7750, 2.0315)
+
+        # Use bfloat16 for efficiency
+        X = G.to(torch.bfloat16)
+        X = X / (X.norm() + eps)
+
+        # Transpose if necessary for efficiency
+        transposed = False
+        if G.size(0) > G.size(1):
+            X = X.T
+            transposed = True
+
+        # Newton-Schulz iterations
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+
+        # Transpose back if needed
+        if transposed:
+            X = X.T
+
+        return X.to(G.dtype)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform a single optimization step."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                # Only apply Muon to 2D parameters
+                if p.ndim != 2:
+                    continue
+
+                grad = p.grad
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                buf = state["momentum_buffer"]
+                momentum = group["momentum"]
+
+                # Add weight decay
+                if group["weight_decay"] != 0:
+                    grad = grad.add(p, alpha=group["weight_decay"])
+
+                # Update momentum buffer
+                buf.mul_(momentum).add_(grad, alpha=1 - momentum)
+
+                # Apply Newton-Schulz orthogonalization
+                if group["nesterov"]:
+                    # Nesterov look-ahead
+                    G = grad.add(buf, alpha=momentum)
+                else:
+                    G = buf
+
+                # Orthogonalize
+                G_ortho = self.newton_schulz_orthogonalize(G, steps=group["ns_steps"])
+
+                # Scale by sqrt(d_in * d_out) / ||G||_F as per Muon formula
+                d_in, d_out = p.shape
+                scale = (d_in * d_out) ** 0.5 / (G.norm() + 1e-7)
+
+                # Apply update
+                p.add_(G_ortho, alpha=-group["lr"] * scale)
+
+        return loss

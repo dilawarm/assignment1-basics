@@ -29,7 +29,7 @@ from cs336_basics.experiments.exp_logging import ExperimentLogger, TrainingInteg
 from cs336_basics.loss.cross_entropy import cross_entropy
 from cs336_basics.nn.enhanced_models import UNetTransformerLM
 from cs336_basics.training.checkpoint import save_checkpoint
-from cs336_basics.training.enhanced_optimizers import EnhancedAdam, LionOptimizer
+from cs336_basics.training.enhanced_optimizers import EnhancedAdam, LionOptimizer, MuonOptimizer
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
 
@@ -50,10 +50,12 @@ class OptimizedTrainArgs:
     tie_embeddings: bool = False  # Untied embeddings
 
     # Optimizer parameters
-    optimizer_type: str = "enhanced_adam"  # "enhanced_adam" or "lion"
+    optimizer_type: str = "muon_adam"  # "enhanced_adam", "lion", or "muon_adam"
     weight_decay: float = 0.1  # Increased weight decay
     betas: tuple[float, float] = (0.9, 0.95)  # Lower beta2 for faster adaptation
     base_lr: float = 3e-3  # Higher base learning rate
+    muon_lr: float = 0.02  # Muon learning rate for 2D parameters
+    muon_momentum: float = 0.95  # Muon momentum
 
     # Learning rate schedule
     min_learning_rate: float = 3e-5
@@ -106,6 +108,32 @@ class OptimizedTrainArgs:
         # Adjust d_ff to be divisible by 64 for tensor core efficiency
         if self.d_ff % 64 != 0:
             self.d_ff = ((self.d_ff + 63) // 64) * 64
+
+
+class MixedOptimizer:
+    """Wrapper to use multiple optimizers together."""
+
+    def __init__(self, *optimizers):
+        self.optimizers = optimizers
+        self.param_groups = []
+        for opt in self.optimizers:
+            self.param_groups.extend(opt.param_groups)
+
+    def zero_grad(self):
+        for opt in self.optimizers:
+            opt.zero_grad()
+
+    def step(self):
+        for opt in self.optimizers:
+            opt.step()
+
+    @property
+    def state(self):
+        # Combine states from all optimizers
+        combined_state = {}
+        for opt in self.optimizers:
+            combined_state.update(opt.state)
+        return combined_state
 
 
 class OptimizedTrainer:
@@ -202,7 +230,75 @@ class OptimizedTrainer:
         # Initialize optimizer with parameter groups
         param_groups = self.model.get_parameter_groups(base_lr=args.base_lr)
 
-        if args.optimizer_type == "enhanced_adam":
+        if args.optimizer_type == "muon_adam":
+            # Mixed Muon + Adam approach as used by the winning solution
+            # Collect parameters by type
+            muon_params = []  # 2D params (except embeddings and lm_head)
+            adam_params = []  # Everything else
+
+            for group in param_groups:
+                group_name = group.get("name", "")
+                group_params = group["params"]
+
+                for p in group_params:
+                    if p.ndim == 2 and "embeddings" not in group_name and "lm_head" not in group_name:
+                        muon_params.append(p)
+                    else:
+                        adam_params.append(p)
+
+            # Create separate optimizers
+            muon_optimizer = MuonOptimizer(
+                muon_params,
+                lr=args.muon_lr,
+                momentum=args.muon_momentum,
+                nesterov=True,
+                ns_steps=5,
+                weight_decay=args.weight_decay,
+            )
+
+            # Use standard Adam (not AdamW) as the winner mentioned Adam was slightly better
+            from cs336_basics.training.optimizers import Adam
+
+            # Recreate parameter groups for Adam with different learning rates
+            adam_param_groups = []
+            for group in param_groups:
+                group_name = group.get("name", "")
+                group_params = [p for p in group["params"] if p in adam_params]
+
+                if not group_params:
+                    continue
+
+                # Different learning rates for different parameter types
+                if "embeddings" in group_name:
+                    lr = args.base_lr * 5.0  # Higher LR for embeddings
+                elif "lm_head" in group_name:
+                    lr = args.base_lr * 0.5  # Lower LR for lm_head
+                elif "1d_params" in group_name:
+                    lr = args.base_lr * 2.0  # Higher LR for 1D params
+                else:
+                    lr = args.base_lr
+
+                adam_param_groups.append(
+                    {
+                        "params": group_params,
+                        "lr": lr,
+                        "name": group_name,
+                    }
+                )
+
+            adam_optimizer = Adam(
+                adam_param_groups,
+                lr=args.base_lr,
+                betas=args.betas,
+                weight_decay=args.weight_decay,
+            )
+
+            # Combine optimizers
+            from itertools import chain
+
+            self.optimizer = MixedOptimizer(muon_optimizer, adam_optimizer)
+
+        elif args.optimizer_type == "enhanced_adam":
             self.optimizer = EnhancedAdam(
                 param_groups,
                 lr=args.base_lr,
@@ -230,10 +326,21 @@ class OptimizedTrainer:
             )
 
         # Log optimizer info
-        for i, group in enumerate(self.optimizer.param_groups):
-            name = group.get("name", f"group_{i}")
-            num_params = sum(p.numel() for p in group["params"])
-            self.experiment_logger.add_note(f"Optimizer {name}: {num_params:,} params, lr={group['lr']:.2e}")
+        if args.optimizer_type == "muon_adam":
+            # Log Muon and Adam parameters separately
+            muon_params = sum(p.numel() for p in muon_params)
+            adam_params_count = sum(p.numel() for p in adam_params)
+            self.experiment_logger.add_note(f"Muon optimizer: {muon_params:,} params, lr={args.muon_lr:.2e}")
+            self.experiment_logger.add_note(f"Adam optimizer: {adam_params_count:,} params")
+            for group in adam_param_groups:
+                name = group.get("name", "unknown")
+                num_params = sum(p.numel() for p in group["params"])
+                self.experiment_logger.add_note(f"  Adam {name}: {num_params:,} params, lr={group['lr']:.2e}")
+        else:
+            for i, group in enumerate(self.optimizer.param_groups):
+                name = group.get("name", f"group_{i}")
+                num_params = sum(p.numel() for p in group["params"])
+                self.experiment_logger.add_note(f"Optimizer {name}: {num_params:,} params, lr={group['lr']:.2e}")
 
         # Initialize gradient scaler for mixed precision (if using AMP)
         self.scaler = GradScaler() if args.use_amp else None
@@ -364,17 +471,36 @@ class OptimizedTrainer:
 
         # Update learning rates for all parameter groups
         lr = self.get_lr(self.step)
-        for i, param_group in enumerate(self.optimizer.param_groups):
-            # Scale learning rate based on group
-            group_name = param_group.get("name", "")
-            if "embeddings" in group_name:
-                param_group["lr"] = lr * 5.0  # Higher LR for embeddings
-            elif "lm_head" in group_name:
-                param_group["lr"] = lr * 0.5  # Lower LR for lm_head
-            elif "1d_params" in group_name:
-                param_group["lr"] = lr * 2.0  # Higher LR for 1D params
-            else:
-                param_group["lr"] = lr
+
+        if self.args.optimizer_type == "muon_adam" and hasattr(self.optimizer, "optimizers"):
+            # Update Muon optimizer
+            muon_lr = self.args.muon_lr * (lr / self.args.base_lr)  # Scale Muon LR proportionally
+            for param_group in self.optimizer.optimizers[0].param_groups:
+                param_group["lr"] = muon_lr
+
+            # Update Adam optimizer groups
+            for param_group in self.optimizer.optimizers[1].param_groups:
+                group_name = param_group.get("name", "")
+                if "embeddings" in group_name:
+                    param_group["lr"] = lr * 5.0  # Higher LR for embeddings
+                elif "lm_head" in group_name:
+                    param_group["lr"] = lr * 0.5  # Lower LR for lm_head
+                elif "1d_params" in group_name:
+                    param_group["lr"] = lr * 2.0  # Higher LR for 1D params
+                else:
+                    param_group["lr"] = lr
+        else:
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                # Scale learning rate based on group
+                group_name = param_group.get("name", "")
+                if "embeddings" in group_name:
+                    param_group["lr"] = lr * 5.0  # Higher LR for embeddings
+                elif "lm_head" in group_name:
+                    param_group["lr"] = lr * 0.5  # Lower LR for lm_head
+                elif "1d_params" in group_name:
+                    param_group["lr"] = lr * 2.0  # Higher LR for 1D params
+                else:
+                    param_group["lr"] = lr
 
         # Gradient accumulation
         accumulated_loss = 0.0
@@ -593,7 +719,11 @@ def main():
     parser.add_argument("--steps", type=int, default=20000, help="Training steps")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-3, help="Base learning rate")
-    parser.add_argument("--optimizer", type=str, default="enhanced_adam", choices=["enhanced_adam", "lion", "adam"])
+    parser.add_argument("--muon_lr", type=float, default=0.02, help="Muon learning rate")
+    parser.add_argument("--muon_momentum", type=float, default=0.95, help="Muon momentum")
+    parser.add_argument(
+        "--optimizer", type=str, default="muon_adam", choices=["enhanced_adam", "lion", "adam", "muon_adam"]
+    )
 
     parser.add_argument("--experiment_name", type=str, default="optimized_transformer_h100")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
@@ -613,8 +743,10 @@ def main():
             config.training_set = args.train_data
         if args.val_data:
             config.validation_set = args.val_data
-        if args.optimizer != "enhanced_adam":
+        if args.optimizer != "muon_adam":
             config.optimizer_type = args.optimizer
+        config.muon_lr = args.muon_lr
+        config.muon_momentum = args.muon_momentum
     else:
         config = OptimizedTrainArgs(
             training_set=args.train_data or "data/encoded/owt_train_tokens.npy",
@@ -622,6 +754,8 @@ def main():
             steps=args.steps,
             batch_size=args.batch_size,
             base_lr=args.lr,
+            muon_lr=args.muon_lr,
+            muon_momentum=args.muon_momentum,
             optimizer_type=args.optimizer,
             experiment_name=args.experiment_name,
             use_wandb=args.wandb,
