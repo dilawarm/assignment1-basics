@@ -4,6 +4,8 @@ Activation functions and modules.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 from jaxtyping import Float
@@ -88,10 +90,14 @@ class SquaredReLU(nn.Module):
         self.w1 = Linear(d_model, d_ff, **kw)
         self.w2 = Linear(d_ff, d_model, **kw)
 
+        nn.init.kaiming_uniform_(self.w1.weight, a=0, nonlinearity="relu")
+        nn.init.kaiming_uniform_(self.w2.weight, a=0, nonlinearity="relu")
+
+        with torch.no_grad():
+            self.w2.weight.mul_(1 / math.sqrt(2.0))
+
     def forward(self, x):
-        x = self.w1(x)
-        x = torch.square(torch.relu(x))
-        return self.w2(x)
+        return self.w2(torch.square(torch.relu(self.w1(x))))
 
 
 def silu(input: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:

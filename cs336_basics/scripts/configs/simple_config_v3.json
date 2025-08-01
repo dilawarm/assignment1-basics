@@ -10,7 +10,7 @@
     "weight_decay": 0.02,
     "betas": [0.9, 0.95],
   
-    "max_learning_rate": 3.0e-3,
+    "max_learning_rate": 2.5e-3,
     "min_learning_rate": 1.5e-5,
     "warmup_iters": 1000,
     "cosine_cycle_iters": 20000,

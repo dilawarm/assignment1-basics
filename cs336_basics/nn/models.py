@@ -170,7 +170,7 @@ class TransformerLM(nn.Module):
             ]
         )
 
-        self.mix_param = nn.Parameter(torch.zeros(1, device=device, dtype=dtype))
+        self.mix_param = nn.Parameter(torch.full((1,), -4.0, device=device, dtype=dtype))
 
         self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
         self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
