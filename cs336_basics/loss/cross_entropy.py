@@ -49,4 +49,4 @@ def cross_entropy(
 
     targets_flat = torch.clamp(targets_flat, 0, vocab_size - 1)
 
-    return F.cross_entropy(logits_flat, targets_flat, reduction="mean")
+    return F.cross_entropy(logits_flat.float(), targets_flat, reduction="mean")

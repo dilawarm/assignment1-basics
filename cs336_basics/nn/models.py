@@ -27,6 +27,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         eps: float = 1e-5,
+        dropout_p: float = 0.0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -38,6 +39,7 @@ class TransformerBlock(nn.Module):
             num_heads: Number of attention heads
             d_ff: Dimensionality of the feed-forward inner layer
             eps: Epsilon value for RMSNorm numerical stability
+            dropout_p: Dropout probability
             device: Device to store parameters on
             dtype: Data type for parameters
         """
@@ -46,6 +48,8 @@ class TransformerBlock(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
+        self.dropout_p = dropout_p
+        self.dropout = nn.Dropout(self.dropout_p)
 
         factory_kwargs = {"device": device, "dtype": dtype}
 
@@ -89,11 +93,11 @@ class TransformerBlock(nn.Module):
         """Internal forward implementation."""
         normalized_x = self.ln1(x)
         attn_output = self.attn(normalized_x, rope=rope, token_positions=token_positions)
-        z = x + attn_output
+        z = x + self.dropout(attn_output)
 
         normalized_z = self.ln2(z)
         ffn_output = self.ffn(normalized_z)
-        y = z + ffn_output
+        y = z + self.dropout(ffn_output)
 
         return y
 
@@ -120,6 +124,7 @@ class TransformerLM(nn.Module):
         d_ff: int,
         rope_theta: float = 10000.0,
         eps: float = 1e-5,
+        dropout_p: float = 0.0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -135,6 +140,7 @@ class TransformerLM(nn.Module):
             d_ff: Dimensionality of the feed-forward inner layer
             rope_theta: RoPE theta parameter (typically 10000.0)
             eps: Epsilon value for RMSNorm numerical stability
+            dropout_p: Dropout probability
             device: Device to store parameters on
             dtype: Data type for parameters
         """
@@ -165,7 +171,9 @@ class TransformerLM(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, **factory_kwargs)
+                TransformerBlock(
+                    d_model=d_model, num_heads=num_heads, d_ff=d_ff, eps=eps, dropout_p=dropout_p, **factory_kwargs
+                )
                 for _ in range(num_layers)
             ]
         )

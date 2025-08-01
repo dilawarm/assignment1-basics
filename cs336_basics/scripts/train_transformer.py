@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.amp import autocast
+from torch.optim import AdamW as FusedAdamW
 from tqdm import tqdm
 
 from cs336_basics.data import get_batch
@@ -21,7 +23,6 @@ from cs336_basics.nn.models import TransformerLM
 from cs336_basics.training.checkpoint import save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
-from cs336_basics.training.optimizers import AdamW
 
 
 @dataclass
@@ -57,6 +58,11 @@ class TrainModelArgs:
     steps: int = 40960
     batch_size: int = 32
     gradient_clipping: float = 1.0
+    gradient_accum: int = 1
+
+    # Regularization
+    dropout_p: float = 0.1
+    flood_level: float = 0.05
 
     # Device and optimization
     device: str = "cuda"
@@ -113,6 +119,7 @@ class TrainModel:
             num_heads=args.num_heads,
             d_ff=args.d_ff,
             rope_theta=args.rope_theta,
+            dropout_p=args.dropout_p,
             device=self.device,
         )
 
@@ -131,8 +138,12 @@ class TrainModel:
                 self.experiment_logger.add_note(f"Model compilation failed: {e}")
                 print(f"⚠️ Model compilation failed: {e}")
 
-        self.optimizer = AdamW(
-            self.model.parameters(), lr=args.max_learning_rate, weight_decay=args.weight_decay, betas=args.betas
+        self.optimizer = FusedAdamW(
+            self.model.parameters(),
+            lr=args.max_learning_rate,
+            weight_decay=args.weight_decay,
+            betas=args.betas,
+            fused=True,
         )
 
         print(f"Loading training data from {args.training_set}")
@@ -202,7 +213,7 @@ class TrainModel:
 
         self.model.eval()
         total_loss = 0.0
-        num_batches = 50
+        num_batches = 20
 
         eval_start_time = time.time()
         with torch.no_grad():
@@ -212,8 +223,9 @@ class TrainModel:
                         self.validation_set, self.args.batch_size, self.args.context_length, device=str(self.device)
                     )
 
-                    logits = self.model(inputs)
-                    loss = cross_entropy(logits, targets)
+                    with autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits = self.model(inputs)
+                        loss = cross_entropy(logits, targets)
 
                     if torch.isfinite(loss):
                         total_loss += loss.item()
@@ -249,7 +261,8 @@ class TrainModel:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
-        self.optimizer.zero_grad()
+        if self.step % self.args.gradient_accum == 0:
+            self.optimizer.zero_grad()
 
         batch_start_time = time.time()
         inputs, targets = get_batch(
@@ -258,19 +271,28 @@ class TrainModel:
         batch_time = time.time() - batch_start_time
 
         forward_start_time = time.time()
-        logits = self.model(inputs)
-        loss = cross_entropy(logits, targets)
+        flood_level = self.args.flood_level
+
+        with autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = self.model(inputs)
+            loss = cross_entropy(logits, targets)
+
+        loss = (loss - flood_level).abs() + flood_level
+
         forward_time = time.time() - forward_start_time
 
         backward_start_time = time.time()
-        loss.backward()
+        (loss / self.args.gradient_accum).backward()
         backward_time = time.time() - backward_start_time
 
-        grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
+        grad_norm = 0.0
+        optimizer_time = 0.0
+        if (self.step + 1) % self.args.gradient_accum == 0:
+            grad_norm = gradient_clipping(self.model.parameters(), self.args.gradient_clipping)
 
-        optimizer_start_time = time.time()
-        self.optimizer.step()
-        optimizer_time = time.time() - optimizer_start_time
+            optimizer_start_time = time.time()
+            self.optimizer.step()
+            optimizer_time = time.time() - optimizer_start_time
 
         step_time = time.time() - step_start_time
 
@@ -419,6 +441,8 @@ def main():
     parser.add_argument("--steps", type=int, default=40960, help="Training steps")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=2e-3, help="Learning rate")
+    parser.add_argument("--dropout_p", type=float, default=0.1, help="Dropout probability")
+    parser.add_argument("--flood_level", type=float, default=0.05, help="Flood level")
 
     parser.add_argument("--experiment_name", type=str, default="transformer_training", help="Experiment name")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
@@ -458,6 +482,8 @@ def main():
             wandb_entity=args.wandb_entity,
             log_dir=args.log_dir,
             compile_model=not args.no_compile,
+            dropout_p=args.dropout_p,
+            flood_level=args.flood_level,
         )
 
     trainer = TrainModel(config)
