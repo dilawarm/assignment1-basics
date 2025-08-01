@@ -59,6 +59,7 @@ class TrainModelArgs:
     batch_size: int = 32
     gradient_clipping: float = 1.0
     gradient_accum: int = 1
+    gradient_checkpointing: bool = True
 
     # Regularization
     dropout_p: float = 0.1
@@ -122,6 +123,8 @@ class TrainModel:
             dropout_p=args.dropout_p,
             device=self.device,
         )
+        if args.gradient_checkpointing:
+            self.model.enable_gradient_checkpointing()
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)

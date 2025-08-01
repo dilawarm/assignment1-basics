@@ -1,0 +1,35 @@
+{
+    "vocab_size": 32000,
+    "context_length": 512,
+    "num_layers": 12,
+    "d_model": 1024,
+    "num_heads": 16,
+    "d_ff": 4096,
+    "rope_theta": 10000,
+
+    "weight_decay": 0.1,
+    "betas": [0.9, 0.95],
+    "max_learning_rate": 2.5e-4,
+    "min_learning_rate": 2.5e-5,
+    "warmup_iters": 3000,
+    "cosine_cycle_iters": 24000,
+
+    "batch_size": 24,
+    "gradient_accum": 3,
+    "gradient_clipping": 1.0,
+    "gradient_checkpointing": true,
+
+    "dropout_p": 0.1,
+    "flood_level": 0.05,
+
+    "steps": 24000,
+    "validation_step_interval": 400,
+    "checkpoint_step_interval": 4000,
+
+    "device": "cuda",
+    "compile_model": true,
+
+    "experiment_name": "h100_big_90m",
+    "use_wandb": true,
+    "log_dir": "experiments"
+}

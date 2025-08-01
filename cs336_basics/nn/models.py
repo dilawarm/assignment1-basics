@@ -180,6 +180,7 @@ class TransformerLM(nn.Module):
 
         self.ln_final = RMSNorm(d_model, eps, **factory_kwargs)
         self.lm_head = Linear(d_model, vocab_size, **factory_kwargs)
+        self.lm_head.weight = self.token_embeddings.weight
 
         self.use_gradient_checkpointing = False
         self._gradient_checkpointing_layers = None
