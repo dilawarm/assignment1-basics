@@ -1,0 +1,32 @@
+{
+    "vocab_size": 32000,
+    "context_length": 512,
+    "num_layers": 16,
+    "d_model": 1024,
+    "num_heads": 16,
+    "d_ff": 2752,
+    "rope_theta": 10000,
+  
+    "weight_decay": 0.02,
+    "betas": [0.9, 0.95],
+  
+    "max_learning_rate": 3.0e-3,
+    "min_learning_rate": 1.5e-5,
+    "warmup_iters": 1000,
+    "cosine_cycle_iters": 20000,
+  
+    "steps": 20000,
+    "batch_size": 128,
+    "gradient_clipping": 1.0,
+    "validation_step_interval": 400,
+    "checkpoint_step_interval": 5000,
+  
+    "device": "cuda",
+    "compile_model": true,
+  
+    "experiment_name": "transformer_v3_adam_sqrelu",
+    "experiment_description": "Adam, squared-ReLU FFN, LR multipliers",
+    "use_wandb": true,
+    "wandb_project": "cs336-assignment1",
+    "log_dir": "experiments"
+}

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 
-from cs336_basics.nn.activations import SwiGLU
+from cs336_basics.nn.activations import SquaredReLU
 from cs336_basics.nn.attention import MultiHeadSelfAttention, RotaryPositionalEmbedding
 from cs336_basics.nn.layers import Embedding, Linear, RMSNorm
 
@@ -52,7 +52,7 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadSelfAttention(d_model, num_heads, **factory_kwargs)
         self.ln1 = RMSNorm(d_model, eps, **factory_kwargs)
 
-        self.ffn = SwiGLU(d_model, d_ff, **factory_kwargs)
+        self.ffn = SquaredReLU(d_model, d_ff, **factory_kwargs)
 
         self.ln2 = RMSNorm(d_model, eps, **factory_kwargs)
 

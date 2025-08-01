@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.optim import AdamW as TorchAdamW
+from torch.optim import Adam as TorchAdam
 from tqdm import tqdm
 
 from cs336_basics.data import get_batch
@@ -142,9 +142,26 @@ class TrainModel:
             f"Model initialized: {total_params:,} total parameters, {trainable_params:,} trainable"
         )
 
-        use_fused = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
-        self.optimizer = TorchAdamW(
-            self.model.parameters(),
+        def param_groups(model):
+            emb, head, rest = [], [], []
+            for n, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if n.startswith("token_embeddings"):
+                    emb.append(p)
+                elif n.startswith("lm_head"):
+                    head.append(p)
+                else:
+                    rest.append(p)
+            return [
+                {"params": emb, "lr_mult": 1.5},
+                {"params": head, "lr_mult": 0.5},
+                {"params": rest, "lr_mult": 1.0},
+            ]
+
+        use_fused = "fused" in TorchAdam.__init__.__code__.co_varnames
+        self.optimizer = TorchAdam(
+            param_groups(self.model),
             lr=args.max_learning_rate,
             betas=args.betas,
             weight_decay=args.weight_decay,
@@ -263,8 +280,8 @@ class TrainModel:
         step_start_time = time.time()
 
         lr = self.get_lr(self.step)
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr * group.get("lr_mult", 1.0)
 
         self.optimizer.zero_grad(set_to_none=True)
 

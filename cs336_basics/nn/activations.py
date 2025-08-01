@@ -82,6 +82,18 @@ class SwiGLU(nn.Module):
         return f"d_model={self.d_model}, d_ff={self.d_ff}"
 
 
+class SquaredReLU(nn.Module):
+    def __init__(self, d_model, d_ff, **kw):
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff, **kw)
+        self.w2 = Linear(d_ff, d_model, **kw)
+
+    def forward(self, x):
+        x = self.w1(x)
+        x = torch.square(torch.relu(x))
+        return self.w2(x)
+
+
 def silu(input: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
     """
     Apply the SiLU (Sigmoid Linear Unit) activation function element-wise.
