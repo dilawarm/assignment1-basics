@@ -5,24 +5,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 from einops import rearrange
-
-# Try to import Flash Attention and Transformer Engine
-try:
-    from flash_attn import flash_attn_func
-
-    FLASH_AVAILABLE = True
-except ImportError:
-    FLASH_AVAILABLE = False
-    print("Warning: Flash Attention not available. Using standard attention.")
-
-try:
-    import transformer_engine.pytorch as te
-
-    TE_AVAILABLE = True
-except ImportError:
-    TE_AVAILABLE = False
-    print("Warning: Transformer Engine not available. Using standard PyTorch.")
+from flash_attn import flash_attn_func
 
 from .components import RotaryPositionEmbedding, scaled_init_
 
@@ -48,8 +33,8 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
         self.dropout = dropout
-        self.use_flash = use_flash and FLASH_AVAILABLE
-        self.use_fp8 = use_fp8 and TE_AVAILABLE
+        self.use_flash = use_flash
+        self.use_fp8 = use_fp8
         self.layer_idx = layer_idx
         self.total_layers = total_layers
 

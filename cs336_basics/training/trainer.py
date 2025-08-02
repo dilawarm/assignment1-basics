@@ -5,32 +5,21 @@ import os
 import time
 from dataclasses import dataclass
 
+import pynvml
 import torch
 import torch.nn as nn
+
+# Try to import NVIDIA-specific libraries
+import transformer_engine.pytorch as te
 from torch.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformer_engine.common import recipe
 
 import wandb
 
-# Try to import NVIDIA-specific libraries
-try:
-    import transformer_engine.pytorch as te
-    from transformer_engine.common import recipe
-
-    TE_AVAILABLE = True
-except ImportError:
-    TE_AVAILABLE = False
-    print("Warning: Transformer Engine not available")
-
-try:
-    import pynvml
-
-    pynvml.nvmlInit()
-    NVML_AVAILABLE = True
-except:
-    NVML_AVAILABLE = False
+pynvml.nvmlInit()
 
 
 @dataclass
@@ -107,7 +96,7 @@ class Trainer:
 
         # Setup FP8 if available
         self.fp8_enabled = False
-        if config.use_fp8 and TE_AVAILABLE:
+        if config.use_fp8:
             self._setup_fp8()
 
         # Compile model if requested
@@ -208,9 +197,6 @@ class Trainer:
 
     def _get_gpu_stats(self) -> dict[str, float]:
         """Get GPU memory and utilization stats."""
-        if not NVML_AVAILABLE:
-            return {}
-
         try:
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)

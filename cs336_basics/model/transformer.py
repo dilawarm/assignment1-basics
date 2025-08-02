@@ -5,14 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Try to import Transformer Engine
-try:
-    import transformer_engine.pytorch as te
-
-    TE_AVAILABLE = True
-except ImportError:
-    TE_AVAILABLE = False
+import transformer_engine.pytorch as te
 
 from .attention import MultiHeadAttention
 from .components import RMSNorm, SwiGLU, scaled_init_
@@ -38,7 +31,7 @@ class TransformerBlock(nn.Module):
         self.layer_idx = layer_idx
 
         # Layer normalization (RMSNorm is more efficient than LayerNorm)
-        if use_fp8 and TE_AVAILABLE:
+        if use_fp8:
             # Use Transformer Engine's LayerNorm for FP8 compatibility
             self.norm1 = te.LayerNorm(dim, eps=1e-8)
             self.norm2 = te.LayerNorm(dim, eps=1e-8)
@@ -135,7 +128,7 @@ class TransformerLM(nn.Module):
         )
 
         # Final layer norm
-        if use_fp8 and TE_AVAILABLE:
+        if use_fp8:
             self.ln_f = te.LayerNorm(dim, eps=1e-8)
         else:
             self.ln_f = RMSNorm(dim)
