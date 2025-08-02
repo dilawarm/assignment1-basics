@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from cs336_basics.data import get_batch
+from cs336_basics.data import DataLoader
 from cs336_basics.experiments.exp_logging import ExperimentLogger, TrainingIntegrator
 from cs336_basics.loss.cross_entropy import cross_entropy
 from cs336_basics.nn.models import TransformerLM
@@ -134,17 +134,15 @@ class TrainModel:
         self.optimizer = self.create_optimizer()
 
         print(f"Loading training data from {args.training_set}")
-        self.training_set = np.load(args.training_set, mmap_mode="r")
-        print(f"Training set size: {len(self.training_set):,} tokens")
-        self.experiment_logger.add_note(f"Training data loaded: {len(self.training_set):,} tokens")
+        self.train_loader = DataLoader(args.training_set, args.batch_size, args.context_length, self.device)
+        self.experiment_logger.add_note(f"Training data loaded: {args.training_set}")
 
         if Path(args.validation_set).exists():
             print(f"Loading validation data from {args.validation_set}")
-            self.validation_set = np.load(args.validation_set, mmap_mode="r")
-            print(f"Validation set size: {len(self.validation_set):,} tokens")
-            self.experiment_logger.add_note(f"Validation data loaded: {len(self.validation_set):,} tokens")
+            self.val_loader = DataLoader(args.validation_set, args.batch_size, args.context_length, self.device)
+            self.experiment_logger.add_note(f"Validation data loaded: {args.validation_set}")
         else:
-            self.validation_set = None
+            self.val_loader = None
             self.experiment_logger.add_note("No validation set found")
             print("No validation set found")
 
@@ -214,7 +212,7 @@ class TrainModel:
 
     def evaluate(self) -> tuple[float, float]:
         """Evaluate the model on validation set."""
-        if self.validation_set is None:
+        if self.val_loader is None:
             return float("inf"), float("inf")
 
         self.model.eval()
@@ -225,10 +223,7 @@ class TrainModel:
         with torch.no_grad():
             for batch_idx in range(num_batches):
                 try:
-                    inputs, targets = get_batch(
-                        self.validation_set, self.args.batch_size, self.args.context_length, device=str(self.device)
-                    )
-
+                    inputs, targets = self.val_loader.get_batch()
                     logits = self.model(inputs)
                     loss = cross_entropy(logits, targets)
 
@@ -269,9 +264,7 @@ class TrainModel:
         self.optimizer.zero_grad()
 
         batch_start_time = time.time()
-        inputs, targets = get_batch(
-            self.training_set, self.args.batch_size, self.args.context_length, device=str(self.device)
-        )
+        inputs, targets = self.train_loader.get_batch()
         batch_time = time.time() - batch_start_time
 
         forward_start_time = time.time()

@@ -4,8 +4,91 @@ Data loading utilities for transformer training.
 
 from __future__ import annotations
 
+import queue
+import threading
+
 import numpy as np
 import torch
+
+# def get_batch(
+#     dataset: np.ndarray,
+#     batch_size: int,
+#     context_length: int,
+#     device: str = "cuda",
+#     dtype: torch.dtype = torch.long,
+#     pin_memory: bool = True,
+# ) -> tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     Batch generation for language model training.
+
+#     This function efficiently samples random sequences from the dataset and
+#     prepares input-target pairs for autoregressive training.
+
+#     Args:
+#         dataset: Memory-mapped numpy array containing tokenized text
+#         batch_size: Number of sequences in the batch
+#         context_length: Length of each sequence
+#         device: Target device for tensors ('cuda' or 'cpu')
+#         dtype: Data type for tensors (default: torch.long)
+#         pin_memory: Whether to use pinned memory for faster GPU transfer
+
+#     Returns:
+#         Tuple of (inputs, targets) where:
+#         - inputs: (batch_size, context_length) tensor of token IDs
+#         - targets: (batch_size, context_length) tensor of next token IDs
+#     """
+#     data_size = len(dataset)
+
+#     if data_size < context_length + 1:
+#         raise ValueError(f"Dataset too small: {data_size} < {context_length + 1}")
+
+#     max_start_idx = data_size - context_length -1
+#     start_indices = np.random.randint(0, max_start_idx, size=batch_size)
+
+#     input_batch = np.empty((batch_size, context_length), dtype=np.int64)
+#     target_batch = np.empty((batch_size, context_length), dtype=np.int64)
+
+#     for i, start_idx in enumerate(start_indices):
+#         input_batch[i] = dataset[start_idx : start_idx + context_length]
+#         target_batch[i] = dataset[start_idx + 1 : start_idx + context_length + 1]
+
+#     if pin_memory and device == "cuda":
+#         inputs = torch.from_numpy(input_batch).pin_memory().to(device=device, dtype=dtype, non_blocking=True)
+#         targets = torch.from_numpy(target_batch).pin_memory().to(device=device, dtype=dtype, non_blocking=True)
+#     else:
+#         inputs = torch.from_numpy(input_batch).to(device=device, dtype=dtype)
+#         targets = torch.from_numpy(target_batch).to(device=device, dtype=dtype)
+#     return inputs, targets
+
+
+class DataLoader:
+    def __init__(self, dataset_path, batch_size, context_length, device, prefetch_factor=2):
+        self.dataset = np.load(dataset_path, mmap_mode="r")
+        self.batch_size = batch_size
+        self.context_length = context_length
+        self.device = device
+        self.prefetch_factor = prefetch_factor
+        self.data_queue = queue.Queue(maxsize=prefetch_factor)
+        self.loader_thread = threading.Thread(target=self._load_batches, daemon=True)
+        self.loader_thread.start()
+
+    def _load_batches(self):
+        while True:
+            data_size = len(self.dataset)
+            max_start_idx = data_size - self.context_length - 1
+            start_indices = np.random.randint(0, max_start_idx, size=self.batch_size)
+
+            input_batch = np.array([self.dataset[i : i + self.context_length] for i in start_indices])
+            target_batch = np.array([self.dataset[i + 1 : i + 1 + self.context_length] for i in start_indices])
+
+            inputs = torch.from_numpy(input_batch).long()
+            targets = torch.from_numpy(target_batch).long()
+
+            self.data_queue.put((inputs, targets))
+
+    def get_batch(self):
+        inputs, targets = self.data_queue.get()
+        return inputs.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
 
 
 def get_batch(
@@ -16,31 +99,12 @@ def get_batch(
     dtype: torch.dtype = torch.long,
     pin_memory: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Batch generation for language model training.
-
-    This function efficiently samples random sequences from the dataset and
-    prepares input-target pairs for autoregressive training.
-
-    Args:
-        dataset: Memory-mapped numpy array containing tokenized text
-        batch_size: Number of sequences in the batch
-        context_length: Length of each sequence
-        device: Target device for tensors ('cuda' or 'cpu')
-        dtype: Data type for tensors (default: torch.long)
-        pin_memory: Whether to use pinned memory for faster GPU transfer
-
-    Returns:
-        Tuple of (inputs, targets) where:
-        - inputs: (batch_size, context_length) tensor of token IDs
-        - targets: (batch_size, context_length) tensor of next token IDs
-    """
     data_size = len(dataset)
 
     if data_size < context_length + 1:
         raise ValueError(f"Dataset too small: {data_size} < {context_length + 1}")
 
-    max_start_idx = data_size - context_length
+    max_start_idx = data_size - (context_length + 1)
     start_indices = np.random.randint(0, max_start_idx, size=batch_size)
 
     input_batch = np.empty((batch_size, context_length), dtype=np.int64)
@@ -63,11 +127,6 @@ def get_batch(
 class BatchSampler:
     """
     Advanced batch sampler with memory optimization and prefetching.
-
-    Features:
-    - Pre-allocated memory pools
-    - Asynchronous data loading
-    - Dynamic batch sizing
     """
 
     def __init__(
@@ -137,28 +196,13 @@ def create_dataloader(
     prefetch_factor: int = 2,
     use_memory_mapping: bool = True,
 ) -> BatchSampler:
-    """
-    Create a data loader for language model training.
-
-    Args:
-        data_path: Path to tokenized data file (.npy)
-        batch_size: Batch size for training
-        context_length: Sequence length
-        device: Target device
-        num_workers: Number of data loading workers
-        prefetch_factor: Number of batches to prefetch
-        use_memory_mapping: Whether to use memory mapping for large files
-
-    Returns:
-        Batch sampler
-    """
     if use_memory_mapping:
-        dataset = np.memmap(data_path, dtype=np.uint16, mode="r")
+        dataset = np.load(data_path, mmap_mode="r")
     else:
         dataset = np.load(data_path)
 
     return BatchSampler(
-        dataset=dataset,
+        dataset,
         batch_size=batch_size,
         context_length=context_length,
         device=device,

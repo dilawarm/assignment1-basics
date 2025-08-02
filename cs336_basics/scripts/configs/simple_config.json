@@ -1,6 +1,6 @@
 {
     "vocab_size": 32000,
-    "context_length": 256,
+    "context_length": 1024,
     "num_layers": 12,
     "d_model": 768,
     "num_heads": 12,
@@ -20,8 +20,8 @@
     
     "validation_step_interval": 500,
     "checkpoint_step_interval": 10000,
-    "steps": 22000,
-    "batch_size": 64,
+    "steps": 44000,
+    "batch_size": 16,
     "gradient_clipping": 1.0,
     
     "device": "cuda",
