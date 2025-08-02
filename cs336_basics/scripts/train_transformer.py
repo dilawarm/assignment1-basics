@@ -33,7 +33,7 @@ class TrainModelArgs:
     context_length: int = 256
     num_layers: int = 4
     d_model: int = 512
-    num_heads: int = 16
+    num_heads: int = 12
     d_ff: int = 1344
     rope_theta: float = 10000
 
@@ -131,9 +131,7 @@ class TrainModel:
                 self.experiment_logger.add_note(f"Model compilation failed: {e}")
                 print(f"⚠️ Model compilation failed: {e}")
 
-        self.optimizer = AdamW(
-            self.model.parameters(), lr=args.max_learning_rate, weight_decay=args.weight_decay, betas=args.betas
-        )
+        self.optimizer = self.create_optimizer()
 
         print(f"Loading training data from {args.training_set}")
         self.training_set = np.load(args.training_set, mmap_mode="r")
@@ -149,6 +147,25 @@ class TrainModel:
             self.validation_set = None
             self.experiment_logger.add_note("No validation set found")
             print("No validation set found")
+
+    def create_optimizer(self) -> AdamW:
+        """Create an AdamW optimizer with selective weight decay."""
+        args = self.args
+
+        param_groups = [
+            {"params": [], "weight_decay": args.weight_decay},
+            {"params": [], "weight_decay": 0.0},
+        ]
+
+        for name, p in self.model.named_parameters():
+            if p.requires_grad:
+                if p.dim() >= 2:
+                    param_groups[0]["params"].append(p)
+                else:
+                    param_groups[1]["params"].append(p)
+
+        optimizer = AdamW(param_groups, lr=args.max_learning_rate, betas=args.betas)
+        return optimizer
 
     def calculate_mfu(self, tokens_per_sec: float) -> float:
         """Calculate Model FLOPs Utilization (MFU) for performance monitoring."""
