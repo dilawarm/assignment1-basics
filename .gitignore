@@ -167,3 +167,6 @@ output/
 checkpoints/
 experiments/
 wandb/
+data.md
+installation.md
+training.md

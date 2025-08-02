@@ -1,17 +1,5 @@
-"""Training infrastructure components."""
+"""Training module for H100-optimized transformer."""
 
-from cs336_basics.training.checkpoint import load_checkpoint, save_checkpoint
-from cs336_basics.training.gradient_clipping import gradient_clipping
-from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
-from cs336_basics.training.optimizers import AdamW
+from .trainer import Trainer, TrainingConfig
 
-__all__ = [
-    # Checkpointing
-    "load_checkpoint",
-    "save_checkpoint",
-    # Optimization
-    "AdamW",
-    "gradient_clipping",
-    # Learning rate scheduling
-    "cosine_learning_rate_schedule",
-]
+__all__ = ["Trainer", "TrainingConfig"]

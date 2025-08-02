@@ -1,0 +1,35 @@
+# H100-optimized training requirements
+# Install with: pip install -r requirements_h100.txt
+
+# Core dependencies
+torch>=2.1.0
+numpy>=1.24.0
+einops>=0.7.0
+tqdm>=4.65.0
+
+# Data handling
+# (Using local preprocessed numpy files)
+
+# Mixed precision and optimization
+accelerate>=0.24.0
+
+# Logging
+wandb>=0.15.0
+tensorboard>=2.14.0
+
+# GPU monitoring
+pynvml>=11.5.0
+
+# Optional but recommended for H100
+# Note: These may require specific CUDA versions and manual installation
+
+# NVIDIA Transformer Engine for FP8 support
+# Requires CUDA >= 12.0 and GPU compute capability >= 8.9
+# Install with: pip install git+https://github.com/NVIDIA/TransformerEngine.git
+
+# Flash Attention for efficient attention computation
+# Install with: pip install flash-attn --no-build-isolation
+
+# For development
+pytest>=7.4.0
+ruff>=0.1.0
