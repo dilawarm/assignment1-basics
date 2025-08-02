@@ -3,6 +3,7 @@ Simple Transformer Training Script
 """
 
 import argparse
+import copy
 import json
 import math
 import time
@@ -23,6 +24,7 @@ from cs336_basics.nn.models import TransformerLM
 from cs336_basics.training.checkpoint import save_checkpoint
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.lr_schedules import cosine_learning_rate_schedule
+from cs336_basics.training.optimizers import Lion
 
 
 @dataclass
@@ -39,6 +41,7 @@ class TrainModelArgs:
     rope_theta: float = 10000
 
     # Optimizer parameters
+    optimizer: str = "lion"
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.999)
 
@@ -64,6 +67,7 @@ class TrainModelArgs:
     # Regularization
     dropout_p: float = 0.1
     flood_level: float = 0.05
+    ema_decay: float = 0.999
 
     # Device and optimization
     device: str = "cuda"
@@ -126,6 +130,11 @@ class TrainModel:
         if args.gradient_checkpointing:
             self.model.enable_gradient_checkpointing()
 
+        self.ema_model = copy.deepcopy(self.model)
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
+        self.ema_model.eval()
+
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.experiment_logger.add_note(
@@ -141,13 +150,21 @@ class TrainModel:
                 self.experiment_logger.add_note(f"Model compilation failed: {e}")
                 print(f"⚠️ Model compilation failed: {e}")
 
-        self.optimizer = FusedAdamW(
-            self.model.parameters(),
-            lr=args.max_learning_rate,
-            weight_decay=args.weight_decay,
-            betas=args.betas,
-            fused=True,
-        )
+        if args.optimizer.lower() == "adamw":
+            self.optimizer = FusedAdamW(
+                self.model.parameters(),
+                lr=args.max_learning_rate,
+                weight_decay=args.weight_decay,
+                betas=args.betas,
+                fused=True,
+            )
+        else:
+            self.optimizer = Lion(
+                self.model.parameters(),
+                lr=args.max_learning_rate,
+                betas=args.betas,
+                weight_decay=args.weight_decay,
+            )
 
         print(f"Loading training data from {args.training_set}")
         self.training_set = np.load(args.training_set, mmap_mode="r")
@@ -214,7 +231,8 @@ class TrainModel:
         if self.validation_set is None:
             return float("inf"), float("inf")
 
-        self.model.eval()
+        model_for_eval = self.ema_model if hasattr(self, "ema_model") else self.model
+        model_for_eval.eval()
         total_loss = 0.0
         num_batches = 20
 
@@ -227,7 +245,7 @@ class TrainModel:
                     )
 
                     with autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = self.model(inputs)
+                        logits = model_for_eval(inputs)
                         loss = cross_entropy(logits, targets)
 
                     if torch.isfinite(loss):
@@ -295,6 +313,11 @@ class TrainModel:
 
             optimizer_start_time = time.time()
             self.optimizer.step()
+
+            with torch.no_grad():
+                decay = self.args.ema_decay
+                for ema_p, model_p in zip(self.ema_model.parameters(), self.model.parameters()):
+                    ema_p.mul_(decay).add_(model_p.data, alpha=1 - decay)
             optimizer_time = time.time() - optimizer_start_time
 
         step_time = time.time() - step_start_time

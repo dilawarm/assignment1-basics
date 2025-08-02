@@ -149,3 +149,55 @@ class AdamW(Optimizer):
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
+
+
+class Lion(Optimizer):
+    """Lion optimizer (Chen et al., 2023). Less memory use, faster convergence.
+
+    Paper: https://arxiv.org/abs/2302.06675
+    """
+
+    def __init__(
+        self,
+        params: Iterator[torch.nn.Parameter],
+        lr: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.0,
+    ) -> None:
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.dtype in {torch.float16, torch.bfloat16}:
+                    grad = grad.float()
+                if wd != 0:
+                    grad = grad.add(p, alpha=wd)
+                state = self.state[p]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                exp_avg = state["exp_avg"]
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                update = grad.add(exp_avg, alpha=-beta2)
+                p.add_(update.sign(), alpha=-lr)
+        return loss
