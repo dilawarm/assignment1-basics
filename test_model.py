@@ -26,9 +26,9 @@ def test_model():
         intermediate_size=4096,
         dropout=0.0,
         tie_embeddings=True,
-        use_flash=False,  # Disable for CPU testing
-        use_fp8=False,  # Disable for CPU testing
-        use_gradient_checkpointing=False,
+        use_flash=True,  # Disable for CPU testing
+        use_fp8=True,  # Disable for CPU testing
+        use_gradient_checkpointing=True,
     )
 
     # Test forward pass
