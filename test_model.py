@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """Quick test script to verify model implementation."""
 
-import os
-import sys
-
 import torch
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from cs336_basics.model import TransformerLM
 
