@@ -20,15 +20,24 @@ tensorboard>=2.14.0
 # GPU monitoring
 pynvml>=11.5.0
 
-# Optional but recommended for H100
-# Note: These may require specific CUDA versions and manual installation
+# Optional H100 Optimizations (install separately after base requirements)
+# ========================================================================
 
-# NVIDIA Transformer Engine for FP8 support
-# Requires CUDA >= 12.0 and GPU compute capability >= 8.9
-# Install with: pip install git+https://github.com/NVIDIA/TransformerEngine.git
+# 1. Flash Attention - Efficient attention computation
+#    IMPORTANT: Requires torch to be installed first!
+#    Install with:
+#      pip install torch  # Install torch first
+#      pip install flash-attn --no-build-isolation
+#    
+#    If you encounter memory errors during compilation:
+#      MAX_JOBS=1 pip install flash-attn --no-build-isolation
 
-# Flash Attention for efficient attention computation
-# Install with: pip install flash-attn --no-build-isolation
+# 2. NVIDIA Transformer Engine - FP8 support for H100
+#    Requires: CUDA >= 12.0, GPU compute capability >= 8.9
+#    Install with:
+#      pip install transformer-engine
+#    Or from source:
+#      pip install git+https://github.com/NVIDIA/TransformerEngine.git
 
 # For development
 pytest>=7.4.0

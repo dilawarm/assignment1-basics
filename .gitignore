@@ -169,4 +169,5 @@ experiments/
 wandb/
 data.md
 installation.md
+install.md
 training.md
