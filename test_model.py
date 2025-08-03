@@ -26,15 +26,19 @@ def test_model():
         intermediate_size=4096,
         dropout=0.0,
         tie_embeddings=True,
-        use_flash=True,  # Disable for CPU testing
-        use_fp8=True,  # Disable for CPU testing
-        use_gradient_checkpointing=True,
+        use_flash=True,  # Enable for H100
+        use_fp8=True,  # Enable for H100
+        use_gradient_checkpointing=False,  # Disable for inference testing
     )
+
+    # Move model to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     # Test forward pass
     batch_size = 2
     seq_len = 128
-    input_ids = torch.randint(0, 50257, (batch_size, seq_len))
+    input_ids = torch.randint(0, 50257, (batch_size, seq_len)).to(device)
 
     print(f"\nTesting forward pass with input shape: {input_ids.shape}")
 
@@ -52,7 +56,7 @@ def test_model():
 
     # Test generation
     print("\nTesting generation...")
-    prompt = torch.tensor([[1, 2, 3, 4, 5]])  # Example prompt
+    prompt = torch.tensor([[1, 2, 3, 4, 5]]).to(device)  # Example prompt
     generated = model.generate(prompt, max_length=20, temperature=0.8)
     print(f"Generated shape: {generated.shape}")
 

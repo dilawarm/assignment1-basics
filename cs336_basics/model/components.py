@@ -1,12 +1,10 @@
 """Core components for the transformer model."""
 
 import math
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 
 class RMSNorm(nn.Module):
@@ -75,13 +73,15 @@ class RotaryPositionEmbedding(nn.Module):
             pos = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
 
             # Compute frequencies (shape: [seq_len, dim/2])
-            freqs = torch.einsum("i,j->ij", pos, self.inv_freq)
+            # Ensure inv_freq is on the same device as pos
+            inv_freq = self.inv_freq.to(device)
+            freqs = torch.einsum("i,j->ij", pos, inv_freq)
 
             # Cache sin/cos (shape: [seq_len, dim/2])
             self._cos_cached = freqs.cos().to(dtype)
             self._sin_cached = freqs.sin().to(dtype)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, seq_dim: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, seq_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply rotary embeddings to query and key tensors.
 
         Args:

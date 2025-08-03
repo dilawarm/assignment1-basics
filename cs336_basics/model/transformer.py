@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
 from .attention import MultiHeadAttention
-from .components import RMSNorm, SwiGLU, scaled_init_
+from .components import RMSNorm, SwiGLU
 
 
 class TransformerBlock(nn.Module):
