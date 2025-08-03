@@ -46,7 +46,8 @@ class MultiHeadAttentionNativeFP8(nn.Module):
                 _ = torch.float8_e5m2
                 # Test scaled_mm
                 test_tensor = torch.randn(2, 2, device="cuda", dtype=torch.float8_e4m3fn)
-                _ = torch._scaled_mm(test_tensor, test_tensor)
+                scale = torch.tensor(1.0, device="cuda")
+                _ = torch._scaled_mm(test_tensor, test_tensor, scale_a=scale, scale_b=scale)
             except (AttributeError, RuntimeError, AssertionError) as e:
                 print(f"Warning: Native FP8 not available ({e}). Using standard layers.")
                 self.use_fp8 = False

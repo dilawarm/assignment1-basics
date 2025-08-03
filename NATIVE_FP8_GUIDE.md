@@ -16,7 +16,14 @@ This implementation uses **native PyTorch FP8** operations instead of NVIDIA Tra
 # Uses native PyTorch FP8 operations
 input_fp8 = input.to(torch.float8_e4m3fn)
 weight_fp8 = weight.to(torch.float8_e4m3fn)
-output = torch._scaled_mm(input_fp8, weight_fp8.t(), ...)
+# torch._scaled_mm requires scale factors
+output = torch._scaled_mm(
+    input_fp8, 
+    weight_fp8.t(), 
+    scale_a=input_scale,
+    scale_b=weight_scale,
+    out_dtype=torch.float32
+)
 ```
 
 ### Model Architecture
@@ -74,10 +81,22 @@ The script automatically checks for FP8 support:
   - Better for gradient accumulation
 
 ### Scaling
-The implementation uses scaling factors to prevent overflow/underflow:
+PyTorch's `torch._scaled_mm` requires explicit scaling factors to prevent overflow/underflow:
 ```python
-torch._scaled_mm(a, b, scale_a=scale_a, scale_b=scale_b)
+# Required signature for FP8 matrix multiplication
+result = torch._scaled_mm(
+    a_fp8,           # First matrix in FP8
+    b_fp8,           # Second matrix in FP8  
+    scale_a=scale_a, # Scale factor for first matrix (required)
+    scale_b=scale_b, # Scale factor for second matrix (required)
+    out_dtype=torch.float32  # Output dtype (optional)
+)
 ```
+
+The scale factors are crucial for FP8 computation as they:
+- Prevent overflow/underflow in the limited FP8 range
+- Allow gradual scaling adjustments during training
+- Enable mixed precision computation with FP32 accumulation
 
 ## Troubleshooting
 

@@ -136,7 +136,8 @@ class TransformerLM(nn.Module):
                 if torch.cuda.is_available():
                     test = torch.randn(2, 2, device="cuda")
                     test_fp8 = test.to(torch.float8_e4m3fn)
-                    _ = torch._scaled_mm(test_fp8, test_fp8)
+                    scale = torch.tensor(1.0, device="cuda")
+                    _ = torch._scaled_mm(test_fp8, test_fp8, scale_a=scale, scale_b=scale)
                     print("✓ Native PyTorch FP8 support detected")
             except (AttributeError, RuntimeError) as e:
                 print(f"Warning: Native FP8 not available: {e}")

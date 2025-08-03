@@ -138,7 +138,9 @@ def main():
                 if torch.cuda.is_available():
                     test = torch.randn(2, 2, device="cuda")
                     test_fp8 = test.to(torch.float8_e4m3fn)
-                    _ = torch._scaled_mm(test_fp8, test_fp8)
+                    # torch._scaled_mm requires scale factors
+                    scale = torch.tensor(1.0, device="cuda")
+                    _ = torch._scaled_mm(test_fp8, test_fp8, scale_a=scale, scale_b=scale)
                     print("✓ Native FP8 computation test passed")
                     fp8_status = "native"
                 else:

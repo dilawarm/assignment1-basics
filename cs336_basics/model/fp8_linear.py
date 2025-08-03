@@ -136,9 +136,13 @@ class FP8LinearFunction(torch.autograd.Function):
 
                 # Gradient w.r.t. input
                 weight_fp8 = weight.to(torch.float8_e5m2)
+                # Use scale of 1.0 for gradients (can be optimized later)
+                grad_scale = torch.tensor(1.0, device=grad_output.device)
                 grad_input = torch._scaled_mm(
                     grad_output_fp8,
                     weight_fp8,
+                    scale_a=grad_scale,
+                    scale_b=weight_scale,
                     out_dtype=torch.float32,
                 )
 
@@ -147,6 +151,8 @@ class FP8LinearFunction(torch.autograd.Function):
                 grad_weight = torch._scaled_mm(
                     grad_output_fp8.t(),
                     input_fp8,
+                    scale_a=grad_scale,
+                    scale_b=input_scale,
                     out_dtype=torch.float32,
                 )
 
