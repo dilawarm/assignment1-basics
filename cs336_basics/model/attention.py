@@ -108,20 +108,8 @@ class MultiHeadAttention(nn.Module):
         if self.use_fp8 and not x.is_contiguous():
             x = x.contiguous()
 
-        # QKV projection with error handling for FP8
-        try:
-            qkv = self.qkv_proj(x)
-        except RuntimeError as e:
-            if self.use_fp8 and "cuBLAS" in str(e):
-                print(f"Warning: Transformer Engine error: {e}")
-                print("Falling back to FP32 computation for this layer")
-                # Convert to standard linear temporarily
-                with torch.no_grad():
-                    weight = self.qkv_proj.weight.data.float()
-                    bias = self.qkv_proj.bias.data.float() if self.qkv_proj.bias is not None else None
-                qkv = F.linear(x.float(), weight, bias)
-            else:
-                raise
+        # QKV projection
+        qkv = self.qkv_proj(x)
 
         # Reshape to separate Q, K, V
         qkv = rearrange(qkv, "b s (three h d) -> three b s h d", three=3, h=self.n_heads, d=self.head_dim)

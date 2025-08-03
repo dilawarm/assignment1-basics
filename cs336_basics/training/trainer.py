@@ -142,20 +142,28 @@ class Trainer:
 
     def _setup_fp8(self):
         """Setup FP8 training with Transformer Engine."""
-        print("Setting up FP8 training with Transformer Engine...")
+        try:
+            print("Setting up FP8 training with Transformer Engine...")
 
-        # Create FP8 recipe for H100
-        fp8_recipe = recipe.DelayedScaling(
-            margin=0,
-            interval=1,
-            fp8_format=recipe.Format.HYBRID,  # E4M3 for forward, E5M2 for backward
-            amax_history_len=16,
-            amax_compute_algo="max",
-        )
+            # Create FP8 recipe for H100
+            fp8_recipe = recipe.DelayedScaling(
+                margin=0,
+                interval=1,
+                fp8_format=recipe.Format.HYBRID,  # E4M3 for forward, E5M2 for backward
+                amax_history_len=16,
+                amax_compute_algo="max",
+            )
 
-        # Wrap model with FP8 autocast
-        self.fp8_context = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
-        self.fp8_enabled = True
+            # Wrap model with FP8 autocast
+            self.fp8_context = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+            self.fp8_enabled = True
+            print("FP8 training enabled successfully")
+        except Exception as e:
+            print(f"\nERROR: Failed to setup FP8 training: {e}")
+            print("Falling back to FP16 mixed precision training")
+            self.fp8_enabled = False
+            self.config.use_fp8 = False
+            self.config.use_amp = True
 
     def _create_optimizer(self):
         """Create AdamW optimizer with weight decay."""

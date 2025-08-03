@@ -101,8 +101,19 @@ def main():
     gpu_name = torch.cuda.get_device_name(0)
     print(f"GPU: {gpu_name}")
 
+    # Check compute capability for FP8 support
+    major, minor = torch.cuda.get_device_capability()
+    compute_capability = major + minor / 10
+    print(f"Compute Capability: {compute_capability}")
+
     if "H100" not in gpu_name and "A100" not in gpu_name:
         print("WARNING: Not running on H100/A100. Performance will be suboptimal.")
+
+    # Disable FP8 if not supported
+    if compute_capability < 8.9 and args.use_fp8:
+        print("\nWARNING: FP8 requires compute capability >= 8.9 (H100 or newer)")
+        print("         Disabling FP8 and using FP16 mixed precision instead")
+        args.use_fp8 = False
 
     # Create model
     print("\nCreating model...")
