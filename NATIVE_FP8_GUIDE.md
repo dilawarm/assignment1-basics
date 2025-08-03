@@ -69,6 +69,13 @@ The script automatically checks for FP8 support:
 
 ## Technical Details
 
+### Dimension Requirements
+**Important**: PyTorch FP8 operations require matrix dimensions to be **multiples of 16** for efficient tensor core utilization. This is a hardware constraint on modern GPUs (H100, A100).
+
+- If dimensions are not aligned to 16, the FP8Linear layer automatically falls back to FP32
+- For optimal performance, design your model with dimensions that are multiples of 16
+- Common aligned dimensions: 1024, 2048, 4096, etc.
+
 ### FP8 Formats
 - **E4M3** (torch.float8_e4m3fn): Used for forward pass
   - 4-bit exponent, 3-bit mantissa

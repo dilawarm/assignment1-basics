@@ -61,8 +61,22 @@ class FP8Linear(nn.Module):
         if self.training and input.device.type == "cuda":
             # Use FP8 for computation
             try:
+                batch_shape = input.shape[:-1]
+                in_features = input.shape[-1]
+
+                # FP8 requires dimensions to be multiples of 16
+                # Pad if necessary
+                needs_padding = (in_features % 16 != 0) or (self.out_features % 16 != 0)
+
+                if needs_padding:
+                    # Fall back to standard computation for non-aligned dimensions
+                    return F.linear(input, self.weight, self.bias)
+
+                # Reshape for matrix multiplication
+                input_2d = input.view(-1, in_features)
+
                 # Cast input and weight to FP8
-                input_fp8 = input.to(self.fp8_e4m3)
+                input_fp8 = input_2d.to(self.fp8_e4m3)
                 weight_fp8 = self.weight.to(self.fp8_e4m3)
 
                 # Use torch._scaled_mm for FP8 matrix multiplication
@@ -78,6 +92,9 @@ class FP8Linear(nn.Module):
 
                 if self.bias is not None:
                     output = output + self.bias
+
+                # Reshape back to original batch dimensions
+                output = output.view(*batch_shape, self.out_features)
 
                 return output
 

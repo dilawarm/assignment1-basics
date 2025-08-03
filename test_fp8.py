@@ -37,9 +37,9 @@ def test_fp8_support():
 
     # Test FP8 operations
     try:
-        # Create test tensors
-        a = torch.randn(4, 4, device="cuda")
-        b = torch.randn(4, 4, device="cuda")
+        # Create test tensors with dimensions divisible by 16 (required for FP8)
+        a = torch.randn(16, 32, device="cuda")
+        b = torch.randn(32, 32, device="cuda")
 
         # Convert to FP8
         a_fp8 = a.to(torch.float8_e4m3fn)

@@ -29,7 +29,28 @@ in function cublas_gemm: cuBLAS Error: an unsupported value or parameter was pas
 
 This error is now avoided by using native PyTorch FP8 operations instead of Transformer Engine.
 
-### 3. Flash Attention Not Available
+### 3. FP8 Dimension Requirements
+
+**Error:**
+```
+Expected trailing dimension of mat1 to be divisible by 16 but got mat1 shape: (4x4).
+```
+
+**Cause:**
+PyTorch FP8 operations require matrix dimensions to be multiples of 16 for efficient tensor core utilization.
+
+**Solutions:**
+1. The model automatically handles this by:
+   - Padding vocabulary size from 50257 to 50272 (nearest multiple of 16)
+   - Falling back to FP32 for layers with incompatible dimensions
+
+2. For optimal FP8 performance, ensure your model dimensions are multiples of 16:
+   - Hidden size: 1024 ✓
+   - Head dimension: 64 ✓
+   - FFN size: 4096 ✓
+   - Batch size * sequence length: Should be multiple of 16
+
+### 4. Flash Attention Not Available
 
 **Error:**
 ```
@@ -48,7 +69,7 @@ Warning: Flash Attention not available. Using standard attention.
    python train_h100.py --no_flash_attn
    ```
 
-### 3. Out of Memory Errors
+### 5. Out of Memory Errors
 
 **Solutions:**
 1. Reduce batch size:
@@ -61,7 +82,7 @@ Warning: Flash Attention not available. Using standard attention.
    python train_h100.py --gradient_checkpointing
    ```
 
-### 4. Compilation Errors
+### 6. Compilation Errors
 
 **Error:**
 ```

@@ -144,8 +144,18 @@ class TransformerLM(nn.Module):
                 print("Falling back to FP32/FP16")
                 self.use_fp8 = False
 
+        # For FP8 efficiency, we need vocab_size to be divisible by 16
+        # If not, we'll pad the vocabulary
+        self.original_vocab_size = vocab_size
+        if vocab_size % 16 != 0:
+            self.vocab_size = ((vocab_size + 15) // 16) * 16
+            if self.use_fp8:
+                print(f"Padding vocabulary from {vocab_size} to {self.vocab_size} for FP8 alignment")
+        else:
+            self.vocab_size = vocab_size
+
         # Token embeddings
-        self.token_emb = nn.Embedding(vocab_size, dim)
+        self.token_emb = nn.Embedding(self.vocab_size, dim)
 
         # Transformer blocks
         self.blocks = nn.ModuleList(
@@ -173,9 +183,9 @@ class TransformerLM(nn.Module):
             self.lm_head = None
         else:
             if use_fp8 and torch.cuda.is_available():
-                self.lm_head = FP8Linear(dim, vocab_size, bias=False)
+                self.lm_head = FP8Linear(dim, self.vocab_size, bias=False)
             else:
-                self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+                self.lm_head = nn.Linear(dim, self.vocab_size, bias=False)
 
         # Initialize weights
         self._init_weights()
@@ -271,6 +281,10 @@ class TransformerLM(nn.Module):
         else:
             logits = self.lm_head(h)
 
+        # If we padded the vocabulary, slice to original size
+        if self.vocab_size != self.original_vocab_size:
+            logits = logits[..., : self.original_vocab_size]
+
         # Prepare output
         output = {"logits": logits}
 
@@ -280,7 +294,7 @@ class TransformerLM(nn.Module):
             shift_labels = labels[..., 1:].contiguous()
 
             loss = F.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
+                shift_logits.view(-1, self.original_vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
