@@ -136,7 +136,8 @@ def main():
 
                 # Test FP8 computation on GPU
                 if torch.cuda.is_available():
-                    test = torch.randn(2, 2, device="cuda")
+                    # FP8 requires dimensions divisible by 16
+                    test = torch.randn(16, 16, device="cuda")
                     test_fp8 = test.to(torch.float8_e4m3fn)
                     # torch._scaled_mm requires scale factors
                     scale = torch.tensor(1.0, device="cuda")
@@ -148,12 +149,23 @@ def main():
                     args.use_fp8 = False
                     fp8_status = "no-cuda"
 
-            except (AttributeError, RuntimeError) as e:
-                print(f"WARNING: PyTorch FP8 not available: {e}")
-                print("         Need PyTorch >= 2.1 with CUDA support")
+            except AttributeError as e:
+                # This means FP8 dtypes are not available in PyTorch
+                print(f"WARNING: PyTorch FP8 dtypes not available: {e}")
+                print("         Need PyTorch >= 2.1 for FP8 support")
                 print("         Falling back to FP16")
                 args.use_fp8 = False
                 fp8_status = "unavailable"
+            except RuntimeError as e:
+                # This usually means dimension requirements or other runtime issues
+                if "divisible by 16" in str(e):
+                    print(f"ERROR: FP8 dimension requirements not met: {e}")
+                    print("       This should not happen - please report this bug")
+                else:
+                    print(f"WARNING: FP8 operations failed: {e}")
+                print("         Falling back to FP16")
+                args.use_fp8 = False
+                fp8_status = "failed"
 
     # Adjust batch size recommendations based on configuration
     if "H100" in gpu_name and not args.use_fp8:
