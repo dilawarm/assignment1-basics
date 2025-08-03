@@ -114,10 +114,12 @@ class Trainer:
         if config.use_fp8:
             self._setup_fp8()
 
-        # Compile model if requested
-        if config.compile_model:
+        # Compile model if requested (but not with FP8 to avoid conflicts)
+        if config.compile_model and not self.fp8_enabled:
             print("Compiling model with torch.compile()...")
             self.model = torch.compile(self.model, mode="max-autotune")
+        elif config.compile_model and self.fp8_enabled:
+            print("Skipping torch.compile() due to FP8 mode (can cause conflicts)")
 
         # Setup optimizer
         self.optimizer = self._create_optimizer()
@@ -145,17 +147,29 @@ class Trainer:
         try:
             print("Setting up FP8 training with Transformer Engine...")
 
-            # Create FP8 recipe for H100
+            # Set environment variables for better compatibility
+            import os
+
+            os.environ["NVTE_FLASH_ATTN"] = "0"  # Disable TE's flash attention to avoid conflicts
+            os.environ["NVTE_FUSED_ATTN"] = "0"  # Disable fused attention
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"  # Avoid some H100 issues
+
+            # Create FP8 recipe for H100 with more conservative settings
             fp8_recipe = recipe.DelayedScaling(
                 margin=0,
                 interval=1,
-                fp8_format=recipe.Format.HYBRID,  # E4M3 for forward, E5M2 for backward
-                amax_history_len=16,
+                fp8_format=recipe.Format.E4M3,  # Use E4M3 only to avoid issues
+                amax_history_len=1024,  # Increased for stability
                 amax_compute_algo="max",
+                override_linear_precision=(False, False, False),  # Let TE decide precision
             )
 
             # Wrap model with FP8 autocast
-            self.fp8_context = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+            self.fp8_context = te.fp8_autocast(
+                enabled=True,
+                fp8_recipe=fp8_recipe,
+                calibrating=False,  # Start with calibration off
+            )
             self.fp8_enabled = True
             print("FP8 training enabled successfully")
         except Exception as e:
