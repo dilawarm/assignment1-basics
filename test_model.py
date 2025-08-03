@@ -31,10 +31,23 @@ def test_model():
         use_gradient_checkpointing=False,  # Disable for inference testing
     )
 
-    # Move model to GPU if available
+        # Move model to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-
+    
+    # Use appropriate precision for H100
+    if device.type == "cuda":
+        # Check if GPU supports bfloat16 (H100 does)
+        if torch.cuda.get_device_capability()[0] >= 8:
+            # Use bfloat16 for H100/A100
+            model = model.to(device).to(torch.bfloat16)
+            print("Using bfloat16 precision")
+        else:
+            # Use float16 for older GPUs
+            model = model.to(device).to(torch.float16)
+            print("Using float16 precision")
+    else:
+        model = model.to(device)
+    
     # Test forward pass
     batch_size = 2
     seq_len = 128

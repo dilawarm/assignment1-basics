@@ -5,20 +5,18 @@ import os
 import time
 from dataclasses import dataclass
 
-import pynvml
 import torch
 import torch.nn as nn
-
-# Try to import NVIDIA-specific libraries
-import transformer_engine.pytorch as te
 from torch.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformer_engine.common import recipe
-
 import wandb
 
+import transformer_engine.pytorch as te
+from transformer_engine.common import recipe
+
+import pynvml
 pynvml.nvmlInit()
 
 
@@ -91,8 +89,25 @@ class Trainer:
         if self.device.type != "cuda":
             print("Warning: CUDA not available, training will be slow!")
 
-        # Move model to device
+        # Move model to device and set appropriate dtype
         self.model = self.model.to(self.device)
+        
+        # Set model dtype for H100/A100
+        if self.device.type == "cuda":
+            # Check GPU capability
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:  # Ampere and newer (A100, H100)
+                # Use bfloat16 for better stability
+                self.model = self.model.to(torch.bfloat16)
+                self.dtype = torch.bfloat16
+                print(f"Using bfloat16 precision on {torch.cuda.get_device_name()}")
+            else:
+                # Use float16 for older GPUs
+                self.model = self.model.to(torch.float16)
+                self.dtype = torch.float16
+                print(f"Using float16 precision on {torch.cuda.get_device_name()}")
+        else:
+            self.dtype = torch.float32
 
         # Setup FP8 if available
         self.fp8_enabled = False
@@ -221,7 +236,7 @@ class Trainer:
             with self.fp8_context:
                 outputs = self.model(input_ids=input_ids, labels=labels)
         elif self.scaler is not None:
-            with torch.amp.autocast(device_type="cuda"):
+            with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
                 outputs = self.model(input_ids=input_ids, labels=labels)
         else:
             outputs = self.model(input_ids=input_ids, labels=labels)
