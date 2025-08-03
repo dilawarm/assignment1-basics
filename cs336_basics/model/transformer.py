@@ -217,6 +217,7 @@ class TransformerLM(nn.Module):
                     attention_mask,
                     use_cache,
                     past_kv,
+                    use_reentrant=False,
                 )
             else:
                 h, present_kv = block(h, attention_mask, use_cache, past_kv)

@@ -42,13 +42,25 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data workers")
 
     # Optimization arguments
-    parser.add_argument("--use_fp8", type=bool, default=True, help="Use FP8 precision")
-    parser.add_argument("--use_flash_attn", type=bool, default=True, help="Use Flash Attention")
-    parser.add_argument("--compile_model", type=bool, default=True, help="Compile model with torch.compile")
-    parser.add_argument("--gradient_checkpointing", type=bool, default=True, help="Use gradient checkpointing")
+    parser.add_argument("--use_fp8", action="store_true", default=True, help="Use FP8 precision")
+    parser.add_argument("--no_fp8", dest="use_fp8", action="store_false", help="Disable FP8 precision")
+    parser.add_argument("--use_flash_attn", action="store_true", default=True, help="Use Flash Attention")
+    parser.add_argument("--no_flash_attn", dest="use_flash_attn", action="store_false", help="Disable Flash Attention")
+    parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model with torch.compile")
+    parser.add_argument("--no_compile", dest="compile_model", action="store_false", help="Disable model compilation")
+    parser.add_argument(
+        "--gradient_checkpointing", action="store_true", default=True, help="Use gradient checkpointing"
+    )
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable gradient checkpointing",
+    )
 
     # Logging arguments
-    parser.add_argument("--use_wandb", type=bool, default=True, help="Use Weights & Biases logging")
+    parser.add_argument("--use_wandb", action="store_true", default=True, help="Use Weights & Biases logging")
+    parser.add_argument("--no_wandb", dest="use_wandb", action="store_false", help="Disable Weights & Biases logging")
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--eval_interval", type=int, default=1000, help="Evaluation interval")
     parser.add_argument("--log_interval", type=int, default=100, help="Logging interval")
