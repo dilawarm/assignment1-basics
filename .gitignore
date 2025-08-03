@@ -162,7 +162,7 @@ cython_debug/
 .ruff_cache/
 *.zip
 
-data/
+training_data/
 output/
 checkpoints/
 experiments/
