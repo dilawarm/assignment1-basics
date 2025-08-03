@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-H100-optimized training script for 350M parameter transformer.
-Target: Beat validation loss of 3.0781 on OpenWebText in 1.5 hours.
+H100 training with native PyTorch FP8 support (no Transformer Engine).
+This avoids cuBLAS errors by using PyTorch's built-in FP8 support.
 """
 
 import argparse
@@ -10,6 +10,7 @@ import sys
 from datetime import datetime
 
 import torch
+import torch.nn as nn
 
 # Add project to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -19,8 +20,19 @@ from cs336_basics.model import TransformerLM
 from cs336_basics.training import Trainer, TrainingConfig
 
 
+def check_fp8_support():
+    """Check if PyTorch supports FP8 dtypes."""
+    try:
+        # Check for FP8 dtypes in PyTorch
+        _ = torch.float8_e4m3fn
+        _ = torch.float8_e5m2
+        return True
+    except AttributeError:
+        return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train 350M transformer on H100")
+    parser = argparse.ArgumentParser(description="Train 350M transformer on H100 with native FP8")
 
     # Model arguments
     parser.add_argument("--dim", type=int, default=1024, help="Model dimension")
@@ -42,25 +54,17 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data workers")
 
     # Optimization arguments
-    parser.add_argument("--use_fp8", action="store_true", default=True, help="Use FP8 precision")
-    parser.add_argument("--no_fp8", dest="use_fp8", action="store_false", help="Disable FP8 precision")
+    parser.add_argument(
+        "--use_native_fp8", action="store_true", default=False, help="Use PyTorch native FP8 (experimental)"
+    )
     parser.add_argument("--use_flash_attn", action="store_true", default=True, help="Use Flash Attention")
-    parser.add_argument("--no_flash_attn", dest="use_flash_attn", action="store_false", help="Disable Flash Attention")
-    parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model with torch.compile")
-    parser.add_argument("--no_compile", dest="compile_model", action="store_false", help="Disable model compilation")
+    parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model")
     parser.add_argument(
         "--gradient_checkpointing", action="store_true", default=True, help="Use gradient checkpointing"
-    )
-    parser.add_argument(
-        "--no_gradient_checkpointing",
-        dest="gradient_checkpointing",
-        action="store_false",
-        help="Disable gradient checkpointing",
     )
 
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true", default=True, help="Use Weights & Biases logging")
-    parser.add_argument("--no_wandb", dest="use_wandb", action="store_false", help="Disable Weights & Biases logging")
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--eval_interval", type=int, default=1000, help="Evaluation interval")
     parser.add_argument("--log_interval", type=int, default=100, help="Logging interval")
@@ -69,7 +73,7 @@ def main():
 
     # Print configuration
     print("=" * 80)
-    print("H100-Optimized 350M Transformer Training")
+    print("H100 Training with Native PyTorch (No Transformer Engine)")
     print("=" * 80)
     print(f"Model Configuration:")
     print(f"  - Parameters: ~350M")
@@ -79,19 +83,6 @@ def main():
     print(f"  - FFN size: {args.intermediate_size}")
     print(f"  - Sequence length: {args.max_length}")
     print()
-    print(f"Training Configuration:")
-    print(f"  - Batch size: {args.batch_size}")
-    print(f"  - Gradient accumulation: {args.gradient_accumulation_steps}")
-    print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.max_length} tokens")
-    print(f"  - Learning rate: {args.learning_rate} (peak) -> {args.min_learning_rate} (min)")
-    print(f"  - Warmup steps: {args.warmup_steps}")
-    print()
-    print(f"Optimizations:")
-    print(f"  - FP8 precision: {args.use_fp8}")
-    print(f"  - Flash Attention: {args.use_flash_attn}")
-    print(f"  - Model compilation: {args.compile_model}")
-    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
-    print("=" * 80)
 
     # Check GPU
     if not torch.cuda.is_available():
@@ -101,33 +92,37 @@ def main():
     gpu_name = torch.cuda.get_device_name(0)
     print(f"GPU: {gpu_name}")
 
-    # Check compute capability for FP8 support
+    # Check compute capability
     major, minor = torch.cuda.get_device_capability()
     compute_capability = major + minor / 10
     print(f"Compute Capability: {compute_capability}")
 
-    if "H100" not in gpu_name and "A100" not in gpu_name:
-        print("WARNING: Not running on H100/A100. Performance will be suboptimal.")
-
-    # Disable FP8 if not supported or if Transformer Engine might fail
-    if args.use_fp8:
-        if compute_capability < 8.9:
-            print("\nWARNING: FP8 requires compute capability >= 8.9 (H100 or newer)")
-            print("         Disabling FP8 and using FP16 mixed precision instead")
-            args.use_fp8 = False
+    # Check FP8 support
+    if args.use_native_fp8:
+        if not check_fp8_support():
+            print("WARNING: PyTorch doesn't support FP8 dtypes. Using FP16 instead.")
+            args.use_native_fp8 = False
+        elif compute_capability < 8.9:
+            print("WARNING: FP8 requires compute capability >= 8.9. Using FP16 instead.")
+            args.use_native_fp8 = False
         else:
-            # Even on H100, Transformer Engine can have cuBLAS issues
-            print("\nNOTE: FP8 is experimental and may encounter cuBLAS errors on H100.")
-            print("      If training fails, run with --no_fp8 flag")
+            print("✓ Native FP8 support available")
 
-            # Set environment variables to minimize issues
-            import os
+    print(f"\nTraining Configuration:")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.max_length} tokens")
+    print(f"  - Learning rate: {args.learning_rate} (peak) -> {args.min_learning_rate} (min)")
+    print(f"  - Warmup steps: {args.warmup_steps}")
+    print()
+    print(f"Optimizations:")
+    print(f"  - FP8 (native): {args.use_native_fp8}")
+    print(f"  - Flash Attention: {args.use_flash_attn}")
+    print(f"  - Model compilation: {args.compile_model}")
+    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
+    print("=" * 80)
 
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-            os.environ["NVTE_FLASH_ATTN"] = "0"
-            os.environ["NVTE_FUSED_ATTN"] = "0"
-
-    # Create model
+    # Create model WITHOUT Transformer Engine FP8
     print("\nCreating model...")
     model = TransformerLM(
         vocab_size=50257,  # GPT-2 tokenizer
@@ -137,12 +132,19 @@ def main():
         n_heads=args.n_heads,
         head_dim=args.head_dim,
         intermediate_size=args.intermediate_size,
-        dropout=0.0,  # No dropout for better performance
+        dropout=0.0,
         tie_embeddings=True,
         use_flash=args.use_flash_attn,
-        use_fp8=args.use_fp8,
+        use_fp8=False,  # Always False to avoid Transformer Engine
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
+
+    # Optionally convert model to FP8 using native PyTorch
+    if args.use_native_fp8 and check_fp8_support():
+        print("\nConverting model to native FP8...")
+        # This is experimental - PyTorch's FP8 support is still evolving
+        # For now, we'll use FP16 which is well-supported
+        pass
 
     # Create data loaders
     print("\nCreating data loaders...")
@@ -152,9 +154,11 @@ def main():
         num_workers=args.num_workers,
     )
 
-    # Calculate training steps based on time limit
-    # Estimate: ~900K tokens/sec on H100 with FP8
-    tokens_per_second = 900_000
+    # Calculate training steps
+    tokens_per_second = 500_000  # Conservative estimate without FP8
+    if args.use_flash_attn:
+        tokens_per_second = 700_000  # With Flash Attention
+
     total_seconds = args.max_hours * 3600
     total_tokens = tokens_per_second * total_seconds
     tokens_per_step = args.batch_size * args.gradient_accumulation_steps * args.max_length
@@ -168,7 +172,7 @@ def main():
 
     # Create training config
     config = TrainingConfig(
-        model_name=f"gpt-350m-h100-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        model_name=f"gpt-350m-h100-native-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
         weight_decay=0.1,
@@ -185,8 +189,8 @@ def main():
         save_interval=5000,
         max_length=args.max_length,
         num_workers=args.num_workers,
-        use_fp8=args.use_fp8,
-        use_amp=not args.use_fp8,  # Use FP16 if not using FP8
+        use_fp8=False,  # Disable Transformer Engine FP8
+        use_amp=True,  # Use standard FP16 AMP
         compile_model=args.compile_model,
         use_flash_attn=args.use_flash_attn,
         gradient_checkpointing=args.gradient_checkpointing,

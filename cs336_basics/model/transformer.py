@@ -40,16 +40,38 @@ class TransformerBlock(nn.Module):
             self.norm2 = RMSNorm(dim)
 
         # Multi-head attention
-        self.attn = MultiHeadAttention(
-            dim=dim,
-            n_heads=n_heads,
-            head_dim=head_dim,
-            dropout=dropout,
-            use_flash=use_flash,
-            use_fp8=use_fp8,
-            layer_idx=layer_idx,
-            total_layers=total_layers,
-        )
+        # Use non-TE version if FP8 fails during initialization
+        try:
+            if use_fp8:
+                # Try to create with FP8 support
+                self.attn = MultiHeadAttention(
+                    dim=dim,
+                    n_heads=n_heads,
+                    head_dim=head_dim,
+                    dropout=dropout,
+                    use_flash=use_flash,
+                    use_fp8=use_fp8,
+                    layer_idx=layer_idx,
+                    total_layers=total_layers,
+                )
+            else:
+                raise RuntimeError("Not using FP8")
+        except (RuntimeError, ImportError) as e:
+            if use_fp8:
+                print(f"Warning: Failed to create FP8 attention layer {layer_idx}: {e}")
+                print("Falling back to standard attention without Transformer Engine")
+            # Import the non-TE version
+            from .attention_no_te import MultiHeadAttentionNoTE
+
+            self.attn = MultiHeadAttentionNoTE(
+                dim=dim,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                dropout=dropout,
+                use_flash=use_flash,
+                layer_idx=layer_idx,
+                total_layers=total_layers,
+            )
 
         # Feedforward with SwiGLU
         self.ffn = SwiGLU(dim, intermediate_size)
