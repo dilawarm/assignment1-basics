@@ -5,10 +5,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-
-from flash_attn import flash_attn_func
 import transformer_engine.pytorch as te
+from einops import rearrange
+from flash_attn import flash_attn_func
 
 from .components import RotaryPositionEmbedding, scaled_init_
 

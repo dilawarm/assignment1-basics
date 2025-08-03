@@ -5,18 +5,18 @@ import os
 import time
 from dataclasses import dataclass
 
+import pynvml
 import torch
 import torch.nn as nn
+import transformer_engine.pytorch as te
 from torch.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import wandb
-
-import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 
-import pynvml
+import wandb
+
 pynvml.nvmlInit()
 
 
@@ -91,7 +91,7 @@ class Trainer:
 
         # Move model to device and set appropriate dtype
         self.model = self.model.to(self.device)
-        
+
         # Set model dtype for H100/A100
         if self.device.type == "cuda":
             # Check GPU capability
