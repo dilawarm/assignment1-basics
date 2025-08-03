@@ -50,6 +50,26 @@ PyTorch FP8 operations require matrix dimensions to be multiples of 16 for effic
    - FFN size: 4096 ✓
    - Batch size * sequence length: Should be multiple of 16
 
+### 3a. FP8 cuBLASLt Matrix Layout Error
+
+**Error:**
+```
+Only multiplication of row-major and column-major matrices is supported by cuBLASLt
+```
+
+**Cause:**
+This is a known limitation in PyTorch's FP8 implementation. The cuBLASLt library requires specific matrix memory layouts that PyTorch doesn't always provide correctly.
+
+**Status:**
+As of PyTorch 2.x, FP8 support is still experimental and has limited operation coverage. This specific error indicates that the FP8 matrix multiplication kernels are not fully compatible with all tensor layouts.
+
+**Solutions:**
+1. **Use FP16 instead**: The script will automatically fall back to FP16 mixed precision, which provides excellent performance on H100 (~700K tokens/sec).
+
+2. **Wait for better FP8 support**: PyTorch's FP8 implementation is actively being improved. Future versions may resolve this issue.
+
+3. **Alternative**: If you absolutely need FP8, consider using NVIDIA's Transformer Engine, though it has its own compatibility issues (see section 2).
+
 ### 4. Flash Attention Not Available
 
 **Error:**

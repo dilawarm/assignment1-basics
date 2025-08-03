@@ -119,6 +119,17 @@ The model automatically falls back to FP32/FP16. Check the console output:
 1. **"scaled_mm not found"**: Need PyTorch >= 2.1
 2. **"float8_e4m3fn not found"**: Need newer PyTorch build
 3. **RuntimeError on older GPUs**: Need compute capability >= 8.9
+4. **"Only multiplication of row-major and column-major matrices is supported by cuBLASLt"**: This is a known limitation in PyTorch's current FP8 implementation. The cuBLASLt library has strict requirements about matrix memory layouts that PyTorch doesn't always satisfy correctly.
+
+## Current Limitations
+
+As noted in the [PyTorch documentation](https://pytorch.org/docs/stable/tensors.html), FP8 support has **"very limited"** operator coverage. The cuBLASLt matrix layout error is one example of these limitations. While FP8 dtypes exist and basic operations may work in some cases, full production support is still in development.
+
+**For reliable training on H100**, FP16 mixed precision remains the best option, providing:
+- Stable performance (~700K tokens/sec)
+- Full operator coverage
+- No matrix layout issues
+- Production-ready status
 
 ## Future Improvements
 

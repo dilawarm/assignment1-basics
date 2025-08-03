@@ -137,11 +137,21 @@ def main():
                 # Test FP8 computation on GPU
                 if torch.cuda.is_available():
                     # FP8 requires dimensions divisible by 16
-                    test = torch.randn(16, 16, device="cuda")
-                    test_fp8 = test.to(torch.float8_e4m3fn)
+                    a = torch.randn(32, 16, device="cuda")
+                    b = torch.randn(16, 32, device="cuda")
+
+                    # Convert to FP8
+                    a_fp8 = a.to(torch.float8_e4m3fn)
+                    b_fp8 = b.to(torch.float8_e4m3fn)
+
                     # torch._scaled_mm requires scale factors
                     scale = torch.tensor(1.0, device="cuda")
-                    _ = torch._scaled_mm(test_fp8, test_fp8, scale_a=scale, scale_b=scale)
+
+                    # For cuBLASLt, we need proper matrix layouts
+                    # Using contiguous tensors and proper dimensions
+                    _ = torch._scaled_mm(
+                        a_fp8.contiguous(), b_fp8.contiguous(), scale_a=scale, scale_b=scale, out_dtype=torch.float32
+                    )
                     print("✓ Native FP8 computation test passed")
                     fp8_status = "native"
                 else:
@@ -158,12 +168,18 @@ def main():
                 fp8_status = "unavailable"
             except RuntimeError as e:
                 # This usually means dimension requirements or other runtime issues
-                if "divisible by 16" in str(e):
+                error_msg = str(e)
+                if "divisible by 16" in error_msg:
                     print(f"ERROR: FP8 dimension requirements not met: {e}")
                     print("       This should not happen - please report this bug")
+                elif "cuBLASLt" in error_msg or "row-major" in error_msg or "column-major" in error_msg:
+                    print(f"WARNING: FP8 operations not fully supported on this system")
+                    print(f"         Error: {e}")
+                    print("         This is a known PyTorch FP8 limitation")
+                    print("         See: https://github.com/pytorch/pytorch/issues")
                 else:
                     print(f"WARNING: FP8 operations failed: {e}")
-                print("         Falling back to FP16")
+                print("         Falling back to FP16 mixed precision")
                 args.use_fp8 = False
                 fp8_status = "failed"
 

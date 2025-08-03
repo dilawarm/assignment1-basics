@@ -80,10 +80,14 @@ class FP8Linear(nn.Module):
                 weight_fp8 = self.weight.to(self.fp8_e4m3)
 
                 # Use torch._scaled_mm for FP8 matrix multiplication
-                # This is the native PyTorch FP8 matmul
+                # cuBLASLt requires specific matrix layouts
+                # We ensure contiguous memory layout
+                input_fp8_contig = input_fp8.contiguous()
+                weight_fp8_t = weight_fp8.t().contiguous()
+
                 output = torch._scaled_mm(
-                    input_fp8,
-                    weight_fp8.t(),
+                    input_fp8_contig,
+                    weight_fp8_t,
                     scale_a=self.input_scale,
                     scale_b=self.weight_scale,
                     scale_result=None,

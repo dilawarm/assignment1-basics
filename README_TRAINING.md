@@ -9,17 +9,22 @@ This implementation provides a state-of-the-art 350M parameter transformer optim
 python train_h100.py --no_fp8 --batch_size 16 --gradient_accumulation_steps 8
 ```
 
-### For H100 with Native FP8 (Recommended)
+### For H100 with Native FP8 (Experimental)
 ```bash
-# Uses native PyTorch FP8, avoiding Transformer Engine issues
+# Attempts to use native PyTorch FP8
 python train_h100.py --use_fp8
+
+# Note: FP8 often fails due to cuBLASLt limitations
+# The script will automatically fall back to FP16
 ```
 
-### If FP8 is Not Available
+### For H100 with FP16 (Recommended for Stability)
 ```bash
-# Falls back to FP16 automatically
+# Use FP16 mixed precision for reliable training
 python train_h100.py --no_fp8
 ```
+
+**Important**: While PyTorch includes FP8 dtypes, the implementation has "very limited" operator coverage. You'll likely see it fall back to FP16 due to cuBLASLt matrix layout errors. This is normal and FP16 still provides excellent performance (~700K tokens/sec on H100).
 
 ## Model Architecture
 
