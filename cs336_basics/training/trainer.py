@@ -8,12 +8,10 @@ from dataclasses import dataclass
 import pynvml
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformer_engine.common import recipe
 
 import wandb
 
@@ -112,14 +110,18 @@ class Trainer:
         # Setup FP8 if available
         self.fp8_enabled = False
         if config.use_fp8:
-            self._setup_fp8()
+            # Check if model has native FP8 support
+            if hasattr(self.model, "use_fp8") and self.model.use_fp8:
+                self.fp8_enabled = True
+                print("Native PyTorch FP8 mode enabled in model")
+            else:
+                print("Model does not support FP8 or FP8 is disabled")
 
-        # Compile model if requested (but not with FP8 to avoid conflicts)
-        if config.compile_model and not self.fp8_enabled:
+        # Compile model if requested
+        if config.compile_model:
             print("Compiling model with torch.compile()...")
-            self.model = torch.compile(self.model, mode="max-autotune")
-        elif config.compile_model and self.fp8_enabled:
-            print("Skipping torch.compile() due to FP8 mode (can cause conflicts)")
+            # Use reduce-overhead mode for better FP8 compatibility
+            self.model = torch.compile(self.model, mode="reduce-overhead")
 
         # Setup optimizer
         self.optimizer = self._create_optimizer()
@@ -143,41 +145,10 @@ class Trainer:
         os.makedirs(config.output_dir, exist_ok=True)
 
     def _setup_fp8(self):
-        """Setup FP8 training with Transformer Engine."""
-        try:
-            print("Setting up FP8 training with Transformer Engine...")
-
-            # Set environment variables for better compatibility
-            import os
-
-            os.environ["NVTE_FLASH_ATTN"] = "0"  # Disable TE's flash attention to avoid conflicts
-            os.environ["NVTE_FUSED_ATTN"] = "0"  # Disable fused attention
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"  # Avoid some H100 issues
-
-            # Create FP8 recipe for H100 with more conservative settings
-            fp8_recipe = recipe.DelayedScaling(
-                margin=0,
-                interval=1,
-                fp8_format=recipe.Format.E4M3,  # Use E4M3 only to avoid issues
-                amax_history_len=1024,  # Increased for stability
-                amax_compute_algo="max",
-                override_linear_precision=(False, False, False),  # Let TE decide precision
-            )
-
-            # Wrap model with FP8 autocast
-            self.fp8_context = te.fp8_autocast(
-                enabled=True,
-                fp8_recipe=fp8_recipe,
-                calibrating=False,  # Start with calibration off
-            )
-            self.fp8_enabled = True
-            print("FP8 training enabled successfully")
-        except Exception as e:
-            print(f"\nERROR: Failed to setup FP8 training: {e}")
-            print("Falling back to FP16 mixed precision training")
-            self.fp8_enabled = False
-            self.config.use_fp8 = False
-            self.config.use_amp = True
+        """FP8 setup is now handled by the model itself."""
+        # This method is kept for backward compatibility but is no longer used
+        # The model now handles FP8 internally using native PyTorch operations
+        pass
 
     def _create_optimizer(self):
         """Create AdamW optimizer with weight decay."""
@@ -254,13 +225,12 @@ class Trainer:
         labels = batch["labels"].to(self.device)
 
         # Forward pass with appropriate precision
-        if self.fp8_enabled:
-            with self.fp8_context:
-                outputs = self.model(input_ids=input_ids, labels=labels)
-        elif self.scaler is not None:
+        if self.scaler is not None and not self.fp8_enabled:
+            # Use AMP for FP16/BF16 (but not with FP8)
             with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
                 outputs = self.model(input_ids=input_ids, labels=labels)
         else:
+            # FP8 is handled internally by the model, or FP32
             outputs = self.model(input_ids=input_ids, labels=labels)
 
         loss = outputs["loss"]
@@ -289,11 +259,7 @@ class Trainer:
             labels = batch["labels"].to(self.device)
 
             # Forward pass
-            if self.fp8_enabled:
-                with self.fp8_context:
-                    outputs = self.model(input_ids=input_ids, labels=labels)
-            else:
-                outputs = self.model(input_ids=input_ids, labels=labels)
+            outputs = self.model(input_ids=input_ids, labels=labels)
 
             loss = outputs["loss"]
 

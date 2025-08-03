@@ -1,14 +1,14 @@
-"""Main transformer model implementation with FP8 support."""
+"""Transformer model with native PyTorch FP8 support (no Transformer Engine)."""
 
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te
 
-from .attention import MultiHeadAttention
+from .attention_native_fp8 import MultiHeadAttentionNativeFP8
 from .components import RMSNorm, SwiGLU
+from .fp8_linear import FP8Linear
 
 
 class TransformerBlock(nn.Module):
@@ -29,55 +29,52 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.layer_idx = layer_idx
+        self.use_fp8 = use_fp8
 
         # Layer normalization (RMSNorm is more efficient than LayerNorm)
-        if use_fp8:
-            # Use Transformer Engine's LayerNorm for FP8 compatibility
-            self.norm1 = te.LayerNorm(dim, eps=1e-8)
-            self.norm2 = te.LayerNorm(dim, eps=1e-8)
-        else:
-            self.norm1 = RMSNorm(dim)
-            self.norm2 = RMSNorm(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
 
-        # Multi-head attention
-        # Use non-TE version if FP8 fails during initialization
-        try:
-            if use_fp8:
-                # Try to create with FP8 support
-                self.attn = MultiHeadAttention(
-                    dim=dim,
-                    n_heads=n_heads,
-                    head_dim=head_dim,
-                    dropout=dropout,
-                    use_flash=use_flash,
-                    use_fp8=use_fp8,
-                    layer_idx=layer_idx,
-                    total_layers=total_layers,
-                )
-            else:
-                raise RuntimeError("Not using FP8")
-        except (RuntimeError, ImportError) as e:
-            if use_fp8:
-                print(f"Warning: Failed to create FP8 attention layer {layer_idx}: {e}")
-                print("Falling back to standard attention without Transformer Engine")
-            # Import the non-TE version
-            from .attention_no_te import MultiHeadAttentionNoTE
-
-            self.attn = MultiHeadAttentionNoTE(
-                dim=dim,
-                n_heads=n_heads,
-                head_dim=head_dim,
-                dropout=dropout,
-                use_flash=use_flash,
-                layer_idx=layer_idx,
-                total_layers=total_layers,
-            )
+        # Multi-head attention with native FP8
+        self.attn = MultiHeadAttentionNativeFP8(
+            dim=dim,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+            use_flash=use_flash,
+            use_fp8=use_fp8,
+            layer_idx=layer_idx,
+            total_layers=total_layers,
+        )
 
         # Feedforward with SwiGLU
-        self.ffn = SwiGLU(dim, intermediate_size)
+        if use_fp8 and torch.cuda.is_available():
+            # Create SwiGLU with FP8 linear layers
+            self.ffn = SwiGLU(dim, intermediate_size)
+            # Convert FFN to FP8
+            if hasattr(self.ffn, "w1") and isinstance(self.ffn.w1, nn.Linear):
+                self.ffn.w1 = self._convert_to_fp8_linear(self.ffn.w1)
+                self.ffn.w2 = self._convert_to_fp8_linear(self.ffn.w2)
+                self.ffn.w3 = self._convert_to_fp8_linear(self.ffn.w3)
+        else:
+            self.ffn = SwiGLU(dim, intermediate_size)
 
         # Dropout
         self.dropout = nn.Dropout(dropout)
+
+    def _convert_to_fp8_linear(self, linear: nn.Linear) -> FP8Linear:
+        """Convert a standard Linear layer to FP8Linear."""
+        fp8_linear = FP8Linear(
+            linear.in_features,
+            linear.out_features,
+            linear.bias is not None,
+            device=linear.weight.device,
+        )
+        with torch.no_grad():
+            fp8_linear.weight.copy_(linear.weight)
+            if linear.bias is not None:
+                fp8_linear.bias.copy_(linear.bias)
+        return fp8_linear
 
     def forward(
         self,
@@ -87,6 +84,7 @@ class TransformerBlock(nn.Module):
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Forward pass for transformer block."""
+        # type: ignore
         # Self-attention with residual
         residual = x
         x = self.norm1(x)
@@ -103,11 +101,11 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerLM(nn.Module):
-    """Transformer Language Model with exact 350M parameters."""
+    """Transformer Language Model with native PyTorch FP8."""
 
     def __init__(
         self,
-        vocab_size: int = 50257,  # GPT-2 tokenizer size
+        vocab_size: int = 50257,
         max_seq_len: int = 1024,
         dim: int = 1024,
         n_layers: int = 24,
@@ -127,6 +125,23 @@ class TransformerLM(nn.Module):
         self.n_layers = n_layers
         self.tie_embeddings = tie_embeddings
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_fp8 = use_fp8
+
+        # Check FP8 availability
+        if self.use_fp8:
+            try:
+                # Test FP8 support
+                _ = torch.float8_e4m3fn
+                _ = torch.float8_e5m2
+                if torch.cuda.is_available():
+                    test = torch.randn(2, 2, device="cuda")
+                    test_fp8 = test.to(torch.float8_e4m3fn)
+                    _ = torch._scaled_mm(test_fp8, test_fp8)
+                    print("✓ Native PyTorch FP8 support detected")
+            except (AttributeError, RuntimeError) as e:
+                print(f"Warning: Native FP8 not available: {e}")
+                print("Falling back to FP32/FP16")
+                self.use_fp8 = False
 
         # Token embeddings
         self.token_emb = nn.Embedding(vocab_size, dim)
@@ -150,17 +165,16 @@ class TransformerLM(nn.Module):
         )
 
         # Final layer norm
-        if use_fp8:
-            self.ln_f = te.LayerNorm(dim, eps=1e-8)
-        else:
-            self.ln_f = RMSNorm(dim)
+        self.ln_f = RMSNorm(dim)
 
         # Language modeling head
         if tie_embeddings:
-            # Share weights between input and output embeddings
             self.lm_head = None
         else:
-            self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+            if use_fp8 and torch.cuda.is_available():
+                self.lm_head = FP8Linear(dim, vocab_size, bias=False)
+            else:
+                self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
         # Initialize weights
         self._init_weights()
@@ -170,13 +184,10 @@ class TransformerLM(nn.Module):
 
     def _init_weights(self):
         """Initialize model weights with scaled initialization."""
-        # Token embeddings
         std = 0.02
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=std)
 
-        # LM head (if not tied)
         if self.lm_head is not None:
-            # Smaller initialization for output layer
             output_std = std / math.sqrt(2 * self.n_layers)
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=output_std)
 
@@ -186,6 +197,10 @@ class TransformerLM(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
         print(f"Trainable parameters: {trainable_params:,} ({trainable_params / 1e6:.1f}M)")
+        if self.use_fp8:
+            print("FP8 mode: ENABLED (Native PyTorch)")
+        else:
+            print("FP8 mode: DISABLED")
 
     def get_input_embeddings(self):
         return self.token_emb
@@ -239,7 +254,6 @@ class TransformerLM(nn.Module):
                     attention_mask,
                     use_cache,
                     past_kv,
-                    use_reentrant=False,
                 )
             else:
                 h, present_kv = block(h, attention_mask, use_cache, past_kv)
@@ -252,7 +266,6 @@ class TransformerLM(nn.Module):
 
         # Language modeling head
         if self.tie_embeddings:
-            # Use shared embeddings
             logits = F.linear(h, self.token_emb.weight)
         else:
             logits = self.lm_head(h)
@@ -262,11 +275,9 @@ class TransformerLM(nn.Module):
 
         # Calculate loss if labels provided
         if labels is not None:
-            # Shift for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            # Flatten for loss calculation
             loss = F.cross_entropy(
                 shift_logits.view(-1, self.vocab_size),
                 shift_labels.view(-1),
@@ -292,11 +303,9 @@ class TransformerLM(nn.Module):
         self.eval()
 
         for _ in range(max_length - input_ids.shape[1]):
-            # Forward pass
             outputs = self(input_ids)
             logits = outputs["logits"][:, -1, :] / temperature
 
-            # Apply top-k/top-p filtering
             if top_k is not None:
                 indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
                 logits[indices_to_remove] = float("-inf")
@@ -310,7 +319,6 @@ class TransformerLM(nn.Module):
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float("-inf")
 
-            # Sample
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_token], dim=1)

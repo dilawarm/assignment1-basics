@@ -1,19 +1,19 @@
-"""Attention module with Flash Attention 3 and FP8 support."""
+"""Attention module with native PyTorch FP8 support (no Transformer Engine)."""
 
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te
 from einops import rearrange
 from flash_attn import flash_attn_func
 
 from .components import RotaryPositionEmbedding, scaled_init_
+from .fp8_linear import FP8Linear
 
 
-class MultiHeadAttention(nn.Module):
-    """Multi-head attention with Flash Attention 3 and FP8 support."""
+class MultiHeadAttentionNativeFP8(nn.Module):
+    """Multi-head attention with native PyTorch FP8 support."""
 
     def __init__(
         self,
@@ -38,26 +38,23 @@ class MultiHeadAttention(nn.Module):
         self.layer_idx = layer_idx
         self.total_layers = total_layers
 
-        # Projections - use Transformer Engine layers for FP8 support
+        # Check if FP8 is available
         if self.use_fp8:
             try:
-                # Transformer Engine layers for FP8 support
-                self.qkv_proj = te.Linear(
-                    dim,
-                    3 * n_heads * head_dim,
-                    bias=bias,
-                )
-                self.o_proj = te.Linear(
-                    n_heads * head_dim,
-                    dim,
-                    bias=bias,
-                )
-            except Exception as e:
-                print(f"Warning: Failed to create Transformer Engine layers: {e}")
-                print("Falling back to standard PyTorch layers")
+                # Test FP8 dtypes
+                _ = torch.float8_e4m3fn
+                _ = torch.float8_e5m2
+                # Test scaled_mm
+                test_tensor = torch.randn(2, 2, device="cuda", dtype=torch.float8_e4m3fn)
+                _ = torch._scaled_mm(test_tensor, test_tensor)
+            except (AttributeError, RuntimeError, AssertionError) as e:
+                print(f"Warning: Native FP8 not available ({e}). Using standard layers.")
                 self.use_fp8 = False
-                self.qkv_proj = nn.Linear(dim, 3 * n_heads * head_dim, bias=bias)
-                self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=bias)
+
+        # Projections - use FP8Linear if requested and available
+        if self.use_fp8 and torch.cuda.is_available():
+            self.qkv_proj = FP8Linear(dim, 3 * n_heads * head_dim, bias=bias)
+            self.o_proj = FP8Linear(n_heads * head_dim, dim, bias=bias)
         else:
             self.qkv_proj = nn.Linear(dim, 3 * n_heads * head_dim, bias=bias)
             self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=bias)
@@ -104,10 +101,6 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size, seq_len, _ = x.shape
 
-        # Ensure input is contiguous for Transformer Engine
-        if self.use_fp8 and not x.is_contiguous():
-            x = x.contiguous()
-
         # QKV projection
         qkv = self.qkv_proj(x)
 
@@ -130,42 +123,41 @@ class MultiHeadAttention(nn.Module):
 
         # Apply attention
         if self.use_flash:
-            # Use Flash Attention 3
-            # Reshape for flash_attn_func: (batch, seq_len, n_heads, head_dim)
+            # Use Flash Attention
             q = rearrange(q, "b s h d -> b s h d")
             k = rearrange(k, "b s h d -> b s h d")
             v = rearrange(v, "b s h d -> b s h d")
 
-            # Flash attention expects dropout probability, not rate
-            attn_output = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout if self.training else 0.0,
-                softmax_scale=self.scale,
-                causal=True,  # Always use causal mask for autoregressive LM
-            )
+            # Flash attention with FP8 inputs if enabled
+            if self.use_fp8 and q.device.type == "cuda":
+                # Flash Attention can work with FP8 inputs on H100
+                # Note: Flash Attention internally handles mixed precision
+                attn_output = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+            else:
+                attn_output = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
 
-            # Reshape back
             attn_output = rearrange(attn_output, "b s h d -> b s (h d)")
         else:
             # Standard attention as fallback
             attn_output = self._standard_attention(q, k, v, attention_mask)
             attn_output = rearrange(attn_output, "b s h d -> b s (h d)")
 
-        # Output projection with error handling for FP8
-        try:
-            output = self.o_proj(attn_output)
-        except RuntimeError as e:
-            if self.use_fp8 and "cuBLAS" in str(e):
-                print(f"Warning: Transformer Engine error in output projection: {e}")
-                print("Falling back to FP32 computation")
-                with torch.no_grad():
-                    weight = self.o_proj.weight.data.float()
-                    bias = self.o_proj.bias.data.float() if self.o_proj.bias is not None else None
-                output = F.linear(attn_output.float(), weight, bias)
-            else:
-                raise
+        # Output projection
+        output = self.o_proj(attn_output)
 
         return output, present_key_value
 
@@ -181,12 +173,9 @@ class MultiHeadAttention(nn.Module):
         scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * self.scale
 
         # Apply causal mask
-        if attention_mask is None:
-            seq_len = q.shape[1]
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), diagonal=1)
-            scores.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
-        else:
-            scores.masked_fill_(attention_mask[None, None, :, :], float("-inf"))
+        seq_len = q.shape[1]
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), diagonal=1)
+        scores.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
 
         # Softmax
         attn_weights = F.softmax(scores, dim=-1)

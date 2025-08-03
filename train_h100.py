@@ -10,13 +10,10 @@ import sys
 from datetime import datetime
 
 # Set critical environment variables BEFORE importing torch
-# These help avoid cuBLAS errors on H100
+# These help with H100 performance and stability
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["NVTE_FLASH_ATTN"] = "0"
-os.environ["NVTE_FUSED_ATTN"] = "0"
-os.environ["NVTE_BIAS_GELU_NVFUSION"] = "0"
-os.environ["NVTE_MASKED_SOFTMAX_FUSION"] = "0"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 
 import torch
 
@@ -127,21 +124,34 @@ def main():
             args.use_fp8 = False
             fp8_status = "unsupported"
         else:
-            # Check if Transformer Engine is available
-            try:
-                import transformer_engine
+            # Using native PyTorch FP8 (no Transformer Engine required)
+            print("\n✓ Using native PyTorch FP8 support (no Transformer Engine)")
+            print("  This avoids cuBLAS compatibility issues with Transformer Engine")
 
-                print(f"\n✓ Transformer Engine version: {transformer_engine.__version__}")
-                fp8_status = "enabled"
-            except ImportError:
-                print("\nWARNING: Transformer Engine not installed. Disabling FP8.")
-                print("         Install with: pip install transformer-engine")
+            # Check PyTorch FP8 support
+            try:
+                _ = torch.float8_e4m3fn
+                _ = torch.float8_e5m2
+                print("✓ PyTorch FP8 dtypes available")
+
+                # Test FP8 computation on GPU
+                if torch.cuda.is_available():
+                    test = torch.randn(2, 2, device="cuda")
+                    test_fp8 = test.to(torch.float8_e4m3fn)
+                    _ = torch._scaled_mm(test_fp8, test_fp8)
+                    print("✓ Native FP8 computation test passed")
+                    fp8_status = "native"
+                else:
+                    print("WARNING: CUDA not available for FP8 test")
+                    args.use_fp8 = False
+                    fp8_status = "no-cuda"
+
+            except (AttributeError, RuntimeError) as e:
+                print(f"WARNING: PyTorch FP8 not available: {e}")
+                print("         Need PyTorch >= 2.1 with CUDA support")
+                print("         Falling back to FP16")
                 args.use_fp8 = False
                 fp8_status = "unavailable"
-
-            if args.use_fp8:
-                print("\nNOTE: FP8 is experimental and may encounter cuBLAS errors.")
-                print("      The model will automatically fall back to standard layers if needed.")
 
     # Adjust batch size recommendations based on configuration
     if "H100" in gpu_name and not args.use_fp8:

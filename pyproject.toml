@@ -23,7 +23,13 @@ dependencies = [
     "matplotlib>=3.10.3",
     "pynvml>=12.0.0",
     "accelerate>=0.24.0", # For mixed precision training
+    "datasets>=2.14.0", # For OpenWebText dataset
+    "transformers>=4.35.0", # For GPT-2 tokenizer
 ]
+
+[project.optional-dependencies]
+# Optional: Flash Attention for faster training (requires separate installation)
+flash = ["flash-attn>=2.0.0"]
 
 
 

@@ -2,49 +2,34 @@
 
 ## Common Errors and Solutions
 
-### 1. Transformer Engine / cuBLAS Error on H100
+### 1. Native PyTorch FP8 Support
 
-**Error:**
+**UPDATE:** The implementation now uses native PyTorch FP8 instead of Transformer Engine, avoiding cuBLAS compatibility issues!
+
+**Using FP8 on H100:**
+```bash
+python train_h100.py --use_fp8
+```
+
+**Requirements for FP8:**
+- PyTorch >= 2.1 (for torch.float8_e4m3fn and torch.float8_e5m2)
+- GPU compute capability >= 8.9 (H100, RTX 4090)
+- CUDA >= 11.8
+
+**If FP8 is not available:**
+The script automatically falls back to FP16 mixed precision, which still provides excellent performance (~700K tokens/sec on H100).
+
+### 2. Old Transformer Engine Error (No Longer Applies)
+
+The previous cuBLAS error with Transformer Engine:
 ```
 RuntimeError: /TransformerEngine/transformer_engine/common/gemm/cublaslt_gemm.cu:412 
 in function cublas_gemm: cuBLAS Error: an unsupported value or parameter was passed to the function
 ```
 
-**Cause:** 
-- Known compatibility issue between Transformer Engine and H100 GPUs
-- cuBLAS library conflicts with certain CUDA versions
-- This affects even H100s that should support FP8
+This error is now avoided by using native PyTorch FP8 operations instead of Transformer Engine.
 
-**Solutions:**
-
-1. **Recommended - Run without FP8:**
-   ```bash
-   python train_h100.py --no_fp8
-   ```
-   This uses Flash Attention + torch.compile for excellent performance.
-
-2. **Optimal H100 Settings (No FP8):**
-   ```bash
-   python train_h100.py --no_fp8 --batch_size 16 --gradient_accumulation_steps 8
-   ```
-   Maximizes H100 performance without FP8 issues.
-
-3. **If you want to try FP8 (experimental):**
-   ```bash
-   source setup_h100_env.sh
-   python train_h100.py --use_fp8
-   ```
-   Note: This may still fail due to cuBLAS compatibility issues.
-
-4. **Diagnose your GPU:**
-   ```bash
-   python diagnose_gpu.py
-   ```
-   Shows GPU capabilities and recommended settings.
-
-**Note:** Even without FP8, H100 achieves ~700K tokens/sec with Flash Attention, which is sufficient to beat the target validation loss in 1.5 hours.
-
-### 2. Flash Attention Not Available
+### 3. Flash Attention Not Available
 
 **Error:**
 ```
