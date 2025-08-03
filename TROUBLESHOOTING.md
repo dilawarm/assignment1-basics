@@ -17,27 +17,30 @@ in function cublas_gemm: cuBLAS Error: an unsupported value or parameter was pas
 
 **Solutions:**
 
-1. **Recommended - Use Optimal H100 Config (No FP8):**
-   ```bash
-   python train_h100_optimal.py
-   ```
-   This uses Flash Attention + torch.compile for excellent performance without FP8.
-
-2. **Quick Fix - Disable FP8:**
+1. **Recommended - Run without FP8:**
    ```bash
    python train_h100.py --no_fp8
    ```
+   This uses Flash Attention + torch.compile for excellent performance.
 
-3. **Alternative - Native PyTorch (No Transformer Engine):**
+2. **Optimal H100 Settings (No FP8):**
    ```bash
-   python train_h100_native_fp8.py
+   python train_h100.py --no_fp8 --batch_size 16 --gradient_accumulation_steps 8
    ```
+   Maximizes H100 performance without FP8 issues.
 
-4. **Set Environment Variables (if you must try FP8):**
+3. **If you want to try FP8 (experimental):**
    ```bash
    source setup_h100_env.sh
    python train_h100.py --use_fp8
    ```
+   Note: This may still fail due to cuBLAS compatibility issues.
+
+4. **Diagnose your GPU:**
+   ```bash
+   python diagnose_gpu.py
+   ```
+   Shows GPU capabilities and recommended settings.
 
 **Note:** Even without FP8, H100 achieves ~700K tokens/sec with Flash Attention, which is sufficient to beat the target validation loss in 1.5 hours.
 
@@ -90,6 +93,11 @@ python train_h100.py --no_compile
 
 ### NVIDIA H100 (80GB)
 ```bash
+# Recommended (avoid FP8 issues)
+python train_h100.py --no_fp8 --use_flash_attn --compile_model \
+    --batch_size 16 --gradient_accumulation_steps 8
+
+# Experimental FP8 (may fail)
 python train_h100.py --use_fp8 --use_flash_attn --compile_model \
     --batch_size 8 --gradient_accumulation_steps 16
 ```
@@ -108,10 +116,7 @@ python train_h100.py --no_fp8 --use_flash_attn --compile_model \
 
 ### Other GPUs
 ```bash
-# Use auto-detection
-python train_auto.py
-
-# Or conservative settings
+# Conservative settings
 python train_h100.py --no_fp8 --no_flash_attn --no_compile \
     --batch_size 1 --gradient_accumulation_steps 128
 ```
