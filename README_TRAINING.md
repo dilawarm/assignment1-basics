@@ -4,27 +4,41 @@ This implementation provides a state-of-the-art 350M parameter transformer optim
 
 ## Quick Start
 
-### For H100 GPUs (Recommended)
+### For H100 GPUs with TorchAO FP8 (BEST Option)
+```bash
+# Install TorchAO (one-time setup)
+pip install torchao
+
+# Run with FP8 - stable and ~1.5x faster than FP16
+python train_h100.py --use_fp8 --fp8_backend torchao
+```
+
+### For H100 with FP16 (Most Stable)
 ```bash
 python train_h100.py --no_fp8 --batch_size 16 --gradient_accumulation_steps 8
 ```
 
-### For H100 with Native FP8 (Experimental)
+### Alternative: Native FP8 (Limited Support)
 ```bash
 # Attempts to use native PyTorch FP8
-python train_h100.py --use_fp8
+python train_h100.py --use_fp8 --fp8_backend native
 
-# Note: FP8 often fails due to cuBLASLt limitations
-# The script will automatically fall back to FP16
+# Note: Often fails due to cuBLASLt limitations
+# Will automatically fall back to FP16
 ```
 
-### For H100 with FP16 (Recommended for Stability)
+### For H100 with FP16 (Most Stable)
 ```bash
 # Use FP16 mixed precision for reliable training
 python train_h100.py --no_fp8
 ```
 
-**Important**: While PyTorch includes FP8 dtypes, the implementation has "very limited" operator coverage. You'll likely see it fall back to FP16 due to cuBLASLt matrix layout errors. This is normal and FP16 still provides excellent performance (~700K tokens/sec on H100).
+**FP8 Options**:
+- **TorchAO** (recommended): PyTorch's official architecture optimization library with mature FP8 support
+- **Native**: Limited PyTorch FP8 using `torch._scaled_mm` (often fails)
+- **FP16**: Most stable fallback, still excellent performance (~700K tokens/sec)
+
+See [FP8_OPTIONS_GUIDE.md](FP8_OPTIONS_GUIDE.md) for detailed comparison of all FP8 alternatives.
 
 ## Model Architecture
 

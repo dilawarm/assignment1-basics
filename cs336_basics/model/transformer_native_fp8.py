@@ -1,4 +1,12 @@
-"""Transformer model with native PyTorch FP8 support (no Transformer Engine)."""
+"""Transformer model with native PyTorch FP8 support (no Transformer Engine).
+
+NOTE: This is kept for educational purposes and as a fallback option.
+For production use, we recommend TorchAO instead:
+    pip install torchao
+    python train_h100.py --use_fp8 --fp8_backend torchao
+
+TorchAO provides more stable and feature-complete FP8 training.
+"""
 
 import math
 

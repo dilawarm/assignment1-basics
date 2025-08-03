@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Quick test script to verify FP8 functionality."""
+"""Quick test script to verify native PyTorch FP8 functionality.
+
+NOTE: This tests native PyTorch FP8 which has limitations.
+For production use, we recommend TorchAO instead:
+    pip install torchao
+    python train_h100.py --use_fp8 --fp8_backend torchao
+"""
 
 import sys
 

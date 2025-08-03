@@ -2,21 +2,30 @@
 
 ## Common Errors and Solutions
 
-### 1. Native PyTorch FP8 Support
+### 1. FP8 Training Options
 
-**UPDATE:** The implementation now uses native PyTorch FP8 instead of Transformer Engine, avoiding cuBLAS compatibility issues!
-
-**Using FP8 on H100:**
+**Best Option - TorchAO FP8:**
 ```bash
-python train_h100.py --use_fp8
+# Install TorchAO
+pip install torchao
+
+# Use TorchAO backend (stable, ~1.5x speedup)
+python train_h100.py --use_fp8 --fp8_backend torchao
+```
+
+**Native PyTorch FP8 (often fails):**
+```bash
+# Try native FP8 (limited support, expect cuBLAS errors)
+python train_h100.py --use_fp8 --fp8_backend native
 ```
 
 **Requirements for FP8:**
 - PyTorch >= 2.1 (for torch.float8_e4m3fn and torch.float8_e5m2)
 - GPU compute capability >= 8.9 (H100, RTX 4090)
 - CUDA >= 11.8
+- TorchAO (recommended) or native PyTorch FP8 dtypes
 
-**If FP8 is not available:**
+**If FP8 fails:**
 The script automatically falls back to FP16 mixed precision, which still provides excellent performance (~700K tokens/sec on H100).
 
 ### 2. Old Transformer Engine Error (No Longer Applies)
@@ -64,11 +73,15 @@ This is a known limitation in PyTorch's FP8 implementation. The cuBLASLt library
 As of PyTorch 2.x, FP8 support is still experimental and has limited operation coverage. This specific error indicates that the FP8 matrix multiplication kernels are not fully compatible with all tensor layouts.
 
 **Solutions:**
-1. **Use FP16 instead**: The script will automatically fall back to FP16 mixed precision, which provides excellent performance on H100 (~700K tokens/sec).
+1. **Use TorchAO (RECOMMENDED)**: Install `pip install torchao` and run with:
+   ```bash
+   python train_h100.py --use_fp8 --fp8_backend torchao
+   ```
+   This avoids all the native FP8 issues and provides stable ~1.5x speedup.
 
-2. **Wait for better FP8 support**: PyTorch's FP8 implementation is actively being improved. Future versions may resolve this issue.
+2. **Use FP16 instead**: The script will automatically fall back to FP16 mixed precision, which provides excellent performance on H100 (~700K tokens/sec).
 
-3. **Alternative**: If you absolutely need FP8, consider using NVIDIA's Transformer Engine, though it has its own compatibility issues (see section 2).
+3. **Alternative**: If you can't use TorchAO, consider NVIDIA's Transformer Engine, though it has its own compatibility issues (see section 2).
 
 ### 4. Flash Attention Not Available
 

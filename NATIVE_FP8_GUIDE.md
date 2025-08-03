@@ -1,6 +1,17 @@
 # Native PyTorch FP8 Training Guide
 
-This implementation uses **native PyTorch FP8** operations instead of NVIDIA Transformer Engine, completely avoiding the cuBLAS compatibility issues you encountered.
+> **⚠️ RECOMMENDATION: Use TorchAO Instead!**  
+> Native PyTorch FP8 has significant limitations (see "Current Limitations" section).  
+> **For production use, we strongly recommend TorchAO:**
+> ```bash
+> pip install torchao
+> python train_h100.py --use_fp8 --fp8_backend torchao
+> ```
+> TorchAO provides stable FP8 training with ~1.5x speedup. See [FP8_OPTIONS_GUIDE.md](FP8_OPTIONS_GUIDE.md) for details.
+
+---
+
+This implementation uses **native PyTorch FP8** operations instead of NVIDIA Transformer Engine. While it avoids some cuBLAS compatibility issues, it has its own limitations and is kept here mainly for educational purposes.
 
 ## What Changed
 

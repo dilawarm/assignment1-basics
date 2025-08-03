@@ -50,6 +50,13 @@ def main():
     # Optimization arguments
     parser.add_argument("--use_fp8", action="store_true", default=True, help="Use FP8 precision")
     parser.add_argument("--no_fp8", dest="use_fp8", action="store_false", help="Disable FP8 precision")
+    parser.add_argument(
+        "--fp8_backend",
+        type=str,
+        default="native",
+        choices=["native", "torchao"],
+        help="FP8 backend: 'native' (limited) or 'torchao' (recommended)",
+    )
     parser.add_argument("--use_flash_attn", action="store_true", default=True, help="Use Flash Attention")
     parser.add_argument("--no_flash_attn", dest="use_flash_attn", action="store_false", help="Disable Flash Attention")
     parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model with torch.compile")
@@ -117,16 +124,34 @@ def main():
 
     # Handle FP8 support and potential issues
     fp8_status = "disabled"
+    torchao_available = False
+
     if args.use_fp8:
         if compute_capability < 8.9:
             print("\nWARNING: FP8 requires compute capability >= 8.9 (H100 or newer)")
             print("         Disabling FP8 and using FP16 mixed precision instead")
             args.use_fp8 = False
             fp8_status = "unsupported"
-        else:
+        elif args.fp8_backend == "torchao":
+            # Check TorchAO availability
+            try:
+                from torchao.float8 import convert_to_float8_training
+
+                torchao_available = True
+                print("\n✓ Using TorchAO Float8 (recommended)")
+                print("  More stable and feature-complete than native PyTorch FP8")
+                fp8_status = "torchao"
+            except ImportError:
+                print("\nWARNING: TorchAO not installed")
+                print("         Install with: pip install torchao")
+                print("         Falling back to native PyTorch FP8")
+                args.fp8_backend = "native"
+
+        if args.fp8_backend == "native" and args.use_fp8:
             # Using native PyTorch FP8 (no Transformer Engine required)
-            print("\n✓ Using native PyTorch FP8 support (no Transformer Engine)")
-            print("  This avoids cuBLAS compatibility issues with Transformer Engine")
+            print("\n✓ Attempting native PyTorch FP8 (limited support)")
+            print("  Note: This often fails due to cuBLAS limitations")
+            print("  Consider using --fp8_backend torchao instead")
 
             # Check PyTorch FP8 support
             try:
@@ -173,10 +198,14 @@ def main():
                     print(f"ERROR: FP8 dimension requirements not met: {e}")
                     print("       This should not happen - please report this bug")
                 elif "cuBLASLt" in error_msg or "row-major" in error_msg or "column-major" in error_msg:
-                    print(f"WARNING: FP8 operations not fully supported on this system")
+                    print(f"WARNING: Native PyTorch FP8 has limited support")
                     print(f"         Error: {e}")
-                    print("         This is a known PyTorch FP8 limitation")
-                    print("         See: https://github.com/pytorch/pytorch/issues")
+                    print("         This is a known limitation (see GitHub issue #123761)")
+                    print("\n         Alternatives for FP8 training:")
+                    print("         1. Use TorchAO: pip install torchao")
+                    print("            Then run: python train_h100.py --use_fp8 --fp8_backend torchao")
+                    print("         2. Use FP16 mixed precision (stable fallback)")
+                    print("         3. See FP8_OPTIONS_GUIDE.md for all options")
                 else:
                     print(f"WARNING: FP8 operations failed: {e}")
                 print("         Falling back to FP16 mixed precision")
@@ -192,6 +221,9 @@ def main():
 
     # Create model
     print("\nCreating model...")
+    # For TorchAO, we create the model without native FP8 support
+    use_native_fp8 = args.use_fp8 and args.fp8_backend == "native"
+
     model = TransformerLM(
         vocab_size=50257,  # GPT-2 tokenizer
         max_seq_len=args.max_length,
@@ -203,9 +235,31 @@ def main():
         dropout=0.0,  # No dropout for better performance
         tie_embeddings=True,
         use_flash=args.use_flash_attn,
-        use_fp8=args.use_fp8,
+        use_fp8=use_native_fp8,  # Only use native FP8 if not using TorchAO
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
+
+    # Convert to TorchAO Float8 if requested
+    if args.use_fp8 and args.fp8_backend == "torchao" and torchao_available:
+        print("\nConverting model to TorchAO Float8...")
+        from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType, convert_to_float8_training
+
+        # Configure float8 settings
+        config = Float8LinearConfig(
+            # Using DYNAMIC scaling for stability
+            # You can try DELAYED scaling for slightly better performance
+            cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
+            cast_config_input=CastConfig(scaling_type=ScalingType.DYNAMIC),
+            cast_config_grad_output=CastConfig(scaling_type=ScalingType.DYNAMIC),
+        )
+
+        # Convert model
+        convert_to_float8_training(model, config=config)
+        print("✓ Model converted to TorchAO Float8")
+
+        # Count Float8 modules
+        float8_count = sum(1 for _, m in model.named_modules() if "Float8" in m.__class__.__name__)
+        print(f"  Float8 modules: {float8_count}")
 
     # Create data loaders
     print("\nCreating data loaders...")

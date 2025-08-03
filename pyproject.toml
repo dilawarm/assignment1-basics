@@ -25,6 +25,7 @@ dependencies = [
     "accelerate>=0.24.0", # For mixed precision training
     "datasets>=2.14.0", # For OpenWebText dataset
     "transformers>=4.35.0", # For GPT-2 tokenizer
+    "torchao>=0.12.0",
 ]
 
 [project.optional-dependencies]
