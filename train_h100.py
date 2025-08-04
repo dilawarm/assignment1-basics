@@ -8,13 +8,30 @@ import os
 import sys
 from datetime import datetime
 
-from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType, convert_to_float8_training
-
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 
 import torch
+
+# Check for critical dependencies early
+try:
+    from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType, convert_to_float8_training
+
+    TORCHAO_AVAILABLE = True
+except ImportError:
+    TORCHAO_AVAILABLE = False
+    print("WARNING: TorchAO not installed - FP8 will not be available")
+    print("         Install with: pip install torchao")
+
+try:
+    import flash_attn
+
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    print("WARNING: Flash Attention not installed - performance will be limited")
+    print("         Install with: pip install flash-attn --no-build-isolation")
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -33,9 +50,9 @@ def main():
     parser.add_argument("--head_dim", type=int, default=64, help="Attention head dimension")
     parser.add_argument("--intermediate_size", type=int, default=4096, help="FFN intermediate size")
 
-    # Training arguments
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Gradient accumulation steps")
+    # Training arguments (optimized for H100)
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
     parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
@@ -55,9 +72,9 @@ def main():
     parser.add_argument(
         "--compile_mode",
         type=str,
-        default="max-autotune",
+        default="default",
         choices=["default", "reduce-overhead", "max-autotune"],
-        help="torch.compile mode (default: max-autotune)",
+        help="torch.compile mode (default: default - most stable)",
     )
     parser.add_argument(
         "--gradient_checkpointing", action="store_true", default=True, help="Use gradient checkpointing"
@@ -119,30 +136,25 @@ def main():
     if "H100" not in gpu_name and "A100" not in gpu_name:
         print("WARNING: Not running on H100/A100. Performance will be suboptimal.")
 
-    torchao_available = False
-
+    # Automatically adjust settings based on hardware and dependencies
     if args.use_fp8:
         if compute_capability < 8.9:
             print("\nWARNING: FP8 requires compute capability >= 8.9 (H100 or newer)")
-            print("         Disabling FP8 and using FP16 mixed precision instead")
+            print("         Disabling FP8 and using BF16 mixed precision instead")
+            args.use_fp8 = False
+        elif not TORCHAO_AVAILABLE:
+            print("\nWARNING: FP8 requested but TorchAO not installed")
+            print("         Disabling FP8 and using BF16 mixed precision instead")
             args.use_fp8 = False
         else:
-            try:
-                torchao_available = True
-                print("\n✓ Using TorchAO Float8")
-                print("  PyTorch's official FP8 solution for stable training")
-                print("  Expected speedup: ~1.5x over FP16")
-            except ImportError:
-                print("\nERROR: TorchAO not installed but required for FP8 training")
-                print("       Install with: pip install torchao")
-                print("       Falling back to FP16 mixed precision")
-                args.use_fp8 = False
+            print("\n✓ Using TorchAO Float8")
+            print("  PyTorch's official FP8 solution for stable training")
+            print("  Expected speedup: ~1.5x over FP16")
 
-    if "H100" in gpu_name and not args.use_fp8:
-        if args.batch_size == 8:
-            args.batch_size = 16
-            args.gradient_accumulation_steps = 8
-            print(f"\nOptimizing for H100: batch_size={args.batch_size}, grad_accum={args.gradient_accumulation_steps}")
+    if args.use_flash_attn and not FLASH_ATTN_AVAILABLE:
+        print("\nWARNING: Flash Attention requested but not installed")
+        print("         Disabling Flash Attention - performance will be limited")
+        args.use_flash_attn = False
 
     print("\nCreating model...")
     model = TransformerLM(
@@ -159,7 +171,11 @@ def main():
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
-    if args.use_fp8 and torchao_available:
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Model parameters: {total_params:.1f}M")
+
+    if args.use_fp8 and TORCHAO_AVAILABLE:
         print("\nConverting model to TorchAO Float8...")
         config = Float8LinearConfig(
             cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
@@ -242,6 +258,15 @@ def main():
     print("\nStarting training...")
     print("Target: Beat validation loss of 3.0781")
     print("Expected: Achieve validation loss of 2.90-2.95")
+    print("\nExpected Performance on H100:")
+    if args.use_fp8:
+        print("  - Tokens/sec: ~900,000 (with FP8)")
+    elif args.use_flash_attn:
+        print("  - Tokens/sec: ~700,000 (with BF16 + Flash Attention)")
+    else:
+        print("  - Tokens/sec: ~500,000 (with BF16)")
+    print("  - MFU: >40%")
+    print("\nIf you see <100,000 tokens/sec, something is wrong!")
     print("-" * 80)
 
     try:
@@ -270,7 +295,7 @@ def main():
         if args.compile_model:
             print(f"5. Try different compile mode: --compile_mode default (current: {args.compile_mode})")
 
-        if args.use_fp8 and not torchao_available:
+        if args.use_fp8 and not TORCHAO_AVAILABLE:
             print("\n6. Install TorchAO for FP8 support: pip install torchao")
 
         sys.exit(1)

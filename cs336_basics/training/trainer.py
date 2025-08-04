@@ -5,7 +5,6 @@ import os
 import time
 from dataclasses import dataclass
 
-import pynvml
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler
@@ -13,9 +12,20 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import wandb
+try:
+    import pynvml
 
-pynvml.nvmlInit()
+    pynvml.nvmlInit()
+    PYNVML_AVAILABLE = True
+except (ImportError, pynvml.NVMLError):
+    PYNVML_AVAILABLE = False
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 @dataclass
@@ -130,9 +140,9 @@ class Trainer:
         self.epoch = 0
         self.best_val_loss = float("inf")
 
-        if config.use_wandb:
+        if config.use_wandb and WANDB_AVAILABLE:
             self._setup_wandb()
-        elif config.use_wandb:
+        elif config.use_wandb and not WANDB_AVAILABLE:
             print("Warning: wandb requested but not available. Install with: pip install wandb")
 
         os.makedirs(config.output_dir, exist_ok=True)
@@ -179,15 +189,19 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def _setup_wandb(self):
-        wandb.init(
-            project=self.config.project_name,
-            name=self.config.model_name,
-            config=self.config.__dict__,
-        )
-        wandb.watch(self.model, log="all", log_freq=1000)
+        if WANDB_AVAILABLE:
+            wandb.init(
+                project=self.config.project_name,
+                name=self.config.model_name,
+                config=self.config.__dict__,
+            )
+            wandb.watch(self.model, log="all", log_freq=1000)
 
     def _get_gpu_stats(self) -> dict[str, float]:
         """Get GPU memory and utilization stats."""
+        if not PYNVML_AVAILABLE:
+            return {}
+
         try:
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -366,7 +380,7 @@ class Trainer:
 
                         log_metrics.update(self._get_gpu_stats())
 
-                        if self.config.use_wandb:
+                        if self.config.use_wandb and WANDB_AVAILABLE:
                             wandb.log(log_metrics)
 
                         print(
@@ -383,7 +397,7 @@ class Trainer:
                         print(f"Validation loss: {eval_metrics['val_loss']:.4f}")
                         print(f"Validation perplexity: {eval_metrics['val_perplexity']:.2f}")
 
-                        if self.config.use_wandb:
+                        if self.config.use_wandb and WANDB_AVAILABLE:
                             wandb.log(eval_metrics)
 
                         if eval_metrics["val_loss"] < self.best_val_loss:
@@ -405,7 +419,7 @@ class Trainer:
 
         self.save_checkpoint(os.path.join(self.config.output_dir, "final_model.pt"))
 
-        if self.config.use_wandb:
+        if self.config.use_wandb and WANDB_AVAILABLE:
             wandb.finish()
 
         return final_metrics
