@@ -53,6 +53,13 @@ def main():
     parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model with torch.compile")
     parser.add_argument("--no_compile", dest="compile_model", action="store_false", help="Disable model compilation")
     parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="max-autotune",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode (default: max-autotune)",
+    )
+    parser.add_argument(
         "--gradient_checkpointing", action="store_true", default=True, help="Use gradient checkpointing"
     )
     parser.add_argument(
@@ -93,6 +100,8 @@ def main():
     print(f"  - FP8 precision (TorchAO): {args.use_fp8}")
     print(f"  - Flash Attention: {args.use_flash_attn}")
     print(f"  - Model compilation: {args.compile_model}")
+    if args.compile_model:
+        print(f"  - Compile mode: {args.compile_mode}")
     print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
     print("=" * 80)
 
@@ -215,6 +224,7 @@ def main():
         use_fp8=args.use_fp8,
         use_amp=not args.use_fp8,
         compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
         use_flash_attn=args.use_flash_attn,
         gradient_checkpointing=args.gradient_checkpointing,
         use_wandb=args.use_wandb,

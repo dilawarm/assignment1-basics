@@ -55,6 +55,7 @@ class TrainingConfig:
 
     # Hardware
     compile_model: bool = True
+    compile_mode: str = "max-autotune"  # Options: "default", "reduce-overhead", "max-autotune"
     use_flash_attn: bool = True
     gradient_checkpointing: bool = True
 
@@ -111,8 +112,13 @@ class Trainer:
                 print("FP8 not enabled - install TorchAO and convert model")
 
         if config.compile_model:
-            print("Compiling model with torch.compile()...")
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            print(f"Compiling model with torch.compile(mode='{config.compile_mode}')...")
+            self.model = torch.compile(self.model, mode=config.compile_mode)
+            self.use_cuda_graphs = config.compile_mode == "reduce-overhead"
+            if self.use_cuda_graphs:
+                print("  Note: Using CUDA graphs with reduce-overhead mode")
+        else:
+            self.use_cuda_graphs = False
 
         self.optimizer = self._create_optimizer()
 
@@ -197,6 +203,9 @@ class Trainer:
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         """Single training step."""
+        if self.use_cuda_graphs:
+            torch.compiler.cudagraph_mark_step_begin()
+
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
 
@@ -226,6 +235,9 @@ class Trainer:
         total_tokens = 0
 
         for batch in tqdm(self.val_dataloader, desc="Evaluating"):
+            if self.use_cuda_graphs:
+                torch.compiler.cudagraph_mark_step_begin()
+
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
 
