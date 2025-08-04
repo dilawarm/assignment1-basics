@@ -77,7 +77,10 @@ def main():
         help="torch.compile mode (default: default - most stable)",
     )
     parser.add_argument(
-        "--gradient_checkpointing", action="store_true", default=True, help="Use gradient checkpointing"
+        "--gradient_checkpointing",
+        action="store_true",
+        default=False,  # Changed default to False for better H100 performance
+        help="Use gradient checkpointing (saves memory but ~3x slower - not needed on H100 80GB)",
     )
     parser.add_argument(
         "--no_gradient_checkpointing",
@@ -92,6 +95,9 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--eval_interval", type=int, default=1000, help="Evaluation interval")
     parser.add_argument("--log_interval", type=int, default=100, help="Logging interval")
+
+    # Debugging arguments
+    parser.add_argument("--debug_performance", action="store_true", help="Enable performance debugging")
 
     args = parser.parse_args()
 
@@ -119,7 +125,11 @@ def main():
     print(f"  - Model compilation: {args.compile_model}")
     if args.compile_model:
         print(f"  - Compile mode: {args.compile_mode}")
-    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
+    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}", end="")
+    if args.gradient_checkpointing:
+        print(" (⚠️  ~3x slowdown!)")
+    else:
+        print(" (✓ optimal for H100)")
     print("=" * 80)
 
     if not torch.cuda.is_available():
@@ -156,6 +166,12 @@ def main():
         print("         Disabling Flash Attention - performance will be limited")
         args.use_flash_attn = False
 
+    # Warn about gradient checkpointing on H100
+    if "H100" in gpu_name and args.gradient_checkpointing:
+        print("\n⚠️  WARNING: Gradient checkpointing is enabled on H100!")
+        print("   This will reduce performance by ~3x and is unnecessary with 80GB memory.")
+        print("   Consider running with --no_gradient_checkpointing for better performance.")
+
     print("\nCreating model...")
     model = TransformerLM(
         vocab_size=50257,
@@ -177,17 +193,35 @@ def main():
 
     if args.use_fp8 and TORCHAO_AVAILABLE:
         print("\nConverting model to TorchAO Float8...")
-        config = Float8LinearConfig(
-            cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
-            cast_config_input=CastConfig(scaling_type=ScalingType.DYNAMIC),
-            cast_config_grad_output=CastConfig(scaling_type=ScalingType.DYNAMIC),
-        )
+        try:
+            # Move model to CUDA and BF16 BEFORE FP8 conversion
+            model = model.cuda().to(torch.bfloat16)
 
-        convert_to_float8_training(model, config=config)
-        print("✓ Model converted to TorchAO Float8")
+            config = Float8LinearConfig(
+                cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
+                cast_config_input=CastConfig(scaling_type=ScalingType.DYNAMIC),
+                cast_config_grad_output=CastConfig(scaling_type=ScalingType.DYNAMIC),
+            )
 
-        float8_count = sum(1 for _, m in model.named_modules() if "Float8" in m.__class__.__name__)
-        print(f"  Float8 modules: {float8_count}")
+            convert_to_float8_training(model, config=config)
+            print("✓ Model converted to TorchAO Float8")
+
+            float8_count = sum(1 for _, m in model.named_modules() if "Float8" in m.__class__.__name__)
+            print(f"  Float8 modules: {float8_count}")
+
+            if float8_count == 0:
+                print("❌ WARNING: No Float8 modules found! FP8 conversion may have failed.")
+                print("   Falling back to BF16...")
+                args.use_fp8 = False
+        except Exception as e:
+            print(f"❌ FP8 conversion failed: {e}")
+            print("   Falling back to BF16...")
+            args.use_fp8 = False
+            # Ensure model is on CUDA with BF16
+            model = model.cuda().to(torch.bfloat16)
+    else:
+        # Move model to CUDA and BF16 if not using FP8
+        model = model.cuda().to(torch.bfloat16)
 
     print("\nCreating data loaders...")
     train_dataloader, val_dataloader = create_dataloaders(
@@ -255,17 +289,63 @@ def main():
         config=config,
     )
 
+    # Quick performance test if debugging is enabled
+    if args.debug_performance:
+        print("\nRunning quick performance test...")
+        with torch.no_grad():
+            test_input = torch.randint(0, 50257, (args.batch_size, args.max_length)).cuda()
+
+            # Warmup
+            for _ in range(3):
+                _ = model(test_input)
+            torch.cuda.synchronize()
+
+            # Test
+            import time
+
+            start = time.time()
+            num_test_iters = 10
+            for _ in range(num_test_iters):
+                _ = model(test_input)
+            torch.cuda.synchronize()
+            end = time.time()
+
+            test_tokens = args.batch_size * args.max_length * num_test_iters
+            test_tokens_per_sec = test_tokens / (end - start)
+            print(f"  Forward pass only: {test_tokens_per_sec:,.0f} tokens/sec")
+            print(f"  Time per iteration: {(end - start) / num_test_iters:.3f} seconds")
+
     print("\nStarting training...")
     print("Target: Beat validation loss of 3.0781")
     print("Expected: Achieve validation loss of 2.90-2.95")
+
+    # Print actual configuration status
+    print("\nActual Configuration:")
+    print(f"  - Model on CUDA: {next(model.parameters()).is_cuda}")
+    print(f"  - Model dtype: {next(model.parameters()).dtype}")
+    print(f"  - FP8 enabled: {args.use_fp8}")
+    print(f"  - Flash Attention: {args.use_flash_attn}")
+    print(f"  - Model compilation: {args.compile_model}")
+    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
+
     print("\nExpected Performance on H100:")
+    expected_tokens_sec = 0
     if args.use_fp8:
+        expected_tokens_sec = 900_000
         print("  - Tokens/sec: ~900,000 (with FP8)")
     elif args.use_flash_attn:
+        expected_tokens_sec = 700_000
         print("  - Tokens/sec: ~700,000 (with BF16 + Flash Attention)")
     else:
+        expected_tokens_sec = 500_000
         print("  - Tokens/sec: ~500,000 (with BF16)")
-    print("  - MFU: >40%")
+
+    if args.gradient_checkpointing and expected_tokens_sec > 0:
+        expected_tokens_sec = expected_tokens_sec // 3  # Gradient checkpointing causes ~3x slowdown
+        print(f"  - ⚠️  WITH gradient checkpointing: ~{expected_tokens_sec:,} tokens/sec")
+
+    expected_mfu = 40 if not args.gradient_checkpointing else 15
+    print(f"  - MFU: >{expected_mfu}%")
     print("\nIf you see <100,000 tokens/sec, something is wrong!")
     print("-" * 80)
 
