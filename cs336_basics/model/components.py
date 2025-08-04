@@ -18,10 +18,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = x.pow(2).mean(-1, keepdim=True).sqrt()
-        return x / (norm + self.eps) * self.weight
+        norm_sq = x.pow(2).mean(-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_sq + self.eps)
+        return x_normed * self.weight
 
 
 class SwiGLU(nn.Module):

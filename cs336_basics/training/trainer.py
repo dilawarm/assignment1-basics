@@ -340,11 +340,27 @@ class Trainer:
                         elapsed_time = time.time() - start_time
                         tokens_per_sec = tokens_processed / elapsed_time
 
+                        # Calculate MFU (Model FLOPs Utilization) for performance monitoring
+                        model_params = sum(p.numel() for p in self.model.parameters()) / 1e6  # in millions
+                        flops_per_token = 6 * model_params * 1e6  # 6N FLOPs per token (approximate)
+                        flops_per_second = tokens_per_sec * flops_per_token
+                        tflops = flops_per_second / 1e12
+
+                        # MFU calculation (H100 BF16 peak: ~990 TFLOPS without sparsity)
+                        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
+                        if "H100" in gpu_name:
+                            h100_tflops_peak = 990  # Conservative H100 BF16 estimate
+                            mfu = (tflops / h100_tflops_peak) * 100
+                        else:
+                            mfu = 0  # MFU only meaningful for known GPU specs
+
                         log_metrics = {
                             "train_loss": metrics["loss"],
                             "learning_rate": self.scheduler.get_last_lr()[0],
                             "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                             "tokens_per_second": tokens_per_sec,
+                            "tflops": tflops,
+                            "mfu_percent": mfu,
                             "global_step": self.global_step,
                         }
 
@@ -356,7 +372,8 @@ class Trainer:
                         print(
                             f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
                             f"lr={log_metrics['learning_rate']:.2e}, "
-                            f"tokens/sec={tokens_per_sec:.0f}"
+                            f"tokens/sec={tokens_per_sec:.0f}, "
+                            f"MFU={mfu:.1f}%"
                         )
 
                     if self.global_step % self.config.eval_interval == 0:
