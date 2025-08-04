@@ -14,6 +14,10 @@ def test_standard_model():
     """Test that the standard model works without FP8."""
     print("Testing standard TransformerLM...")
 
+    use_flash = torch.cuda.is_available()
+    if not use_flash:
+        print("  Note: Running on CPU, Flash Attention disabled")
+
     model = TransformerLM(
         vocab_size=1000,
         max_seq_len=128,
@@ -22,11 +26,18 @@ def test_standard_model():
         n_heads=4,
         head_dim=64,
         intermediate_size=1024,
+        use_flash=use_flash,
     )
+
+    if torch.cuda.is_available():
+        model = model.cuda()
+        device = "cuda"
+    else:
+        device = "cpu"
 
     batch_size = 2
     seq_len = 64
-    input_ids = torch.randint(0, 1000, (batch_size, seq_len))
+    input_ids = torch.randint(0, 1000, (batch_size, seq_len), device=device)
 
     outputs = model(input_ids)
     print(f"✓ Model output shape: {outputs['logits'].shape}")
@@ -55,6 +66,7 @@ def test_torchao_conversion():
         n_heads=4,
         head_dim=64,
         intermediate_size=1024,
+        use_flash=True,
     )
 
     if not torch.cuda.is_available():
