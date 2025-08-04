@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -97,18 +97,25 @@ class Trainer:
         if self.device.type != "cuda":
             print("Warning: CUDA not available, training will be slow!")
 
-        self.model = self.model.to(self.device)
+        if not next(self.model.parameters()).is_cuda:
+            self.model = self.model.to(self.device)
 
         if self.device.type == "cuda":
             capability = torch.cuda.get_device_capability()
-            if capability[0] >= 8:
-                self.model = self.model.to(torch.bfloat16)
-                self.dtype = torch.bfloat16
-                print(f"Using bfloat16 precision on {torch.cuda.get_device_name()}")
+            has_float8 = any("Float8" in module.__class__.__name__ for _, module in self.model.named_modules())
+
+            if not has_float8:
+                if capability[0] >= 8:
+                    self.model = self.model.to(torch.bfloat16)
+                    self.dtype = torch.bfloat16
+                    print(f"Using bfloat16 precision on {torch.cuda.get_device_name()}")
+                else:
+                    self.model = self.model.to(torch.float16)
+                    self.dtype = torch.float16
+                    print(f"Using float16 precision on {torch.cuda.get_device_name()}")
             else:
-                self.model = self.model.to(torch.float16)
-                self.dtype = torch.float16
-                print(f"Using float16 precision on {torch.cuda.get_device_name()}")
+                self.dtype = next(self.model.parameters()).dtype
+                print(f"Model already configured with FP8 (base dtype: {self.dtype})")
         else:
             self.dtype = torch.float32
 

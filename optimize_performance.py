@@ -216,6 +216,43 @@ def main():
         del model
         torch.cuda.empty_cache()
 
+    # Test 6: FP8 + Compilation (the key to FP8 performance!)
+    if TORCHAO_AVAILABLE:
+        print("\n6. Creating FP8 + Compiled model...")
+        model = (
+            TransformerLM(
+                **base_config,
+                use_flash=True,
+                use_gradient_checkpointing=False,
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
+
+        try:
+            config = Float8LinearConfig(
+                cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
+                cast_config_input=CastConfig(scaling_type=ScalingType.DYNAMIC),
+                cast_config_grad_output=CastConfig(scaling_type=ScalingType.DYNAMIC),
+            )
+            convert_to_float8_training(model, config=config)
+
+            # CRITICAL: Compile the FP8 model for performance!
+            model = torch.compile(model, mode="default")
+
+            float8_count = sum(1 for _, m in model.named_modules() if "Float8" in m.__class__.__name__)
+            print(f"  Float8 modules: {float8_count}")
+
+            if float8_count > 0:
+                results["FP8 + Flash + Compile"] = test_configuration("FP8 + Flash + Compile", model, args.batch_size)
+            else:
+                print("  FP8 conversion failed - no Float8 modules found")
+        except Exception as e:
+            print(f"  FP8 conversion failed: {e}")
+
+        del model
+        torch.cuda.empty_cache()
+
     # Summary
     print("\n" + "=" * 80)
     print("PERFORMANCE SUMMARY")
