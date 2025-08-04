@@ -267,9 +267,11 @@ def main():
         print("2. Try reducing batch size: --batch_size 4")
         print("3. Try without compilation: --no_compile")
         print("4. Try without FP8: --no_fp8")
+        if args.compile_model:
+            print(f"5. Try different compile mode: --compile_mode default (current: {args.compile_mode})")
 
         if args.use_fp8 and not torchao_available:
-            print("\n5. Install TorchAO for FP8 support: pip install torchao")
+            print("\n6. Install TorchAO for FP8 support: pip install torchao")
 
         sys.exit(1)
 
