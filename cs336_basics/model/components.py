@@ -19,9 +19,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Calculate RMS
         norm = x.pow(2).mean(-1, keepdim=True).sqrt()
-        # Normalize and scale
         return x / (norm + self.eps) * self.weight
 
 
@@ -38,7 +36,6 @@ class SwiGLU(nn.Module):
         self.w3 = nn.Linear(dim_hidden, dim_in, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # SwiGLU: (Swish(xW1) * xW2)W3
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
@@ -54,12 +51,9 @@ class RotaryPositionEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
         self.base = base
 
-        # Precompute frequencies (only for half the dimensions)
-        # RoPE is applied to pairs of dimensions
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
-        # Cache for sin/cos values
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
@@ -69,15 +63,11 @@ class RotaryPositionEmbedding(nn.Module):
         if seq_len > self._seq_len_cached:
             self._seq_len_cached = seq_len
 
-            # Create position indices
             pos = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
 
-            # Compute frequencies (shape: [seq_len, dim/2])
-            # Ensure inv_freq is on the same device as pos
             inv_freq = self.inv_freq.to(device)
             freqs = torch.einsum("i,j->ij", pos, inv_freq)
 
-            # Cache sin/cos (shape: [seq_len, dim/2])
             self._cos_cached = freqs.cos().to(dtype)
             self._sin_cached = freqs.sin().to(dtype)
 
@@ -95,11 +85,9 @@ class RotaryPositionEmbedding(nn.Module):
         seq_len = q.shape[seq_dim]
         self._update_cache(seq_len, q.device, q.dtype)
 
-        # Get cached sin/cos values
         cos = self._cos_cached[:seq_len]
         sin = self._sin_cached[:seq_len]
 
-        # Apply rotation
         q_rot = self._apply_rotation(q, cos, sin, seq_dim)
         k_rot = self._apply_rotation(k, cos, sin, seq_dim)
 
@@ -107,23 +95,15 @@ class RotaryPositionEmbedding(nn.Module):
 
     def _apply_rotation(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, seq_dim: int) -> torch.Tensor:
         """Apply the rotation to a tensor."""
-        # Reshape for rotation
         if seq_dim == 1:
-            # x shape: (..., seq_len, n_heads, head_dim)
-            # cos/sin shape: (seq_len, dim/2)
-            cos = cos[:, None, :]  # (seq_len, 1, dim/2)
+            cos = cos[:, None, :]
             sin = sin[:, None, :]
         elif seq_dim == 0:
-            # x shape: (seq_len, ..., n_heads, head_dim)
-            cos = cos[:, None, None, :]  # (seq_len, 1, 1, dim/2)
+            cos = cos[:, None, None, :]
             sin = sin[:, None, None, :]
 
-        # Split tensor for rotation
-        # x1, x2 shape: (..., seq_len, n_heads, head_dim/2)
         x1, x2 = x.chunk(2, dim=-1)
 
-        # Apply rotation: [cos, -sin; sin, cos] @ [x1; x2]
-        # Resulting shapes: (..., seq_len, n_heads, head_dim/2) each
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 

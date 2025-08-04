@@ -1,4 +1,4 @@
-"""H100-optimized trainer with FP8 support."""
+"""H100-optimized trainer with TorchAO FP8 support."""
 
 import math
 import os
@@ -14,8 +14,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
-
-pynvml.nvmlInit()
 
 
 @dataclass
@@ -36,7 +34,7 @@ class TrainingConfig:
 
     # Training
     batch_size: int = 8
-    gradient_accumulation_steps: int = 16  # Effective batch = 8 * 16 * 1024 = 131K tokens
+    gradient_accumulation_steps: int = 16
     max_steps: int | None = None
     warmup_steps: int = 2000
 
@@ -51,7 +49,7 @@ class TrainingConfig:
 
     # Precision
     use_fp8: bool = True
-    use_amp: bool = True  # FP16 mixed precision as fallback
+    use_amp: bool = True
 
     # Hardware
     compile_model: bool = True
@@ -68,7 +66,7 @@ class TrainingConfig:
 
 
 class Trainer:
-    """H100-optimized trainer with FP8 and Flash Attention support."""
+    """H100-optimized trainer with TorchAO FP8 and Flash Attention support."""
 
     def __init__(
         self,
@@ -82,77 +80,57 @@ class Trainer:
         self.val_dataloader = val_dataloader
         self.config = config
 
-        # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type != "cuda":
             print("Warning: CUDA not available, training will be slow!")
 
-        # Move model to device and set appropriate dtype
         self.model = self.model.to(self.device)
 
-        # Set model dtype for H100/A100
         if self.device.type == "cuda":
-            # Check GPU capability
             capability = torch.cuda.get_device_capability()
-            if capability[0] >= 8:  # Ampere and newer (A100, H100)
-                # Use bfloat16 for better stability
+            if capability[0] >= 8:
                 self.model = self.model.to(torch.bfloat16)
                 self.dtype = torch.bfloat16
                 print(f"Using bfloat16 precision on {torch.cuda.get_device_name()}")
             else:
-                # Use float16 for older GPUs
                 self.model = self.model.to(torch.float16)
                 self.dtype = torch.float16
                 print(f"Using float16 precision on {torch.cuda.get_device_name()}")
         else:
             self.dtype = torch.float32
 
-        # Setup FP8 if available
         self.fp8_enabled = False
         if config.use_fp8:
-            # Check if model has native FP8 support
-            if hasattr(self.model, "use_fp8") and self.model.use_fp8:
+            has_float8 = any("Float8" in module.__class__.__name__ for _, module in self.model.named_modules())
+            if has_float8:
                 self.fp8_enabled = True
-                print("Native PyTorch FP8 mode enabled in model")
+                print("TorchAO FP8 mode enabled - model contains Float8 modules")
             else:
-                print("Model does not support FP8 or FP8 is disabled")
+                print("FP8 not enabled - install TorchAO and convert model")
 
-        # Compile model if requested
         if config.compile_model:
             print("Compiling model with torch.compile()...")
-            # Use reduce-overhead mode for better FP8 compatibility
             self.model = torch.compile(self.model, mode="reduce-overhead")
 
-        # Setup optimizer
         self.optimizer = self._create_optimizer()
 
-        # Setup mixed precision
         self.scaler = GradScaler() if config.use_amp and not self.fp8_enabled else None
 
-        # Setup learning rate scheduler
         self.scheduler = self._create_scheduler()
 
-        # Training state
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float("inf")
 
-        # Setup logging
         if config.use_wandb:
             self._setup_wandb()
+        elif config.use_wandb:
+            print("Warning: wandb requested but not available. Install with: pip install wandb")
 
-        # Create output directory
         os.makedirs(config.output_dir, exist_ok=True)
-
-    def _setup_fp8(self):
-        """FP8 setup is now handled by the model itself."""
-        # This method is kept for backward compatibility but is no longer used
-        # The model now handles FP8 internally using native PyTorch operations
-        pass
 
     def _create_optimizer(self):
         """Create AdamW optimizer with weight decay."""
-        # Separate parameters for weight decay
         decay_params = []
         no_decay_params = []
 
@@ -173,7 +151,7 @@ class Trainer:
             lr=self.config.learning_rate,
             betas=(self.config.beta1, self.config.beta2),
             eps=self.config.eps,
-            fused=True,  # Use fused AdamW for better performance
+            fused=True,
         )
 
         return optimizer
@@ -182,11 +160,9 @@ class Trainer:
         """Create cosine learning rate scheduler with warmup."""
 
         def lr_lambda(step):
-            # Warmup
             if step < self.config.warmup_steps:
                 return step / self.config.warmup_steps
 
-            # Cosine decay
             progress = (step - self.config.warmup_steps) / max(1, self.config.max_steps - self.config.warmup_steps)
             return self.config.min_learning_rate / self.config.learning_rate + (
                 1 - self.config.min_learning_rate / self.config.learning_rate
@@ -195,7 +171,6 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def _setup_wandb(self):
-        """Setup Weights & Biases logging."""
         wandb.init(
             project=self.config.project_name,
             name=self.config.model_name,
@@ -220,25 +195,19 @@ class Trainer:
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         """Single training step."""
-        # Move batch to device
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
 
-        # Forward pass with appropriate precision
         if self.scaler is not None and not self.fp8_enabled:
-            # Use AMP for FP16/BF16 (but not with FP8)
             with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
                 outputs = self.model(input_ids=input_ids, labels=labels)
         else:
-            # FP8 is handled internally by the model, or FP32
             outputs = self.model(input_ids=input_ids, labels=labels)
 
         loss = outputs["loss"]
 
-        # Scale loss by gradient accumulation steps
         loss = loss / self.config.gradient_accumulation_steps
 
-        # Backward pass
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
         else:
@@ -258,7 +227,6 @@ class Trainer:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
 
-            # Forward pass
             outputs = self.model(input_ids=input_ids, labels=labels)
 
             loss = outputs["loss"]
@@ -314,10 +282,8 @@ class Trainer:
         if max_steps is not None:
             self.config.max_steps = max_steps
 
-        # Calculate total steps if not specified
         if self.config.max_steps is None:
             steps_per_epoch = len(self.train_dataloader) // self.config.gradient_accumulation_steps
-            # Train for 1.5 hours on H100 (~5B tokens at 900K tokens/sec)
             estimated_steps = int(
                 5e9 / (self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length)
             )
@@ -328,25 +294,20 @@ class Trainer:
             f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length} tokens"
         )
 
-        # Training loop
         self.model.train()
         start_time = time.time()
         tokens_processed = 0
 
         while self.global_step < self.config.max_steps:
             for batch_idx, batch in enumerate(self.train_dataloader):
-                # Training step
                 metrics = self.train_step(batch)
 
-                # Gradient accumulation
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Gradient clipping
                     if self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
 
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
-                    # Optimizer step
                     if self.scaler is not None:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -361,7 +322,6 @@ class Trainer:
                         self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length
                     )
 
-                    # Logging
                     if self.global_step % self.config.log_interval == 0:
                         elapsed_time = time.time() - start_time
                         tokens_per_sec = tokens_processed / elapsed_time
@@ -374,21 +334,17 @@ class Trainer:
                             "global_step": self.global_step,
                         }
 
-                        # Add GPU stats
                         log_metrics.update(self._get_gpu_stats())
 
-                        # Log to wandb
                         if self.config.use_wandb:
                             wandb.log(log_metrics)
 
-                        # Print progress
                         print(
                             f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
                             f"lr={log_metrics['learning_rate']:.2e}, "
                             f"tokens/sec={tokens_per_sec:.0f}"
                         )
 
-                    # Evaluation
                     if self.global_step % self.config.eval_interval == 0:
                         print("\nRunning evaluation...")
                         eval_metrics = self.evaluate()
@@ -396,35 +352,28 @@ class Trainer:
                         print(f"Validation loss: {eval_metrics['val_loss']:.4f}")
                         print(f"Validation perplexity: {eval_metrics['val_perplexity']:.2f}")
 
-                        # Log to wandb
                         if self.config.use_wandb:
                             wandb.log(eval_metrics)
 
-                        # Save best model
                         if eval_metrics["val_loss"] < self.best_val_loss:
                             self.best_val_loss = eval_metrics["val_loss"]
                             self.save_checkpoint(os.path.join(self.config.output_dir, "best_model.pt"))
 
-                    # Save checkpoint
                     if self.global_step % self.config.save_interval == 0:
                         self.save_checkpoint()
 
-                    # Check if done
                     if self.global_step >= self.config.max_steps:
                         break
 
             self.epoch += 1
 
-        # Final evaluation
         print("\nTraining complete! Running final evaluation...")
         final_metrics = self.evaluate()
         print(f"Final validation loss: {final_metrics['val_loss']:.4f}")
         print(f"Final validation perplexity: {final_metrics['val_perplexity']:.2f}")
 
-        # Save final model
         self.save_checkpoint(os.path.join(self.config.output_dir, "final_model.pt"))
 
-        # Close wandb
         if self.config.use_wandb:
             wandb.finish()
 

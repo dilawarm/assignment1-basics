@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 H100-optimized training script for 350M parameter transformer.
 Target: Beat validation loss of 3.0781 on OpenWebText in 1.5 hours.
@@ -9,15 +8,14 @@ import os
 import sys
 from datetime import datetime
 
-# Set critical environment variables BEFORE importing torch
-# These help with H100 performance and stability
+from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType, convert_to_float8_training
+
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 
 import torch
 
-# Add project to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from cs336_basics.data import create_dataloaders
@@ -48,15 +46,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data workers")
 
     # Optimization arguments
-    parser.add_argument("--use_fp8", action="store_true", default=True, help="Use FP8 precision")
+    parser.add_argument("--use_fp8", action="store_true", default=True, help="Use FP8 precision with TorchAO")
     parser.add_argument("--no_fp8", dest="use_fp8", action="store_false", help="Disable FP8 precision")
-    parser.add_argument(
-        "--fp8_backend",
-        type=str,
-        default="native",
-        choices=["native", "torchao"],
-        help="FP8 backend: 'native' (limited) or 'torchao' (recommended)",
-    )
     parser.add_argument("--use_flash_attn", action="store_true", default=True, help="Use Flash Attention")
     parser.add_argument("--no_flash_attn", dest="use_flash_attn", action="store_false", help="Disable Flash Attention")
     parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model with torch.compile")
@@ -80,7 +71,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Print configuration
     print("=" * 80)
     print("H100-Optimized 350M Transformer Training")
     print("=" * 80)
@@ -100,13 +90,12 @@ def main():
     print(f"  - Warmup steps: {args.warmup_steps}")
     print()
     print(f"Optimizations:")
-    print(f"  - FP8 precision: {args.use_fp8}")
+    print(f"  - FP8 precision (TorchAO): {args.use_fp8}")
     print(f"  - Flash Attention: {args.use_flash_attn}")
     print(f"  - Model compilation: {args.compile_model}")
     print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
     print("=" * 80)
 
-    # Check GPU
     if not torch.cuda.is_available():
         print("ERROR: CUDA not available!")
         sys.exit(1)
@@ -114,7 +103,6 @@ def main():
     gpu_name = torch.cuda.get_device_name(0)
     print(f"GPU: {gpu_name}")
 
-    # Check compute capability for FP8 support
     major, minor = torch.cuda.get_device_capability()
     compute_capability = major + minor / 10
     print(f"Compute Capability: {compute_capability}")
@@ -122,8 +110,6 @@ def main():
     if "H100" not in gpu_name and "A100" not in gpu_name:
         print("WARNING: Not running on H100/A100. Performance will be suboptimal.")
 
-    # Handle FP8 support and potential issues
-    fp8_status = "disabled"
     torchao_available = False
 
     if args.use_fp8:
@@ -131,137 +117,53 @@ def main():
             print("\nWARNING: FP8 requires compute capability >= 8.9 (H100 or newer)")
             print("         Disabling FP8 and using FP16 mixed precision instead")
             args.use_fp8 = False
-            fp8_status = "unsupported"
-        elif args.fp8_backend == "torchao":
-            # Check TorchAO availability
+        else:
             try:
-                from torchao.float8 import convert_to_float8_training
-
                 torchao_available = True
-                print("\n✓ Using TorchAO Float8 (recommended)")
-                print("  More stable and feature-complete than native PyTorch FP8")
-                fp8_status = "torchao"
+                print("\n✓ Using TorchAO Float8")
+                print("  PyTorch's official FP8 solution for stable training")
+                print("  Expected speedup: ~1.5x over FP16")
             except ImportError:
-                print("\nWARNING: TorchAO not installed")
-                print("         Install with: pip install torchao")
-                print("         Falling back to native PyTorch FP8")
-                args.fp8_backend = "native"
-
-        if args.fp8_backend == "native" and args.use_fp8:
-            # Using native PyTorch FP8 (no Transformer Engine required)
-            print("\n✓ Attempting native PyTorch FP8 (limited support)")
-            print("  Note: This often fails due to cuBLAS limitations")
-            print("  Consider using --fp8_backend torchao instead")
-
-            # Check PyTorch FP8 support
-            try:
-                _ = torch.float8_e4m3fn
-                _ = torch.float8_e5m2
-                print("✓ PyTorch FP8 dtypes available")
-
-                # Test FP8 computation on GPU
-                if torch.cuda.is_available():
-                    # FP8 requires dimensions divisible by 16
-                    a = torch.randn(32, 16, device="cuda")
-                    b = torch.randn(16, 32, device="cuda")
-
-                    # Convert to FP8
-                    a_fp8 = a.to(torch.float8_e4m3fn)
-                    b_fp8 = b.to(torch.float8_e4m3fn)
-
-                    # torch._scaled_mm requires scale factors
-                    scale = torch.tensor(1.0, device="cuda")
-
-                    # For cuBLASLt, we need proper matrix layouts
-                    # Using contiguous tensors and proper dimensions
-                    _ = torch._scaled_mm(
-                        a_fp8.contiguous(), b_fp8.contiguous(), scale_a=scale, scale_b=scale, out_dtype=torch.float32
-                    )
-                    print("✓ Native FP8 computation test passed")
-                    fp8_status = "native"
-                else:
-                    print("WARNING: CUDA not available for FP8 test")
-                    args.use_fp8 = False
-                    fp8_status = "no-cuda"
-
-            except AttributeError as e:
-                # This means FP8 dtypes are not available in PyTorch
-                print(f"WARNING: PyTorch FP8 dtypes not available: {e}")
-                print("         Need PyTorch >= 2.1 for FP8 support")
-                print("         Falling back to FP16")
+                print("\nERROR: TorchAO not installed but required for FP8 training")
+                print("       Install with: pip install torchao")
+                print("       Falling back to FP16 mixed precision")
                 args.use_fp8 = False
-                fp8_status = "unavailable"
-            except RuntimeError as e:
-                # This usually means dimension requirements or other runtime issues
-                error_msg = str(e)
-                if "divisible by 16" in error_msg:
-                    print(f"ERROR: FP8 dimension requirements not met: {e}")
-                    print("       This should not happen - please report this bug")
-                elif "cuBLASLt" in error_msg or "row-major" in error_msg or "column-major" in error_msg:
-                    print(f"WARNING: Native PyTorch FP8 has limited support")
-                    print(f"         Error: {e}")
-                    print("         This is a known limitation (see GitHub issue #123761)")
-                    print("\n         Alternatives for FP8 training:")
-                    print("         1. Use TorchAO: pip install torchao")
-                    print("            Then run: python train_h100.py --use_fp8 --fp8_backend torchao")
-                    print("         2. Use FP16 mixed precision (stable fallback)")
-                    print("         3. See FP8_OPTIONS_GUIDE.md for all options")
-                else:
-                    print(f"WARNING: FP8 operations failed: {e}")
-                print("         Falling back to FP16 mixed precision")
-                args.use_fp8 = False
-                fp8_status = "failed"
 
-    # Adjust batch size recommendations based on configuration
     if "H100" in gpu_name and not args.use_fp8:
-        if args.batch_size == 8:  # Default value
-            args.batch_size = 16  # H100 can handle larger batches without FP8
-            args.gradient_accumulation_steps = 8  # Adjust to maintain effective batch size
+        if args.batch_size == 8:
+            args.batch_size = 16
+            args.gradient_accumulation_steps = 8
             print(f"\nOptimizing for H100: batch_size={args.batch_size}, grad_accum={args.gradient_accumulation_steps}")
 
-    # Create model
     print("\nCreating model...")
-    # For TorchAO, we create the model without native FP8 support
-    use_native_fp8 = args.use_fp8 and args.fp8_backend == "native"
-
     model = TransformerLM(
-        vocab_size=50257,  # GPT-2 tokenizer
+        vocab_size=50257,
         max_seq_len=args.max_length,
         dim=args.dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         head_dim=args.head_dim,
         intermediate_size=args.intermediate_size,
-        dropout=0.0,  # No dropout for better performance
+        dropout=0.0,
         tie_embeddings=True,
         use_flash=args.use_flash_attn,
-        use_fp8=use_native_fp8,  # Only use native FP8 if not using TorchAO
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
-    # Convert to TorchAO Float8 if requested
-    if args.use_fp8 and args.fp8_backend == "torchao" and torchao_available:
+    if args.use_fp8 and torchao_available:
         print("\nConverting model to TorchAO Float8...")
-        from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType, convert_to_float8_training
-
-        # Configure float8 settings
         config = Float8LinearConfig(
-            # Using DYNAMIC scaling for stability
-            # You can try DELAYED scaling for slightly better performance
             cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
             cast_config_input=CastConfig(scaling_type=ScalingType.DYNAMIC),
             cast_config_grad_output=CastConfig(scaling_type=ScalingType.DYNAMIC),
         )
 
-        # Convert model
         convert_to_float8_training(model, config=config)
         print("✓ Model converted to TorchAO Float8")
 
-        # Count Float8 modules
         float8_count = sum(1 for _, m in model.named_modules() if "Float8" in m.__class__.__name__)
         print(f"  Float8 modules: {float8_count}")
 
-    # Create data loaders
     print("\nCreating data loaders...")
     train_dataloader, val_dataloader = create_dataloaders(
         batch_size=args.batch_size,
@@ -269,19 +171,17 @@ def main():
         num_workers=args.num_workers,
     )
 
-    # Calculate training steps based on time limit
-    # Estimate tokens/sec based on configuration
     if "H100" in gpu_name:
         if args.use_fp8:
-            tokens_per_second = 900_000  # FP8 estimate (if it works)
+            tokens_per_second = 900_000
         elif args.use_flash_attn:
-            tokens_per_second = 700_000  # Flash Attention on H100
+            tokens_per_second = 700_000
         else:
-            tokens_per_second = 500_000  # Standard attention
+            tokens_per_second = 500_000
     elif "A100" in gpu_name:
         tokens_per_second = 400_000 if args.use_flash_attn else 300_000
     else:
-        tokens_per_second = 200_000  # Conservative estimate for other GPUs
+        tokens_per_second = 200_000
 
     total_seconds = args.max_hours * 3600
     total_tokens = tokens_per_second * total_seconds
@@ -294,7 +194,6 @@ def main():
     print(f"  - Total tokens: {total_tokens:,} ({total_tokens / 1e9:.1f}B)")
     print(f"  - Total steps: {max_steps:,}")
 
-    # Create training config
     config = TrainingConfig(
         model_name=f"gpt-350m-h100-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         learning_rate=args.learning_rate,
@@ -314,7 +213,7 @@ def main():
         max_length=args.max_length,
         num_workers=args.num_workers,
         use_fp8=args.use_fp8,
-        use_amp=not args.use_fp8,  # Use FP16 if not using FP8
+        use_amp=not args.use_fp8,
         compile_model=args.compile_model,
         use_flash_attn=args.use_flash_attn,
         gradient_checkpointing=args.gradient_checkpointing,
@@ -322,7 +221,6 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # Create trainer
     print("\nCreating trainer...")
     trainer = Trainer(
         model=model,
@@ -331,7 +229,6 @@ def main():
         config=config,
     )
 
-    # Start training
     print("\nStarting training...")
     print("Target: Beat validation loss of 3.0781")
     print("Expected: Achieve validation loss of 2.90-2.95")
@@ -340,7 +237,6 @@ def main():
     try:
         final_metrics = trainer.train()
 
-        # Print final results
         print("\n" + "=" * 80)
         print("TRAINING COMPLETE!")
         print("=" * 80)
@@ -355,23 +251,16 @@ def main():
         print("=" * 80)
 
     except RuntimeError as e:
-        if "cuBLAS" in str(e) and args.use_fp8:
-            print("\n" + "=" * 80)
-            print("ERROR: cuBLAS error encountered with FP8!")
-            print("=" * 80)
-            print("\nThis is a known issue with Transformer Engine on H100.")
-            print("\nTry running without FP8:")
-            print(f"\n  python {sys.argv[0]} --no_fp8")
-            print("\nOr with optimal H100 settings:")
-            print(f"\n  python {sys.argv[0]} --no_fp8 --batch_size 16 --gradient_accumulation_steps 8")
-            print("=" * 80)
-        else:
-            print(f"\nTraining failed with error: {e}")
-            print("\nTroubleshooting suggestions:")
-            print("1. Check GPU memory with: nvidia-smi")
-            print("2. Try reducing batch size: --batch_size 4")
-            print("3. Try without compilation: --no_compile")
-            print("4. See TROUBLESHOOTING.md for more help")
+        print(f"\nTraining failed with error: {e}")
+        print("\nTroubleshooting suggestions:")
+        print("1. Check GPU memory with: nvidia-smi")
+        print("2. Try reducing batch size: --batch_size 4")
+        print("3. Try without compilation: --no_compile")
+        print("4. Try without FP8: --no_fp8")
+
+        if args.use_fp8 and not torchao_available:
+            print("\n5. Install TorchAO for FP8 support: pip install torchao")
+
         sys.exit(1)
 
 
