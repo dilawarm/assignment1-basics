@@ -213,6 +213,12 @@ def main():
                 print("❌ WARNING: No Float8 modules found! FP8 conversion may have failed.")
                 print("   Falling back to BF16...")
                 args.use_fp8 = False
+            else:
+                print(f"✓ Successfully converted {float8_count} modules to FP8")
+                print("  Note: FP8 models require compilation for optimal performance")
+                if not args.compile_model:
+                    print("  ⚠️  WARNING: Compilation is disabled! FP8 will be SLOWER than BF16!")
+                    print("     Enable with default settings or add --compile_model")
         except Exception as e:
             print(f"❌ FP8 conversion failed: {e}")
             print("   Falling back to BF16...")
@@ -288,6 +294,32 @@ def main():
         val_dataloader=val_dataloader,
         config=config,
     )
+
+    # Print final configuration summary
+    print("\n" + "=" * 80)
+    print("FINAL CONFIGURATION SUMMARY")
+    print("=" * 80)
+    print(f"Model: {total_params:.1f}M parameters")
+    print(f"Precision: {'FP8 (TorchAO)' if args.use_fp8 else 'BF16'}")
+    print(f"Compilation: {'Enabled (' + args.compile_mode + ')' if args.compile_model else 'Disabled'}")
+    print(f"Flash Attention: {'Enabled' if args.use_flash_attn else 'Disabled'}")
+    print(f"Gradient Checkpointing: {'Enabled (⚠️ ~3x slower)' if args.gradient_checkpointing else 'Disabled'}")
+
+    # Performance expectations based on PyTorch blog
+    if args.use_fp8 and args.compile_model:
+        print("\n✅ OPTIMAL CONFIGURATION: FP8 + Compilation")
+        print("   Expected: ~900,000 tokens/sec on H100")
+    elif args.use_fp8 and not args.compile_model:
+        print("\n⚠️  SUBOPTIMAL: FP8 without compilation")
+        print("   FP8 REQUIRES compilation to be faster than BF16!")
+        print("   Expected: <50,000 tokens/sec (slower than BF16)")
+    elif not args.use_fp8 and args.compile_model and args.use_flash_attn:
+        print("\n✓ GOOD CONFIGURATION: BF16 + Flash + Compilation")
+        print("   Expected: ~700,000 tokens/sec on H100")
+    else:
+        print("\n⚠️  SUBOPTIMAL CONFIGURATION")
+        print("   Consider enabling: --use_fp8 --compile_model --use_flash_attn")
+    print("=" * 80)
 
     # Quick performance test if debugging is enabled
     if args.debug_performance:
