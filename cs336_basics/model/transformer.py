@@ -151,7 +151,7 @@ class TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             total_layers=total_layers,
         )
-        self.ffn = SwiGLU(dim=dim, hidden_dim=intermediate_size, dropout=dropout)
+        self.ffn = SwiGLU(dim_in=dim, dim_hidden=intermediate_size, dropout=dropout)
         self.attention_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
         self.dropout = nn.Dropout(dropout)
