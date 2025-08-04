@@ -15,6 +15,8 @@ from tqdm import tqdm
 
 import wandb
 
+pynvml.nvmlInit()
+
 
 @dataclass
 class TrainingConfig:

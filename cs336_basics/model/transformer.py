@@ -5,7 +5,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
 
 from .components import RMSNorm, RotaryPositionEmbedding, SwiGLU
 
@@ -69,8 +68,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.n_heads, self.head_dim)
 
-        q = self.rope(q)
-        k = self.rope(k)
+        q, k = self.rope(q, k)
 
         if past_key_value is not None:
             past_k, past_v = past_key_value
@@ -81,6 +79,8 @@ class MultiHeadAttention(nn.Module):
 
         if self.use_flash:
             try:
+                from flash_attn import flash_attn_func
+
                 attn_out = flash_attn_func(
                     q,
                     k,
@@ -151,7 +151,7 @@ class TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             total_layers=total_layers,
         )
-        self.ffn = SwiGLU(dim_in=dim, dim_hidden=intermediate_size, dropout=dropout)
+        self.ffn = SwiGLU(dim_in=dim, dim_hidden=intermediate_size)
         self.attention_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
         self.dropout = nn.Dropout(dropout)
@@ -294,6 +294,7 @@ class TransformerLM(nn.Module):
                     attention_mask,
                     use_cache,
                     past_kv,
+                    use_reentrant=False,
                 )
             else:
                 h, present_kv = block(h, attention_mask, use_cache, past_kv)
