@@ -30,10 +30,13 @@ def test_standard_model():
     )
 
     if torch.cuda.is_available():
-        model = model.cuda()
+        # Use bfloat16 for Flash Attention compatibility
+        model = model.cuda().to(torch.bfloat16)
         device = "cuda"
+        dtype = torch.bfloat16
     else:
         device = "cpu"
+        dtype = torch.float32
 
     batch_size = 2
     seq_len = 64
@@ -74,7 +77,8 @@ def test_torchao_conversion():
         return False
 
     device = torch.device("cuda")
-    model = model.to(device)
+    # Use bfloat16 for better stability and Flash Attention compatibility
+    model = model.to(device).to(torch.bfloat16)
 
     major, minor = torch.cuda.get_device_capability()
     compute_capability = major + minor / 10
