@@ -51,8 +51,10 @@ def main():
     parser.add_argument("--intermediate_size", type=int, default=4096, help="FFN intermediate size")
 
     # Training arguments (optimized for H100)
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size per GPU (H100 optimal: 128-256)")
+    parser.add_argument(
+        "--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation (1 for best perf)"
+    )
     parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
     parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
@@ -236,17 +238,20 @@ def main():
         num_workers=args.num_workers,
     )
 
+    # Realistic expectations based on NVIDIA benchmarks
+    # H200 achieves 11,819 tokens/sec on Llama2-13B with batch 1024
+    # For 350M model, we expect higher throughput
     if "H100" in gpu_name:
         if args.use_fp8:
-            tokens_per_second = 900_000
+            tokens_per_second = 300_000  # Realistic for 350M model
         elif args.use_flash_attn:
-            tokens_per_second = 700_000
+            tokens_per_second = 200_000
         else:
-            tokens_per_second = 500_000
+            tokens_per_second = 150_000
     elif "A100" in gpu_name:
-        tokens_per_second = 400_000 if args.use_flash_attn else 300_000
+        tokens_per_second = 100_000 if args.use_flash_attn else 80_000
     else:
-        tokens_per_second = 200_000
+        tokens_per_second = 50_000
 
     total_seconds = args.max_hours * 3600
     total_tokens = tokens_per_second * total_seconds
@@ -305,20 +310,48 @@ def main():
     print(f"Flash Attention: {'Enabled' if args.use_flash_attn else 'Disabled'}")
     print(f"Gradient Checkpointing: {'Enabled (⚠️ ~3x slower)' if args.gradient_checkpointing else 'Disabled'}")
 
-    # Performance expectations based on PyTorch blog
+    # Performance expectations based on NVIDIA benchmarks and PyTorch limitations
     if args.use_fp8 and args.compile_model:
         print("\n✅ OPTIMAL CONFIGURATION: FP8 + Compilation")
-        print("   Expected: ~900,000 tokens/sec on H100")
+        print("   Expected: 150,000-200,000 tokens/sec on H100")
+        print("   Note: If you see <100k, compilation may not be working")
     elif args.use_fp8 and not args.compile_model:
         print("\n⚠️  SUBOPTIMAL: FP8 without compilation")
         print("   FP8 REQUIRES compilation to be faster than BF16!")
-        print("   Expected: <50,000 tokens/sec (slower than BF16)")
+        print("   Expected: 40,000-60,000 tokens/sec (slower than BF16)")
     elif not args.use_fp8 and args.compile_model and args.use_flash_attn:
         print("\n✓ GOOD CONFIGURATION: BF16 + Flash + Compilation")
-        print("   Expected: ~700,000 tokens/sec on H100")
+        print("   Expected: 100,000-150,000 tokens/sec on H100")
     else:
         print("\n⚠️  SUBOPTIMAL CONFIGURATION")
         print("   Consider enabling: --use_fp8 --compile_model --use_flash_attn")
+
+    print("\n💡 IMPORTANT: First training step will be SLOW (5-30s) due to compilation!")
+    print("   If first step is fast, compilation didn't work.")
+    print("=" * 80)
+
+    # Memory usage estimation
+    if "H100" in gpu_name or "A100" in gpu_name:
+        total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        model_memory_gb = (total_params * 2) / 1000  # BF16
+        optimizer_memory_gb = model_memory_gb * 2  # Adam states
+        activation_memory_gb = (args.batch_size * args.max_length * args.dim * 50) / 1e9  # Rough estimate
+        estimated_usage_gb = model_memory_gb + optimizer_memory_gb + activation_memory_gb + 5  # +5GB overhead
+
+        print(f"\n📊 Memory Usage Estimation:")
+        print(f"  Total GPU Memory: {total_memory_gb:.1f}GB")
+        print(f"  Model: ~{model_memory_gb:.1f}GB")
+        print(f"  Optimizer: ~{optimizer_memory_gb:.1f}GB")
+        print(f"  Activations: ~{activation_memory_gb:.1f}GB")
+        print(f"  Estimated Total: ~{estimated_usage_gb:.1f}GB ({estimated_usage_gb / total_memory_gb * 100:.1f}%)")
+
+        if estimated_usage_gb < total_memory_gb * 0.5:
+            print(f"\n⚠️  You're only using ~{estimated_usage_gb / total_memory_gb * 100:.0f}% of GPU memory!")
+            print(f"   Consider increasing batch size for better performance.")
+            print(f"   Try: --batch_size {args.batch_size * 2} or run: python find_optimal_batch_size.py")
+        elif estimated_usage_gb > total_memory_gb * 0.9:
+            print(f"\n⚠️  Memory usage is very high ({estimated_usage_gb / total_memory_gb * 100:.0f}%)")
+            print(f"   You might hit OOM. Consider reducing batch size.")
     print("=" * 80)
 
     # Quick performance test if debugging is enabled
@@ -361,24 +394,38 @@ def main():
     print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
 
     print("\nExpected Performance on H100:")
+    # Based on NVIDIA benchmarks: H200 gets 11,819 tokens/sec on Llama2-13B
+    # For 350M model, we expect higher throughput but not 100x
     expected_tokens_sec = 0
-    if args.use_fp8:
-        expected_tokens_sec = 900_000
-        print("  - Tokens/sec: ~900,000 (with FP8)")
+    if args.use_fp8 and args.compile_model:
+        expected_tokens_sec = 200_000  # Realistic for 350M with FP8+compile
+        print("  - Tokens/sec: ~200,000 (with FP8 + Compilation)")
+    elif args.use_fp8 and not args.compile_model:
+        expected_tokens_sec = 50_000  # FP8 without compile is slow
+        print("  - Tokens/sec: ~50,000 (FP8 without compilation - SLOW!)")
+    elif args.use_flash_attn and args.compile_model:
+        expected_tokens_sec = 150_000  # BF16 + Flash + Compile
+        print("  - Tokens/sec: ~150,000 (with BF16 + Flash + Compilation)")
     elif args.use_flash_attn:
-        expected_tokens_sec = 700_000
-        print("  - Tokens/sec: ~700,000 (with BF16 + Flash Attention)")
+        expected_tokens_sec = 100_000  # Just Flash
+        print("  - Tokens/sec: ~100,000 (with BF16 + Flash)")
     else:
-        expected_tokens_sec = 500_000
-        print("  - Tokens/sec: ~500,000 (with BF16)")
+        expected_tokens_sec = 80_000
+        print("  - Tokens/sec: ~80,000 (with BF16)")
 
     if args.gradient_checkpointing and expected_tokens_sec > 0:
         expected_tokens_sec = expected_tokens_sec // 3  # Gradient checkpointing causes ~3x slowdown
         print(f"  - ⚠️  WITH gradient checkpointing: ~{expected_tokens_sec:,} tokens/sec")
 
-    expected_mfu = 40 if not args.gradient_checkpointing else 15
+    expected_mfu = 30 if not args.gradient_checkpointing else 10
     print(f"  - MFU: >{expected_mfu}%")
-    print("\nIf you see <100,000 tokens/sec, something is wrong!")
+
+    # Performance debugging hint
+    if args.use_fp8 and not args.compile_model:
+        print("\n❌ WARNING: FP8 without compilation is SLOWER than BF16!")
+        print("   Enable compilation for FP8 performance benefits.")
+
+    print("\nIf performance is low, run: python debug_low_performance.py")
     print("-" * 80)
 
     try:
