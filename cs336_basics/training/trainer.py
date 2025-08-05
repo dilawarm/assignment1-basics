@@ -333,6 +333,16 @@ class Trainer:
         start_time = time.time()
         tokens_processed = 0
 
+        # Create progress bar
+        pbar = tqdm(
+            total=self.config.max_steps,
+            desc="Training",
+            initial=self.global_step,
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+        )
+
         while self.global_step < self.config.max_steps:
             for batch_idx, batch in enumerate(self.train_dataloader):
                 metrics = self.train_step(batch)
@@ -357,10 +367,21 @@ class Trainer:
                         self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length
                     )
 
-                    if self.global_step % self.config.log_interval == 0:
-                        elapsed_time = time.time() - start_time
-                        tokens_per_sec = tokens_processed / elapsed_time
+                    # Calculate performance metrics
+                    elapsed_time = time.time() - start_time
+                    tokens_per_sec = tokens_processed / elapsed_time if elapsed_time > 0 else 0
 
+                    # Update progress bar
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{metrics['loss']:.4f}",
+                            "tok/s": f"{tokens_per_sec:.0f}",
+                            "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                        }
+                    )
+
+                    if self.global_step % self.config.log_interval == 0:
                         # Calculate MFU (Model FLOPs Utilization) for performance monitoring
                         model_params = sum(p.numel() for p in self.model.parameters()) / 1e6  # in millions
                         flops_per_token = 6 * model_params * 1e6  # 6N FLOPs per token (approximate)
@@ -390,7 +411,8 @@ class Trainer:
                         if self.config.use_wandb and WANDB_AVAILABLE:
                             wandb.log(log_metrics)
 
-                        print(
+                        # Write to tqdm instead of print
+                        pbar.write(
                             f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
                             f"lr={log_metrics['learning_rate']:.2e}, "
                             f"tokens/sec={tokens_per_sec:.0f}, "
@@ -398,11 +420,12 @@ class Trainer:
                         )
 
                     if self.global_step % self.config.eval_interval == 0:
-                        print("\nRunning evaluation...")
+                        pbar.write("🔍 Running evaluation...")
                         eval_metrics = self.evaluate()
 
-                        print(f"Validation loss: {eval_metrics['val_loss']:.4f}")
-                        print(f"Validation perplexity: {eval_metrics['val_perplexity']:.2f}")
+                        pbar.write(
+                            f"✅ Val loss: {eval_metrics['val_loss']:.4f} | Perplexity: {eval_metrics['val_perplexity']:.2f}"
+                        )
 
                         if self.config.use_wandb and WANDB_AVAILABLE:
                             wandb.log(eval_metrics)
@@ -410,6 +433,7 @@ class Trainer:
                         if eval_metrics["val_loss"] < self.best_val_loss:
                             self.best_val_loss = eval_metrics["val_loss"]
                             self.save_checkpoint(os.path.join(self.config.output_dir, "best_model.pt"))
+                            pbar.write(f"💾 New best model saved! Loss: {self.best_val_loss:.4f}")
 
                     if self.global_step % self.config.save_interval == 0:
                         self.save_checkpoint()
@@ -419,10 +443,13 @@ class Trainer:
 
             self.epoch += 1
 
-        print("\nTraining complete! Running final evaluation...")
+        # Close progress bar
+        pbar.close()
+
+        print("\n🏁 Training complete! Running final evaluation...")
         final_metrics = self.evaluate()
-        print(f"Final validation loss: {final_metrics['val_loss']:.4f}")
-        print(f"Final validation perplexity: {final_metrics['val_perplexity']:.2f}")
+        print(f"📊 Final validation loss: {final_metrics['val_loss']:.4f}")
+        print(f"📊 Final validation perplexity: {final_metrics['val_perplexity']:.2f}")
 
         self.save_checkpoint(os.path.join(self.config.output_dir, "final_model.pt"))
 

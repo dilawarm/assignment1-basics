@@ -14,7 +14,6 @@ os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 
 import torch
 
-# Check for critical dependencies early
 try:
     from torchao.float8 import CastConfig, Float8LinearConfig, ScalingType, convert_to_float8_training
 
@@ -46,12 +45,12 @@ def main():
     # Model arguments
     parser.add_argument("--dim", type=int, default=1024, help="Model dimension")
     parser.add_argument("--n_layers", type=int, default=24, help="Number of layers")
-    parser.add_argument("--n_heads", type=int, default=16, help="Number of attention heads")
+    parser.add_argument("--n_heads", type=int, default=64, help="Number of attention heads")
     parser.add_argument("--head_dim", type=int, default=64, help="Attention head dimension")
     parser.add_argument("--intermediate_size", type=int, default=4096, help="FFN intermediate size")
 
     # Training arguments (optimized for H100)
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size per GPU (H100 optimal: 128-256)")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size per GPU (H100 optimal: 128-256)")
     parser.add_argument(
         "--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation (1 for best perf)"
     )
@@ -81,7 +80,7 @@ def main():
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
-        default=False,  # Changed default to False for better H100 performance
+        default=False,
         help="Use gradient checkpointing (saves memory but ~3x slower - not needed on H100 80GB)",
     )
     parser.add_argument(
@@ -103,78 +102,16 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 80)
-    print("H100-Optimized 350M Transformer Training")
-    print("=" * 80)
-    print(f"Model Configuration:")
-    print(f"  - Parameters: ~350M")
-    print(f"  - Layers: {args.n_layers}")
-    print(f"  - Hidden size: {args.dim}")
-    print(f"  - Heads: {args.n_heads} x {args.head_dim}")
-    print(f"  - FFN size: {args.intermediate_size}")
-    print(f"  - Sequence length: {args.max_length}")
-    print()
-    print(f"Training Configuration:")
-    print(f"  - Batch size: {args.batch_size}")
-    print(f"  - Gradient accumulation: {args.gradient_accumulation_steps}")
-    print(f"  - Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.max_length} tokens")
-    print(f"  - Learning rate: {args.learning_rate} (peak) -> {args.min_learning_rate} (min)")
-    print(f"  - Warmup steps: {args.warmup_steps}")
-    print()
-    print(f"Optimizations:")
-    print(f"  - FP8 precision (TorchAO): {args.use_fp8}")
-    print(f"  - Flash Attention: {args.use_flash_attn}")
-    print(f"  - Model compilation: {args.compile_model}")
-    if args.compile_model:
-        print(f"  - Compile mode: {args.compile_mode}")
-    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}", end="")
-    if args.gradient_checkpointing:
-        print(" (⚠️  ~3x slowdown!)")
-    else:
-        print(" (✓ optimal for H100)")
-    print("=" * 80)
+    print("=" * 60)
+    print("🚀 H100-Optimized 350M Transformer Training")
+    print("=" * 60)
 
     if not torch.cuda.is_available():
-        print("ERROR: CUDA not available!")
+        print("❌ ERROR: CUDA not available!")
         sys.exit(1)
 
     gpu_name = torch.cuda.get_device_name(0)
-    print(f"GPU: {gpu_name}")
-
-    major, minor = torch.cuda.get_device_capability()
-    compute_capability = major + minor / 10
-    print(f"Compute Capability: {compute_capability}")
-
-    if "H100" not in gpu_name and "A100" not in gpu_name:
-        print("WARNING: Not running on H100/A100. Performance will be suboptimal.")
-
-    # Automatically adjust settings based on hardware and dependencies
-    if args.use_fp8:
-        if compute_capability < 8.9:
-            print("\nWARNING: FP8 requires compute capability >= 8.9 (H100 or newer)")
-            print("         Disabling FP8 and using BF16 mixed precision instead")
-            args.use_fp8 = False
-        elif not TORCHAO_AVAILABLE:
-            print("\nWARNING: FP8 requested but TorchAO not installed")
-            print("         Disabling FP8 and using BF16 mixed precision instead")
-            args.use_fp8 = False
-        else:
-            print("\n✓ Using TorchAO Float8")
-            print("  PyTorch's official FP8 solution for stable training")
-            print("  Expected speedup: ~1.5x over FP16")
-
-    if args.use_flash_attn and not FLASH_ATTN_AVAILABLE:
-        print("\nWARNING: Flash Attention requested but not installed")
-        print("         Disabling Flash Attention - performance will be limited")
-        args.use_flash_attn = False
-
-    # Warn about gradient checkpointing on H100
-    if "H100" in gpu_name and args.gradient_checkpointing:
-        print("\n⚠️  WARNING: Gradient checkpointing is enabled on H100!")
-        print("   This will reduce performance by ~3x and is unnecessary with 80GB memory.")
-        print("   Consider running with --no_gradient_checkpointing for better performance.")
-
-    print("\nCreating model...")
+    print(f"🔧 GPU: {gpu_name}")
     model = TransformerLM(
         vocab_size=50257,
         max_seq_len=args.max_length,
@@ -191,10 +128,9 @@ def main():
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Model parameters: {total_params:.1f}M")
+    print(f"📊 Model: {total_params:.1f}M parameters")
 
     if args.use_fp8 and TORCHAO_AVAILABLE:
-        print("\nConverting model to TorchAO Float8...")
         try:
             # Move model to CUDA and BF16 BEFORE FP8 conversion
             model = model.cuda().to(torch.bfloat16)
@@ -206,41 +142,28 @@ def main():
             )
 
             convert_to_float8_training(model, config=config)
-            print("✓ Model converted to TorchAO Float8")
-
             float8_count = sum(1 for _, m in model.named_modules() if "Float8" in m.__class__.__name__)
-            print(f"  Float8 modules: {float8_count}")
 
             if float8_count == 0:
-                print("❌ WARNING: No Float8 modules found! FP8 conversion may have failed.")
-                print("   Falling back to BF16...")
+                print("⚠️  FP8 conversion failed, using BF16")
                 args.use_fp8 = False
             else:
-                print(f"✓ Successfully converted {float8_count} modules to FP8")
-                print("  Note: FP8 models require compilation for optimal performance")
+                print(f"✅ FP8 enabled ({float8_count} modules)")
                 if not args.compile_model:
-                    print("  ⚠️  WARNING: Compilation is disabled! FP8 will be SLOWER than BF16!")
-                    print("     Enable with default settings or add --compile_model")
+                    print("⚠️  WARNING: FP8 without compilation will be slower than BF16!")
         except Exception as e:
-            print(f"❌ FP8 conversion failed: {e}")
-            print("   Falling back to BF16...")
+            print(f"⚠️  FP8 failed ({e}), using BF16")
             args.use_fp8 = False
-            # Ensure model is on CUDA with BF16
             model = model.cuda().to(torch.bfloat16)
     else:
-        # Move model to CUDA and BF16 if not using FP8
         model = model.cuda().to(torch.bfloat16)
 
-    print("\nCreating data loaders...")
     train_dataloader, val_dataloader = create_dataloaders(
         batch_size=args.batch_size,
         max_length=args.max_length,
         num_workers=args.num_workers,
     )
 
-    # Realistic expectations based on NVIDIA benchmarks
-    # H200 achieves 11,819 tokens/sec on Llama2-13B with batch 1024
-    # For 350M model, we expect higher throughput
     if "H100" in gpu_name:
         if args.use_fp8:
             tokens_per_second = 300_000  # Realistic for 350M model
@@ -258,11 +181,7 @@ def main():
     tokens_per_step = args.batch_size * args.gradient_accumulation_steps * args.max_length
     max_steps = int(total_tokens / tokens_per_step)
 
-    print(f"\nTraining plan:")
-    print(f"  - Estimated tokens/sec: {tokens_per_second:,}")
-    print(f"  - Total training time: {args.max_hours} hours")
-    print(f"  - Total tokens: {total_tokens:,} ({total_tokens / 1e9:.1f}B)")
-    print(f"  - Total steps: {max_steps:,}")
+    print(f"⏱️  Training plan: {max_steps:,} steps (~{total_tokens / 1e9:.1f}B tokens, {args.max_hours}h)")
 
     config = TrainingConfig(
         model_name=f"gpt-350m-h100-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -292,7 +211,6 @@ def main():
         output_dir=args.output_dir,
     )
 
-    print("\nCreating trainer...")
     trainer = Trainer(
         model=model,
         train_dataloader=train_dataloader,
@@ -300,133 +218,30 @@ def main():
         config=config,
     )
 
-    # Print final configuration summary
-    print("\n" + "=" * 80)
-    print("FINAL CONFIGURATION SUMMARY")
-    print("=" * 80)
-    print(f"Model: {total_params:.1f}M parameters")
-    print(f"Precision: {'FP8 (TorchAO)' if args.use_fp8 else 'BF16'}")
-    print(f"Compilation: {'Enabled (' + args.compile_mode + ')' if args.compile_model else 'Disabled'}")
-    print(f"Flash Attention: {'Enabled' if args.use_flash_attn else 'Disabled'}")
-    print(f"Gradient Checkpointing: {'Enabled (⚠️ ~3x slower)' if args.gradient_checkpointing else 'Disabled'}")
+    # Configuration summary
+    precision = "FP8" if args.use_fp8 else "BF16"
+    compile_status = f"✅ {args.compile_mode}" if args.compile_model else "❌"
+    flash_status = "✅" if args.use_flash_attn else "❌"
 
-    # Performance expectations based on NVIDIA benchmarks and PyTorch limitations
-    if args.use_fp8 and args.compile_model:
-        print("\n✅ OPTIMAL CONFIGURATION: FP8 + Compilation")
-        print("   Expected: 150,000-200,000 tokens/sec on H100")
-        print("   Note: If you see <100k, compilation may not be working")
-    elif args.use_fp8 and not args.compile_model:
-        print("\n⚠️  SUBOPTIMAL: FP8 without compilation")
-        print("   FP8 REQUIRES compilation to be faster than BF16!")
-        print("   Expected: 40,000-60,000 tokens/sec (slower than BF16)")
-    elif not args.use_fp8 and args.compile_model and args.use_flash_attn:
-        print("\n✓ GOOD CONFIGURATION: BF16 + Flash + Compilation")
-        print("   Expected: 100,000-150,000 tokens/sec on H100")
-    else:
-        print("\n⚠️  SUBOPTIMAL CONFIGURATION")
-        print("   Consider enabling: --use_fp8 --compile_model --use_flash_attn")
+    print(f"⚙️  Config: {precision} | Compile: {compile_status} | Flash: {flash_status}")
 
-    print("\n💡 IMPORTANT: First training step will be SLOW (5-30s) due to compilation!")
-    print("   If first step is fast, compilation didn't work.")
-    print("=" * 80)
-
-    # Memory usage estimation
+    # Quick memory check
     if "H100" in gpu_name or "A100" in gpu_name:
         total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        model_memory_gb = (total_params * 2) / 1000  # BF16
-        optimizer_memory_gb = model_memory_gb * 2  # Adam states
-        activation_memory_gb = (args.batch_size * args.max_length * args.dim * 50) / 1e9  # Rough estimate
-        estimated_usage_gb = model_memory_gb + optimizer_memory_gb + activation_memory_gb + 5  # +5GB overhead
+        estimated_usage_gb = (total_params * 6) / 1000 + 5  # Rough estimate
+        usage_pct = (estimated_usage_gb / total_memory_gb) * 100
 
-        print(f"\n📊 Memory Usage Estimation:")
-        print(f"  Total GPU Memory: {total_memory_gb:.1f}GB")
-        print(f"  Model: ~{model_memory_gb:.1f}GB")
-        print(f"  Optimizer: ~{optimizer_memory_gb:.1f}GB")
-        print(f"  Activations: ~{activation_memory_gb:.1f}GB")
-        print(f"  Estimated Total: ~{estimated_usage_gb:.1f}GB ({estimated_usage_gb / total_memory_gb * 100:.1f}%)")
+        if usage_pct < 50:
+            print(
+                f"💾 Memory: ~{usage_pct:.0f}% ({estimated_usage_gb:.1f}GB/{total_memory_gb:.1f}GB) - Consider larger batch size"
+            )
+        elif usage_pct > 90:
+            print(f"💾 Memory: ~{usage_pct:.0f}% ({estimated_usage_gb:.1f}GB/{total_memory_gb:.1f}GB) - May hit OOM!")
+        else:
+            print(f"💾 Memory: ~{usage_pct:.0f}% ({estimated_usage_gb:.1f}GB/{total_memory_gb:.1f}GB)")
 
-        if estimated_usage_gb < total_memory_gb * 0.5:
-            print(f"\n⚠️  You're only using ~{estimated_usage_gb / total_memory_gb * 100:.0f}% of GPU memory!")
-            print(f"   Consider increasing batch size for better performance.")
-            print(f"   Try: --batch_size {args.batch_size * 2} or run: python find_optimal_batch_size.py")
-        elif estimated_usage_gb > total_memory_gb * 0.9:
-            print(f"\n⚠️  Memory usage is very high ({estimated_usage_gb / total_memory_gb * 100:.0f}%)")
-            print(f"   You might hit OOM. Consider reducing batch size.")
-    print("=" * 80)
-
-    # Quick performance test if debugging is enabled
-    if args.debug_performance:
-        print("\nRunning quick performance test...")
-        with torch.no_grad():
-            test_input = torch.randint(0, 50257, (args.batch_size, args.max_length)).cuda()
-
-            # Warmup
-            for _ in range(3):
-                _ = model(test_input)
-            torch.cuda.synchronize()
-
-            # Test
-            import time
-
-            start = time.time()
-            num_test_iters = 10
-            for _ in range(num_test_iters):
-                _ = model(test_input)
-            torch.cuda.synchronize()
-            end = time.time()
-
-            test_tokens = args.batch_size * args.max_length * num_test_iters
-            test_tokens_per_sec = test_tokens / (end - start)
-            print(f"  Forward pass only: {test_tokens_per_sec:,.0f} tokens/sec")
-            print(f"  Time per iteration: {(end - start) / num_test_iters:.3f} seconds")
-
-    print("\nStarting training...")
-    print("Target: Beat validation loss of 3.0781")
-    print("Expected: Achieve validation loss of 2.90-2.95")
-
-    # Print actual configuration status
-    print("\nActual Configuration:")
-    print(f"  - Model on CUDA: {next(model.parameters()).is_cuda}")
-    print(f"  - Model dtype: {next(model.parameters()).dtype}")
-    print(f"  - FP8 enabled: {args.use_fp8}")
-    print(f"  - Flash Attention: {args.use_flash_attn}")
-    print(f"  - Model compilation: {args.compile_model}")
-    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
-
-    print("\nExpected Performance on H100:")
-    # Based on NVIDIA benchmarks: H200 gets 11,819 tokens/sec on Llama2-13B
-    # For 350M model, we expect higher throughput but not 100x
-    expected_tokens_sec = 0
-    if args.use_fp8 and args.compile_model:
-        expected_tokens_sec = 200_000  # Realistic for 350M with FP8+compile
-        print("  - Tokens/sec: ~200,000 (with FP8 + Compilation)")
-    elif args.use_fp8 and not args.compile_model:
-        expected_tokens_sec = 50_000  # FP8 without compile is slow
-        print("  - Tokens/sec: ~50,000 (FP8 without compilation - SLOW!)")
-    elif args.use_flash_attn and args.compile_model:
-        expected_tokens_sec = 150_000  # BF16 + Flash + Compile
-        print("  - Tokens/sec: ~150,000 (with BF16 + Flash + Compilation)")
-    elif args.use_flash_attn:
-        expected_tokens_sec = 100_000  # Just Flash
-        print("  - Tokens/sec: ~100,000 (with BF16 + Flash)")
-    else:
-        expected_tokens_sec = 80_000
-        print("  - Tokens/sec: ~80,000 (with BF16)")
-
-    if args.gradient_checkpointing and expected_tokens_sec > 0:
-        expected_tokens_sec = expected_tokens_sec // 3  # Gradient checkpointing causes ~3x slowdown
-        print(f"  - ⚠️  WITH gradient checkpointing: ~{expected_tokens_sec:,} tokens/sec")
-
-    expected_mfu = 30 if not args.gradient_checkpointing else 10
-    print(f"  - MFU: >{expected_mfu}%")
-
-    # Performance debugging hint
-    if args.use_fp8 and not args.compile_model:
-        print("\n❌ WARNING: FP8 without compilation is SLOWER than BF16!")
-        print("   Enable compilation for FP8 performance benefits.")
-
-    print("\nIf performance is low, run: python debug_low_performance.py")
-    print("-" * 80)
+    print("\n🚀 Starting training...")
+    print("=" * 60)
 
     try:
         final_metrics = trainer.train()
@@ -445,19 +260,11 @@ def main():
         print("=" * 80)
 
     except RuntimeError as e:
-        print(f"\nTraining failed with error: {e}")
-        print("\nTroubleshooting suggestions:")
-        print("1. Check GPU memory with: nvidia-smi")
-        print("2. Try reducing batch size: --batch_size 4")
-        print("3. Try without compilation: --no_compile")
-        print("4. Try without FP8: --no_fp8")
-        if args.compile_model:
-            print(f"5. Try different compile mode: --compile_mode default (current: {args.compile_mode})")
-
-        if args.use_fp8 and not TORCHAO_AVAILABLE:
-            print("\n6. Install TorchAO for FP8 support: pip install torchao")
-
+        print(f"\n❌ Training failed with RuntimeError: {e}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n⚠️  Training interrupted by user")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
