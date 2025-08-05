@@ -50,9 +50,9 @@ def main():
     parser.add_argument("--intermediate_size", type=int, default=4096, help="FFN intermediate size")
 
     # Training arguments (optimized for H100)
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size per GPU (H100 optimal: 128-256)")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU (H100 optimal: 128-256)")
     parser.add_argument(
-        "--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation (1 for best perf)"
+        "--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation (1 for best perf)"
     )
     parser.add_argument("--learning_rate", type=float, default=4e-4, help="Peak learning rate")
     parser.add_argument("--min_learning_rate", type=float, default=4e-5, help="Minimum learning rate")
