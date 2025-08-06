@@ -28,10 +28,19 @@ class LocalTokenizedDataset(IterableDataset):
             raise FileNotFoundError(f"Tokenized data file not found: {data_path}")
 
         # Use memory mapping for efficient access to large files
-        self.tokens = np.memmap(data_path, dtype=np.int32, mode='r')
+        # First, try to load with np.load to detect the actual dtype
+        try:
+            sample_array = np.load(data_path)
+            actual_dtype = sample_array.dtype
+            del sample_array  # Free memory
+        except:
+            actual_dtype = np.uint16  # Default fallback
+            
+        self.tokens = np.memmap(data_path, dtype=actual_dtype, mode='r')
         self.total_tokens = len(self.tokens)
         
         print(f"📁 Loaded {data_path}: {self.total_tokens:,} tokens ({self.total_tokens/1e9:.2f}B)")
+        print(f"📊 Data type: {actual_dtype}, file size: {os.path.getsize(data_path)/1e9:.2f}GB")
         
         # Calculate number of sequences we can create
         self.num_sequences = self.total_tokens // max_length
@@ -189,8 +198,16 @@ class LocalTokenizedDatasetFixed(Dataset):
 
         # Load memory-mapped data
         if os.path.exists(data_path):
-            self.data = np.memmap(data_path, dtype=np.int32, mode="r")
-            print(f"📁 Loaded memory-mapped dataset: {len(self.data):,} tokens")
+            # Detect actual dtype from the file
+            try:
+                sample_array = np.load(data_path)
+                actual_dtype = sample_array.dtype
+                del sample_array
+            except:
+                actual_dtype = np.uint16  # Default fallback
+                
+            self.data = np.memmap(data_path, dtype=actual_dtype, mode="r")
+            print(f"📁 Loaded memory-mapped dataset: {len(self.data):,} tokens (dtype: {actual_dtype})")
         else:
             raise FileNotFoundError(f"Data file not found: {data_path}")
 
