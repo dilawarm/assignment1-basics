@@ -5,10 +5,11 @@ Target: Beat validation loss of 3.0781 on OpenWebText in 1.5 hours.
 
 Key optimizations:
 - Larger batch sizes to utilize 80GB H100 memory
-- TorchAO FP8 for 2x speedup
+- Selective mixed precision: FP8 for linear layers, BF16 for others, FP32 for critical layers
 - Aggressive hyperparameters for faster convergence
-- Streaming data loading to prevent I/O bottlenecks
+- Local pre-tokenized data for maximum I/O throughput
 - Advanced CUDA optimizations
+- torch.compile() compatible implementation
 """
 
 import argparse
@@ -22,7 +23,7 @@ import torch
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from cs336_basics.data import create_dataloaders
-from cs336_basics.model import TransformerLM, apply_torchao_optimizations
+from cs336_basics.model import TransformerLM, apply_selective_mixed_precision
 from cs336_basics.training import H100OptimizedTrainer, TrainingConfig
 
 
@@ -68,29 +69,34 @@ def print_system_info():
     except ImportError:
         print("❌ Flash Attention not available")
 
+    # Check BF16 support
+    if torch.cuda.is_bf16_supported():
+        print("✅ BF16 mixed precision supported")
+    else:
+        print("⚠️  BF16 not supported, falling back to FP16")
+
     print("=" * 80)
 
 
 def calculate_optimal_batch_size():
     """Calculate optimal batch size for 80GB H100."""
     # Model memory estimation (350M parameters)
-    # - Model weights: 350M * 4 bytes = 1.4GB (FP32)
-    # - With FP8: ~0.7GB
-    # - Activations: batch_size * seq_len * hidden_dim * layers * 4
+    # - Model weights: 350M * 2 bytes = 0.7GB (BF16)
+    # - Activations: batch_size * seq_len * hidden_dim * layers * 2
     # - With gradient checkpointing: much less activation memory
 
     # Conservative estimate for 80GB H100
     # Leave ~20GB for system/other processes
     available_memory = 60  # GB
 
-    # With FP8 + gradient checkpointing, we can fit much larger batches
-    # Each sequence (1024 tokens) uses roughly 100MB with all optimizations
-    estimated_memory_per_batch = 0.1  # GB per sequence
+    # With BF16 + gradient checkpointing, we can fit larger batches
+    # Each sequence (1024 tokens) uses roughly 80MB with all optimizations
+    estimated_memory_per_batch = 0.08  # GB per sequence
 
     max_batch_size = int(available_memory / estimated_memory_per_batch)
 
-    # Be conservative and use 80% of calculated max
-    optimal_batch_size = max(16, int(max_batch_size * 0.8))
+    # Be conservative and use 70% of calculated max
+    optimal_batch_size = max(16, int(max_batch_size * 0.7))
 
     return min(optimal_batch_size, 64)  # Cap at 64 for stability
 
@@ -131,7 +137,7 @@ def main():
     parser.add_argument("--prefetch_factor", type=int, default=4, help="Prefetch factor")
 
     # Optimization arguments
-    parser.add_argument("--use_fp8", action="store_true", default=True, help="Use FP8 precision")
+    parser.add_argument("--use_bf16", action="store_true", default=True, help="Use BF16 mixed precision")
     parser.add_argument("--use_flash_attn", action="store_true", default=True, help="Use Flash Attention")
     parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model")
     parser.add_argument(
@@ -176,6 +182,7 @@ def main():
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.max_length:,} tokens")
     print(f"  Learning rate: {args.learning_rate} -> {args.min_learning_rate}")
     print(f"  Max training time: {args.max_hours} hours")
+    print(f"  Mixed precision: {'BF16' if args.use_bf16 else 'FP32'}")
     print()
 
     # Create model
@@ -194,13 +201,13 @@ def main():
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
-    # Apply TorchAO optimizations if available
-    if args.use_fp8:
+    # Apply selective mixed precision optimizations
+    if args.use_bf16:
         try:
-            model = apply_torchao_optimizations(model, torch.device("cuda"))
+            model = apply_selective_mixed_precision(model)
         except Exception as e:
-            print(f"⚠️  Failed to apply TorchAO optimizations: {e}")
-            args.use_fp8 = False
+            print(f"⚠️  Failed to apply mixed precision optimizations: {e}")
+            args.use_bf16 = False
 
     # Create optimized data loaders
     print("📂 Creating optimized data loaders from local .npy files...")
@@ -230,7 +237,7 @@ def main():
 
     # Create optimized training config
     config = TrainingConfig(
-        model_name=f"gpt-350m-h100-ultra-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        model_name=f"gpt-350m-h100-selective-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
         weight_decay=0.1,
@@ -248,13 +255,12 @@ def main():
         max_length=args.max_length,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
-        use_fp8=args.use_fp8,
-        use_amp=False,  # Don't use both FP8 and AMP
+        use_mixed_precision=args.use_bf16,
+        use_bf16=args.use_bf16,
         compile_model=args.compile_model,
         use_flash_attn=args.use_flash_attn,
         gradient_checkpointing=args.gradient_checkpointing,
         use_fused_adamw=True,
-        use_cuda_graphs=True,
         use_wandb=args.use_wandb,
         output_dir=args.output_dir,
     )
@@ -270,7 +276,7 @@ def main():
 
     # Print optimization status
     print(f"\n⚙️  Optimizations:")
-    print(f"  FP8: {'✅' if config.use_fp8 else '❌'}")
+    print(f"  Mixed Precision: {'✅ BF16' if config.use_bf16 else '❌'}")
     print(f"  Flash Attention: {'✅' if config.use_flash_attn else '❌'}")
     print(f"  Model Compilation: {'✅' if config.compile_model else '❌'}")
     print(f"  Gradient Checkpointing: {'✅' if config.gradient_checkpointing else '❌'}")

@@ -1,4 +1,4 @@
-"""H100-optimized trainer with TorchAO FP8 support and maximum throughput."""
+"""H100-optimized trainer with selective mixed precision and maximum throughput."""
 
 import math
 import os
@@ -14,16 +14,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
-
-# Try to import TorchAO for FP8
-try:
-    import torchao
-    from torchao.quantization import float8_dynamic_activation_float8_weight, quantize_
-
-    TORCHAO_AVAILABLE = True
-except ImportError:
-    TORCHAO_AVAILABLE = False
-    print("Warning: TorchAO not available")
 
 try:
     import pynvml
@@ -66,9 +56,9 @@ class TrainingConfig:
     num_workers: int = 8
     prefetch_factor: int = 4
 
-    # Precision
-    use_fp8: bool = True
-    use_amp: bool = False  # Don't use both FP8 and AMP
+    # Precision - Use selective mixed precision instead of aggressive FP8
+    use_mixed_precision: bool = True
+    use_bf16: bool = True  # BF16 is more stable than FP16 for large models
 
     # Hardware optimizations
     compile_model: bool = True
@@ -77,7 +67,6 @@ class TrainingConfig:
 
     # Advanced optimizations
     use_fused_adamw: bool = True
-    use_cuda_graphs: bool = True
 
     # Logging
     use_wandb: bool = True
@@ -111,13 +100,20 @@ class H100OptimizedTrainer:
         # Move model to device
         self.model = self.model.to(self.device)
 
-        # Apply FP8 optimizations with TorchAO
-        if config.use_fp8 and TORCHAO_AVAILABLE:
-            self._setup_fp8()
+        # Setup mixed precision (selective approach)
+        self.scaler = None
+        if config.use_mixed_precision:
+            if config.use_bf16:
+                # BF16 is more stable for large models and works well with torch.compile()
+                print("🔧 Using BF16 mixed precision training...")
+                # Model dtype conversion is handled in apply_selective_mixed_precision
+            else:
+                # FP16 with gradient scaling
+                print("🔧 Using FP16 mixed precision training...")
+                self.scaler = GradScaler()
 
         # Compile model for maximum performance
-        # Note: FP8 and torch.compile() are incompatible due to missing gradient implementations
-        if config.compile_model and not config.use_fp8:
+        if config.compile_model:
             print("🔧 Compiling model with torch.compile...")
             self.model = torch.compile(
                 self.model,
@@ -126,19 +122,9 @@ class H100OptimizedTrainer:
                 backend="inductor",  # Use TorchInductor backend
             )
             print("✅ Model compiled successfully")
-        elif config.use_fp8:
-            print("🔧 Skipping model compilation (FP8 + torch.compile() incompatible)")
-            print("ℹ️  FP8 provides significant speedup without compilation")
-        else:
-            print("🔧 Model compilation disabled")
 
         # Setup optimizer with optimizations
         self.optimizer = self._create_optimizer()
-
-        # Setup mixed precision (only if not using FP8)
-        self.scaler = None
-        if config.use_amp and not config.use_fp8:
-            self.scaler = GradScaler()
 
         # Setup learning rate scheduler
         self.scheduler = self._create_scheduler()
@@ -161,17 +147,6 @@ class H100OptimizedTrainer:
 
         # CUDA optimizations
         self._setup_cuda_optimizations()
-
-    def _setup_fp8(self):
-        """Setup FP8 training with TorchAO."""
-        print("🔧 Setting up FP8 training with TorchAO...")
-        try:
-            # Apply FP8 quantization to the model
-            quantize_(self.model, float8_dynamic_activation_float8_weight())
-            print("✅ Applied TorchAO FP8 quantization")
-        except Exception as e:
-            print(f"Warning: Failed to apply FP8 quantization: {e}")
-            self.config.use_fp8 = False
 
     def _setup_cuda_optimizations(self):
         """Setup CUDA-specific optimizations."""
@@ -273,8 +248,8 @@ class H100OptimizedTrainer:
         model_flops_per_sec = tokens_per_sec * flops_per_token
 
         # H100 peak FLOPs (theoretical)
-        # FP16: ~1000 TFLOPs/s, FP8: ~2000 TFLOPs/s
-        peak_flops = 2000e12 if self.config.use_fp8 else 1000e12
+        # BF16: ~1000 TFLOPs/s, FP16: ~1000 TFLOPs/s
+        peak_flops = 1000e12
 
         # MFU calculation
         mfu = (model_flops_per_sec / peak_flops) * 100
@@ -286,16 +261,18 @@ class H100OptimizedTrainer:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         labels = batch["labels"].to(self.device, non_blocking=True)
 
-        # Forward pass
-        if self.config.use_fp8:
-            # FP8 forward pass
-            outputs = self.model(input_ids=input_ids, labels=labels)
-        elif self.scaler is not None:
-            # Mixed precision forward pass
-            with torch.cuda.amp.autocast():
-                outputs = self.model(input_ids=input_ids, labels=labels)
+        # Forward pass with mixed precision
+        if self.config.use_mixed_precision:
+            if self.config.use_bf16:
+                # BF16 mixed precision (no gradient scaling needed)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = self.model(input_ids=input_ids, labels=labels)
+            else:
+                # FP16 mixed precision with gradient scaling
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(input_ids=input_ids, labels=labels)
         else:
-            # Standard forward pass
+            # Full precision
             outputs = self.model(input_ids=input_ids, labels=labels)
 
         loss = outputs["loss"]
@@ -332,9 +309,14 @@ class H100OptimizedTrainer:
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
 
-            # Forward pass
-            if self.config.use_fp8:
-                outputs = self.model(input_ids=input_ids, labels=labels)
+            # Forward pass with mixed precision
+            if self.config.use_mixed_precision:
+                if self.config.use_bf16:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        outputs = self.model(input_ids=input_ids, labels=labels)
+                else:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(input_ids=input_ids, labels=labels)
             else:
                 outputs = self.model(input_ids=input_ids, labels=labels)
 
