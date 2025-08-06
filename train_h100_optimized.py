@@ -5,11 +5,11 @@ Target: Beat validation loss of 3.0781 on OpenWebText in 1.5 hours.
 
 Key optimizations:
 - Larger batch sizes to utilize 80GB H100 memory
-- Selective mixed precision: FP8 for linear layers, BF16 for others, FP32 for critical layers
+- Selective mixed precision: BF16 for excellent stability and torch.compile() compatibility
 - Aggressive hyperparameters for faster convergence
 - Local pre-tokenized data for maximum I/O throughput
 - Advanced CUDA optimizations
-- torch.compile() compatible implementation
+- Compatible with both FP8 (no compile) and BF16 (with compile) modes
 """
 
 import argparse
@@ -183,6 +183,7 @@ def main():
     print(f"  Learning rate: {args.learning_rate} -> {args.min_learning_rate}")
     print(f"  Max training time: {args.max_hours} hours")
     print(f"  Mixed precision: {'BF16' if args.use_bf16 else 'FP32'}")
+    print(f"  Model compilation: {'Enabled' if args.compile_model else 'Disabled'}")
     print()
 
     # Create model
@@ -204,7 +205,8 @@ def main():
     # Apply selective mixed precision optimizations
     if args.use_bf16:
         try:
-            model = apply_selective_mixed_precision(model)
+            # Pass compile flag to determine precision strategy
+            model = apply_selective_mixed_precision(model, use_compile=args.compile_model)
         except Exception as e:
             print(f"⚠️  Failed to apply mixed precision optimizations: {e}")
             args.use_bf16 = False
@@ -222,7 +224,7 @@ def main():
     )
 
     # Calculate training steps
-    estimated_tokens_per_sec = 500_000  # Conservative estimate with all optimizations
+    estimated_tokens_per_sec = 400_000  # More conservative estimate for stability
     total_seconds = args.max_hours * 3600
     total_tokens = estimated_tokens_per_sec * total_seconds
     tokens_per_step = args.batch_size * args.gradient_accumulation_steps * args.max_length
@@ -237,7 +239,7 @@ def main():
 
     # Create optimized training config
     config = TrainingConfig(
-        model_name=f"gpt-350m-h100-selective-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        model_name=f"gpt-350m-h100-compatible-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
         weight_decay=0.1,
@@ -293,6 +295,7 @@ def main():
     print("\n" + "🚀 Starting optimized training...")
     print("🎯 Target: Beat validation loss of 3.0781")
     print("🔥 Expected: Achieve validation loss of 2.8-2.9")
+    print("🛡️  Enhanced compatibility mode for stability")
     print("-" * 80)
 
     try:

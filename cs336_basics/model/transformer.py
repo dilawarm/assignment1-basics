@@ -215,7 +215,7 @@ class TransformerLM(nn.Module):
                     attention_mask,
                     use_cache,
                     past_kv,
-                    use_reentrant=False,  # Better performance on newer PyTorch
+                    use_reentrant=True,  # More compatible with torch.compile() and TorchAO
                 )
             else:
                 h, present_kv = block(h, attention_mask, use_cache, past_kv)
@@ -294,51 +294,66 @@ class TransformerLM(nn.Module):
         return input_ids
 
 
-def apply_selective_mixed_precision(model: nn.Module) -> nn.Module:
+def apply_selective_mixed_precision(model: nn.Module, use_compile: bool = True) -> nn.Module:
     """
     Apply selective mixed precision following best practices for transformers.
+    
+    This version is compatible with torch.compile() by avoiding TorchAO FP8 when compiling.
 
     Based on research and NVIDIA recommendations:
-    1. FP8 for linear layers (attention projections, FFN) - maximum speedup
-    2. BF16 for most other operations (better numerical stability than FP16)
-    3. FP32 for embeddings and normalization layers (critical for stability)
-    4. E4M3 format for forward pass, E5M2 for backward pass
+    1. BF16 for most operations (excellent stability and compile compatibility)
+    2. FP32 for embeddings and normalization layers (critical for stability)
+    3. FP8 only when not using torch.compile() (due to compatibility issues)
     """
     print("🔧 Applying selective mixed precision optimizations...")
 
-    # Step 1: Apply FP8 to linear layers using TorchAO (if available)
-    if TORCHAO_AVAILABLE:
-        try:
-            # Get all linear layers for FP8 quantization
-            linear_layers = []
-            for name, module in model.named_modules():
-                if isinstance(module, nn.Linear):
-                    # Apply FP8 to linear layers in attention and FFN
-                    if any(part in name for part in ["attn", "ffn", "qkv_proj", "o_proj", "w1", "w2", "w3"]):
-                        linear_layers.append(name)
-
-            if linear_layers:
-                # Apply FP8 quantization to linear layers
-                quantize_(model, float8_dynamic_activation_float8_weight())
-                print(f"✅ Applied FP8 to {len(linear_layers)} linear layers")
-            else:
-                print("⚠️  No suitable linear layers found for FP8")
-
-        except Exception as e:
-            print(f"⚠️  Failed to apply FP8 quantization: {e}")
-            print("Falling back to BF16 for all operations")
+    # For torch.compile() compatibility, prefer BF16 over FP8
+    if use_compile:
+        print("🔧 Using BF16 mixed precision (torch.compile() compatible)")
+        
+        # Apply BF16 to most operations for excellent performance and stability
+        if torch.cuda.is_bf16_supported():
+            model = model.to(dtype=torch.bfloat16)
+            print("✅ Applied BF16 mixed precision to transformer blocks")
+        else:
+            # Fallback to FP16 if BF16 not supported
+            model = model.to(dtype=torch.float16)
+            print("✅ Applied FP16 mixed precision (BF16 not supported)")
+    
     else:
-        print("⚠️  TorchAO not available, skipping FP8 optimization")
+        # Only try FP8 when NOT using torch.compile()
+        print("🔧 Using FP8 + BF16 mixed precision (no compilation)")
+        
+        if TORCHAO_AVAILABLE:
+            try:
+                # Get all linear layers for FP8 quantization
+                linear_layers = []
+                for name, module in model.named_modules():
+                    if isinstance(module, nn.Linear):
+                        # Apply FP8 to linear layers in attention and FFN
+                        if any(part in name for part in ["attn", "ffn", "qkv_proj", "o_proj", "w1", "w2", "w3"]):
+                            linear_layers.append(name)
 
-    # Step 2: Apply BF16 to most operations (better stability than FP16)
-    if torch.cuda.is_bf16_supported():
-        # Convert most of model to BF16
-        model = model.to(dtype=torch.bfloat16)
-        print("✅ Applied BF16 mixed precision to transformer blocks")
-    else:
-        # Fallback to FP16 if BF16 not supported
-        model = model.to(dtype=torch.float16)
-        print("✅ Applied FP16 mixed precision (BF16 not supported)")
+                if linear_layers:
+                    # Apply FP8 quantization to linear layers
+                    quantize_(model, float8_dynamic_activation_float8_weight())
+                    print(f"✅ Applied FP8 to {len(linear_layers)} linear layers")
+                else:
+                    print("⚠️  No suitable linear layers found for FP8")
+
+            except Exception as e:
+                print(f"⚠️  Failed to apply FP8 quantization: {e}")
+                print("Falling back to BF16 for all operations")
+        else:
+            print("⚠️  TorchAO not available, using BF16 only")
+
+        # Apply BF16 to remaining operations
+        if torch.cuda.is_bf16_supported():
+            model = model.to(dtype=torch.bfloat16)
+            print("✅ Applied BF16 mixed precision")
+        else:
+            model = model.to(dtype=torch.float16)
+            print("✅ Applied FP16 mixed precision (BF16 not supported)")
 
     # Step 3: Keep critical layers in FP32 for numerical stability
     def convert_critical_layers_to_fp32(module):

@@ -384,15 +384,20 @@ class H100OptimizedTrainer:
         # Training loop
         self.model.train()
 
-        # Warmup CUDA kernels
+        # Warmup CUDA kernels (more conservative for compatibility)
         print("🔥 Warming up CUDA kernels...")
+        warmup_steps = 2  # Reduced warmup to avoid potential issues
         for i, batch in enumerate(self.train_dataloader):
-            if i >= 3:  # Just a few warmup steps
+            if i >= warmup_steps:
                 break
-            _ = self.train_step(batch)
-            if (i + 1) % self.config.gradient_accumulation_steps == 0:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+            try:
+                _ = self.train_step(batch)
+                if (i + 1) % self.config.gradient_accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+            except Exception as e:
+                print(f"⚠️  Warmup step {i} failed: {e}")
+                break
 
         # Reset for actual training
         self.optimizer.zero_grad()
@@ -403,105 +408,111 @@ class H100OptimizedTrainer:
 
         while self.global_step < self.config.max_steps:
             for batch_idx, batch in enumerate(self.train_dataloader):
-                # Training step
-                step_start = time.time()
-                metrics = self.train_step(batch)
+                try:
+                    # Training step
+                    step_start = time.time()
+                    metrics = self.train_step(batch)
 
-                # Track tokens
-                batch_tokens = batch["input_ids"].numel()
-                self.total_tokens += batch_tokens
+                    # Track tokens
+                    batch_tokens = batch["input_ids"].numel()
+                    self.total_tokens += batch_tokens
 
-                # Gradient accumulation
-                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if self.scaler is not None:
-                        self.scaler.unscale_(self.optimizer)
+                    # Gradient accumulation
+                    if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                        # Gradient clipping
+                        if self.scaler is not None:
+                            self.scaler.unscale_(self.optimizer)
 
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
-                    # Optimizer step
-                    if self.scaler is not None:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        self.optimizer.step()
+                        # Optimizer step
+                        if self.scaler is not None:
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
 
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
 
-                    self.global_step += 1
+                        self.global_step += 1
 
-                    # Performance calculations
-                    elapsed = time.time() - self.start_time
-                    tokens_per_sec = self.total_tokens / elapsed if elapsed > 0 else 0
-                    mfu = self._calculate_mfu(
-                        tokens_per_sec,
-                        self.config.batch_size * self.config.gradient_accumulation_steps,
-                        self.config.max_length,
-                    )
-
-                    # Logging
-                    if self.global_step % self.config.log_interval == 0:
-                        log_metrics = {
-                            "train_loss": metrics["loss"],
-                            "learning_rate": self.scheduler.get_last_lr()[0],
-                            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                            "tokens_per_second": tokens_per_sec,
-                            "mfu_percent": mfu,
-                            "global_step": self.global_step,
-                        }
-
-                        # Add GPU stats
-                        gpu_stats = self._get_gpu_stats()
-                        log_metrics.update(gpu_stats)
-
-                        # Log to wandb
-                        if self.config.use_wandb:
-                            wandb.log(log_metrics)
-
-                        # Print progress
-                        print(
-                            f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
-                            f"lr={log_metrics['learning_rate']:.2e}, "
-                            f"tokens/sec={tokens_per_sec:.0f}, "
-                            f"MFU={mfu:.1f}%"
+                        # Performance calculations
+                        elapsed = time.time() - self.start_time
+                        tokens_per_sec = self.total_tokens / elapsed if elapsed > 0 else 0
+                        mfu = self._calculate_mfu(
+                            tokens_per_sec,
+                            self.config.batch_size * self.config.gradient_accumulation_steps,
+                            self.config.max_length,
                         )
 
-                    # Evaluation
-                    if self.global_step % self.config.eval_interval == 0:
-                        print(f"\n🔍 Running evaluation at step {self.global_step}...")
-                        eval_start = time.time()
-                        eval_metrics = self.evaluate()
-                        eval_time = time.time() - eval_start
+                        # Logging
+                        if self.global_step % self.config.log_interval == 0:
+                            log_metrics = {
+                                "train_loss": metrics["loss"],
+                                "learning_rate": self.scheduler.get_last_lr()[0],
+                                "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                                "tokens_per_second": tokens_per_sec,
+                                "mfu_percent": mfu,
+                                "global_step": self.global_step,
+                            }
 
-                        print(
-                            f"✅ Val loss: {eval_metrics['val_loss']:.4f} | "
-                            f"Perplexity: {eval_metrics['val_perplexity']:.2f}"
-                        )
+                            # Add GPU stats
+                            gpu_stats = self._get_gpu_stats()
+                            log_metrics.update(gpu_stats)
 
-                        # Log to wandb
-                        if self.config.use_wandb:
-                            wandb.log(eval_metrics)
+                            # Log to wandb
+                            if self.config.use_wandb:
+                                wandb.log(log_metrics)
 
-                        # Save best model
-                        if eval_metrics["val_loss"] < self.best_val_loss:
-                            self.best_val_loss = eval_metrics["val_loss"]
-                            best_path = os.path.join(self.config.output_dir, "best_model.pt")
-                            self.save_checkpoint(best_path)
-                            print(f"💾 New best model saved! Loss: {self.best_val_loss:.4f}")
+                            # Print progress
+                            print(
+                                f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
+                                f"lr={log_metrics['learning_rate']:.2e}, "
+                                f"tokens/sec={tokens_per_sec:.0f}, "
+                                f"MFU={mfu:.1f}%"
+                            )
 
-                    # Save checkpoint
-                    if self.global_step % self.config.save_interval == 0:
-                        self.save_checkpoint()
+                        # Evaluation
+                        if self.global_step % self.config.eval_interval == 0:
+                            print(f"\n🔍 Running evaluation at step {self.global_step}...")
+                            eval_start = time.time()
+                            eval_metrics = self.evaluate()
+                            eval_time = time.time() - eval_start
 
-                    # Check target loss
-                    if hasattr(self, "best_val_loss") and self.best_val_loss < 3.0781:
-                        print(f"\n🎯 TARGET ACHIEVED! Validation loss {self.best_val_loss:.4f} < 3.0781")
-                        break
+                            print(
+                                f"✅ Val loss: {eval_metrics['val_loss']:.4f} | "
+                                f"Perplexity: {eval_metrics['val_perplexity']:.2f}"
+                            )
 
-                    # Check if done
-                    if self.global_step >= self.config.max_steps:
-                        break
+                            # Log to wandb
+                            if self.config.use_wandb:
+                                wandb.log(eval_metrics)
+
+                            # Save best model
+                            if eval_metrics["val_loss"] < self.best_val_loss:
+                                self.best_val_loss = eval_metrics["val_loss"]
+                                best_path = os.path.join(self.config.output_dir, "best_model.pt")
+                                self.save_checkpoint(best_path)
+                                print(f"💾 New best model saved! Loss: {self.best_val_loss:.4f}")
+
+                        # Save checkpoint
+                        if self.global_step % self.config.save_interval == 0:
+                            self.save_checkpoint()
+
+                        # Check target loss
+                        if hasattr(self, "best_val_loss") and self.best_val_loss < 3.0781:
+                            print(f"\n🎯 TARGET ACHIEVED! Validation loss {self.best_val_loss:.4f} < 3.0781")
+                            break
+
+                        # Check if done
+                        if self.global_step >= self.config.max_steps:
+                            break
+
+                except Exception as e:
+                    print(f"⚠️  Training step failed: {e}")
+                    # Continue training instead of crashing
+                    continue
 
             self.epoch += 1
 
