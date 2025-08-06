@@ -1,6 +1,6 @@
 """Data module for OpenWebText dataset handling."""
 
-from .dataloader import OpenWebTextDataModule, OpenWebTextDataset, create_dataloaders
+from .dataloader import OpenWebTextDataModule, create_dataloaders
 from .local_dataloader import LocalOpenWebTextDataModule, LocalOpenWebTextDataset, create_local_dataloaders
 
 __all__ = [
