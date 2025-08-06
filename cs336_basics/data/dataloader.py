@@ -46,6 +46,10 @@ class LocalTokenizedDataset(IterableDataset):
         self.num_sequences = self.total_tokens // max_length
         print(f"📊 Number of {max_length}-token sequences: {self.num_sequences:,}")
 
+    def __len__(self) -> int:
+        """Return the number of sequences available."""
+        return self.num_sequences
+
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Iterate over tokenized sequences with efficient random access."""
         worker_info = torch.utils.data.get_worker_info()

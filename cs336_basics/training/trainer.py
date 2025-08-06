@@ -288,9 +288,30 @@ class H100OptimizedTrainer:
 
         return {"loss": loss.item() * self.config.gradient_accumulation_steps}
 
+    def _get_memory_usage(self) -> Dict[str, float]:
+        """Get detailed memory usage statistics."""
+        if not torch.cuda.is_available():
+            return {}
+
+        try:
+            allocated = torch.cuda.memory_allocated(0) / 1e9
+            reserved = torch.cuda.memory_reserved(0) / 1e9
+            max_allocated = torch.cuda.max_memory_allocated(0) / 1e9
+            total = torch.cuda.get_device_properties(0).total_memory / 1e9
+
+            return {
+                "memory_allocated_gb": allocated,
+                "memory_reserved_gb": reserved,
+                "memory_max_allocated_gb": max_allocated,
+                "memory_total_gb": total,
+                "memory_utilization_percent": (allocated / total) * 100,
+            }
+        except:
+            return {}
+
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
-        """Fast evaluation on validation set."""
+        """Memory-efficient evaluation on validation set."""
         self.model.eval()
 
         total_loss = 0
@@ -300,7 +321,14 @@ class H100OptimizedTrainer:
 
         eval_iter = iter(self.val_dataloader)
 
-        for _ in range(min(max_eval_batches, len(self.val_dataloader))):
+        # Handle IterableDataset which may not have len()
+        try:
+            max_batches = min(max_eval_batches, len(self.val_dataloader))
+        except TypeError:
+            # IterableDataset doesn't have len(), use max_eval_batches
+            max_batches = max_eval_batches
+
+        for batch_idx in range(max_batches):
             try:
                 batch = next(eval_iter)
             except StopIteration:
@@ -326,6 +354,10 @@ class H100OptimizedTrainer:
             total_loss += loss.item() * batch_size * seq_len
             total_tokens += batch_size * seq_len
             num_batches += 1
+
+            # Memory cleanup every few batches during evaluation
+            if batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
 
         avg_loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
         perplexity = math.exp(min(avg_loss, 10))  # Cap for numerical stability
@@ -433,7 +465,8 @@ class H100OptimizedTrainer:
                             self.optimizer.step()
 
                         self.scheduler.step()
-                        self.optimizer.zero_grad()
+                        # Use set_to_none=True for memory efficiency (PyTorch 2.0+ default)
+                        self.optimizer.zero_grad(set_to_none=True)
 
                         self.global_step += 1
 
@@ -461,21 +494,31 @@ class H100OptimizedTrainer:
                             gpu_stats = self._get_gpu_stats()
                             log_metrics.update(gpu_stats)
 
+                            # Add memory stats
+                            memory_stats = self._get_memory_usage()
+                            log_metrics.update(memory_stats)
+
                             # Log to wandb
                             if self.config.use_wandb:
                                 wandb.log(log_metrics)
 
-                            # Print progress
+                            # Print progress with memory info
+                            memory_pct = memory_stats.get("memory_utilization_percent", 0)
                             print(
                                 f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
                                 f"lr={log_metrics['learning_rate']:.2e}, "
                                 f"tokens/sec={tokens_per_sec:.0f}, "
-                                f"MFU={mfu:.1f}%"
+                                f"MFU={mfu:.1f}%, "
+                                f"mem={memory_pct:.1f}%"
                             )
 
                         # Evaluation
                         if self.global_step % self.config.eval_interval == 0:
                             print(f"\n🔍 Running evaluation at step {self.global_step}...")
+
+                            # Clear cache before evaluation for memory efficiency
+                            torch.cuda.empty_cache()
+
                             eval_start = time.time()
                             eval_metrics = self.evaluate()
                             eval_time = time.time() - eval_start
@@ -495,6 +538,9 @@ class H100OptimizedTrainer:
                                 best_path = os.path.join(self.config.output_dir, "best_model.pt")
                                 self.save_checkpoint(best_path)
                                 print(f"💾 New best model saved! Loss: {self.best_val_loss:.4f}")
+
+                            # Clear cache after evaluation
+                            torch.cuda.empty_cache()
 
                         # Save checkpoint
                         if self.global_step % self.config.save_interval == 0:

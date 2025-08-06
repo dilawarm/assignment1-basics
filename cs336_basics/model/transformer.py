@@ -297,7 +297,7 @@ class TransformerLM(nn.Module):
 def apply_selective_mixed_precision(model: nn.Module, use_compile: bool = True) -> nn.Module:
     """
     Apply selective mixed precision following best practices for transformers.
-    
+
     This version is compatible with torch.compile() by avoiding TorchAO FP8 when compiling.
 
     Based on research and NVIDIA recommendations:
@@ -310,7 +310,7 @@ def apply_selective_mixed_precision(model: nn.Module, use_compile: bool = True) 
     # For torch.compile() compatibility, prefer BF16 over FP8
     if use_compile:
         print("🔧 Using BF16 mixed precision (torch.compile() compatible)")
-        
+
         # Apply BF16 to most operations for excellent performance and stability
         if torch.cuda.is_bf16_supported():
             model = model.to(dtype=torch.bfloat16)
@@ -319,11 +319,11 @@ def apply_selective_mixed_precision(model: nn.Module, use_compile: bool = True) 
             # Fallback to FP16 if BF16 not supported
             model = model.to(dtype=torch.float16)
             print("✅ Applied FP16 mixed precision (BF16 not supported)")
-    
+
     else:
         # Only try FP8 when NOT using torch.compile()
         print("🔧 Using FP8 + BF16 mixed precision (no compilation)")
-        
+
         if TORCHAO_AVAILABLE:
             try:
                 # Get all linear layers for FP8 quantization

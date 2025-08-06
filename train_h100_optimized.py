@@ -4,11 +4,11 @@ Ultra-optimized H100 training script for 350M parameter transformer.
 Target: Beat validation loss of 3.0781 on OpenWebText in 1.5 hours.
 
 Key optimizations:
-- Larger batch sizes to utilize 80GB H100 memory
+- Memory-efficient batch sizing and gradient accumulation
 - Selective mixed precision: BF16 for excellent stability and torch.compile() compatibility
 - Aggressive hyperparameters for faster convergence
 - Local pre-tokenized data for maximum I/O throughput
-- Advanced CUDA optimizations
+- Advanced CUDA optimizations with memory management
 - Compatible with both FP8 (no compile) and BF16 (with compile) modes
 """
 
@@ -78,31 +78,68 @@ def print_system_info():
     print("=" * 80)
 
 
-def calculate_optimal_batch_size():
-    """Calculate optimal batch size for 80GB H100."""
-    # Model memory estimation (350M parameters)
-    # - Model weights: 350M * 2 bytes = 0.7GB (BF16)
-    # - Activations: batch_size * seq_len * hidden_dim * layers * 2
-    # - With gradient checkpointing: much less activation memory
+def calculate_memory_efficient_batch_size():
+    """
+    Calculate memory-efficient batch size for 80GB H100.
 
-    # Conservative estimate for 80GB H100
-    # Leave ~20GB for system/other processes
-    available_memory = 60  # GB
+    Based on PyTorch memory optimization best practices:
+    https://paulbridger.com/posts/pytorch-memory-tuning/
+    """
+    # Model memory estimation (350M parameters with BF16)
+    model_params = 350e6
 
-    # With BF16 + gradient checkpointing, we can fit larger batches
-    # Each sequence (1024 tokens) uses roughly 80MB with all optimizations
-    estimated_memory_per_batch = 0.08  # GB per sequence
+    # Memory breakdown for transformer models:
+    # 1. Model parameters: 350M * 2 bytes = 0.7GB (BF16)
+    # 2. Gradients: 350M * 2 bytes = 0.7GB (BF16)
+    # 3. Optimizer states: 350M * 8 bytes = 2.8GB (Adam: momentum + variance)
+    # 4. Activations: batch_size * seq_len * hidden_dim * layers * multiplier
 
-    max_batch_size = int(available_memory / estimated_memory_per_batch)
+    base_memory = 0.7 + 0.7 + 2.8  # Model + gradients + optimizer = 4.2GB
 
-    # Be conservative and use 70% of calculated max
-    optimal_batch_size = max(16, int(max_batch_size * 0.7))
+    # Available memory for activations (leave 10GB safety margin)
+    available_memory = 80 - base_memory - 10  # ~65GB for activations
 
-    return min(optimal_batch_size, 64)  # Cap at 64 for stability
+    # Activation memory per sequence with gradient checkpointing
+    # With checkpointing: activations ≈ 2 * sqrt(n_layers) * hidden_dim * seq_len * 2 bytes
+    n_layers = 24
+    hidden_dim = 1024
+    seq_len = 1024
+
+    # Memory per sequence with gradient checkpointing (much more efficient)
+    activation_memory_per_seq = 2 * (n_layers**0.5) * hidden_dim * seq_len * 2 / 1e9  # GB
+
+    # Calculate max batch size
+    max_batch_size = int(available_memory / activation_memory_per_seq)
+
+    # Be conservative: use 60% of calculated max
+    optimal_batch_size = max(8, int(max_batch_size * 0.6))
+
+    # Cap at reasonable limit for stability
+    optimal_batch_size = min(optimal_batch_size, 32)
+
+    print(f"💾 Memory Analysis:")
+    print(f"  Base memory (model + optimizer): {base_memory:.1f}GB")
+    print(f"  Available for activations: {available_memory:.1f}GB")
+    print(f"  Memory per sequence: {activation_memory_per_seq * 1000:.1f}MB")
+    print(f"  Calculated max batch size: {max_batch_size}")
+    print(f"  Conservative optimal: {optimal_batch_size}")
+
+    return optimal_batch_size
+
+
+def setup_memory_optimizations():
+    """Setup memory optimization environment variables."""
+    # Enable expandable segments to reduce fragmentation
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+
+    # Enable memory pool for better allocation patterns
+    torch.cuda.empty_cache()
+
+    print("✅ Memory optimizations configured")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="H100-optimized 350M transformer training")
+    parser = argparse.ArgumentParser(description="Memory-optimized H100 transformer training")
 
     # Model arguments
     parser.add_argument("--dim", type=int, default=1024, help="Model dimension")
@@ -111,12 +148,17 @@ def main():
     parser.add_argument("--head_dim", type=int, default=64, help="Attention head dimension")
     parser.add_argument("--intermediate_size", type=int, default=4096, help="FFN intermediate size")
 
-    # Training arguments - Optimized defaults
+    # Training arguments - Memory-optimized defaults
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (auto-calculated if None)")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak learning rate (increased)")
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=8,
+        help="Gradient accumulation steps (increased for memory efficiency)",
+    )
+    parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak learning rate")
     parser.add_argument("--min_learning_rate", type=float, default=6e-5, help="Minimum learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps (reduced)")
+    parser.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
     parser.add_argument("--max_hours", type=float, default=1.5, help="Maximum training hours")
 
     # Data arguments
@@ -133,15 +175,18 @@ def main():
         help="Path to validation data .npy file",
     )
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of data workers")
-    parser.add_argument("--prefetch_factor", type=int, default=4, help="Prefetch factor")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data workers (reduced for memory)")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor (reduced for memory)")
 
     # Optimization arguments
     parser.add_argument("--use_bf16", action="store_true", default=True, help="Use BF16 mixed precision")
     parser.add_argument("--use_flash_attn", action="store_true", default=True, help="Use Flash Attention")
     parser.add_argument("--compile_model", action="store_true", default=True, help="Compile model")
     parser.add_argument(
-        "--gradient_checkpointing", action="store_true", default=True, help="Use gradient checkpointing"
+        "--gradient_checkpointing",
+        action="store_true",
+        default=True,
+        help="Use gradient checkpointing (essential for memory)",
     )
 
     # Logging arguments
@@ -151,6 +196,9 @@ def main():
     parser.add_argument("--log_interval", type=int, default=50, help="Logging interval")
 
     args = parser.parse_args()
+
+    # Setup memory optimizations first
+    setup_memory_optimizations()
 
     # Print system information
     print_system_info()
@@ -166,28 +214,34 @@ def main():
     print(f"✅ Found training data: {args.train_data_path}")
     print(f"✅ Found validation data: {args.val_data_path}")
 
-    # Calculate optimal batch size if not provided
+    # Calculate memory-efficient batch size if not provided
     if args.batch_size is None:
-        args.batch_size = calculate_optimal_batch_size()
-        print(f"🧮 Auto-calculated batch size: {args.batch_size}")
+        args.batch_size = calculate_memory_efficient_batch_size()
+        print(f"🧮 Auto-calculated memory-efficient batch size: {args.batch_size}")
+    else:
+        print(f"⚠️  Using manual batch size: {args.batch_size}")
 
-    # Validate batch size isn't too large
-    if args.batch_size > 64:
-        print(f"⚠️  Large batch size ({args.batch_size}) detected. Consider reducing if OOM occurs.")
+    # Validate memory usage
+    estimated_memory_gb = 4.2 + args.batch_size * 0.15  # Base + batch memory
+    if estimated_memory_gb > 70:
+        print(f"⚠️  WARNING: Estimated memory usage {estimated_memory_gb:.1f}GB may cause OOM!")
+        print("Consider reducing batch size or enabling gradient checkpointing.")
 
-    print(f"\n📊 Training Configuration:")
+    print(f"\n📊 Memory-Optimized Training Configuration:")
     print(f"  Model: 350M parameters ({args.n_layers} layers, {args.dim} hidden)")
-    print(f"  Batch size: {args.batch_size}")
+    print(f"  Batch size: {args.batch_size} (memory-optimized)")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.max_length:,} tokens")
     print(f"  Learning rate: {args.learning_rate} -> {args.min_learning_rate}")
     print(f"  Max training time: {args.max_hours} hours")
     print(f"  Mixed precision: {'BF16' if args.use_bf16 else 'FP32'}")
     print(f"  Model compilation: {'Enabled' if args.compile_model else 'Disabled'}")
+    print(f"  Gradient checkpointing: {'Enabled' if args.gradient_checkpointing else 'Disabled'}")
+    print(f"  Estimated memory usage: {estimated_memory_gb:.1f}GB")
     print()
 
     # Create model
-    print("🏗️  Creating model...")
+    print("🏗️  Creating memory-optimized model...")
     model = TransformerLM(
         vocab_size=50257,
         max_seq_len=args.max_length,
@@ -211,8 +265,8 @@ def main():
             print(f"⚠️  Failed to apply mixed precision optimizations: {e}")
             args.use_bf16 = False
 
-    # Create optimized data loaders
-    print("📂 Creating optimized data loaders from local .npy files...")
+    # Create memory-optimized data loaders
+    print("📂 Creating memory-optimized data loaders...")
     train_dataloader, val_dataloader = create_dataloaders(
         train_data_path=args.train_data_path,
         val_data_path=args.val_data_path,
@@ -224,7 +278,7 @@ def main():
     )
 
     # Calculate training steps
-    estimated_tokens_per_sec = 400_000  # More conservative estimate for stability
+    estimated_tokens_per_sec = 300_000  # Conservative estimate with memory optimizations
     total_seconds = args.max_hours * 3600
     total_tokens = estimated_tokens_per_sec * total_seconds
     tokens_per_step = args.batch_size * args.gradient_accumulation_steps * args.max_length
@@ -237,9 +291,9 @@ def main():
     print(f"  Planned steps: {max_steps:,}")
     print(f"  Tokens per step: {tokens_per_step:,}")
 
-    # Create optimized training config
+    # Create memory-optimized training config
     config = TrainingConfig(
-        model_name=f"gpt-350m-h100-compatible-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        model_name=f"gpt-350m-h100-memory-optimized-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         learning_rate=args.learning_rate,
         min_learning_rate=args.min_learning_rate,
         weight_decay=0.1,
@@ -267,8 +321,8 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # Create optimized trainer
-    print("🎯 Creating H100-optimized trainer...")
+    # Create memory-optimized trainer
+    print("🎯 Creating H100 memory-optimized trainer...")
     trainer = H100OptimizedTrainer(
         model=model,
         train_dataloader=train_dataloader,
@@ -277,28 +331,35 @@ def main():
     )
 
     # Print optimization status
-    print(f"\n⚙️  Optimizations:")
+    print(f"\n⚙️  Memory Optimizations:")
     print(f"  Mixed Precision: {'✅ BF16' if config.use_bf16 else '❌'}")
     print(f"  Flash Attention: {'✅' if config.use_flash_attn else '❌'}")
     print(f"  Model Compilation: {'✅' if config.compile_model else '❌'}")
-    print(f"  Gradient Checkpointing: {'✅' if config.gradient_checkpointing else '❌'}")
+    print(f"  Gradient Checkpointing: {'✅ ENABLED' if config.gradient_checkpointing else '❌ DISABLED'}")
     print(f"  Fused AdamW: {'✅' if config.use_fused_adamw else '❌'}")
+    print(
+        f"  Memory Allocation: {'✅ Optimized' if 'expandable_segments' in os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '') else '❌'}"
+    )
 
     # Memory estimate
     model_size_gb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1e9
-    print(f"\n💾 Memory Estimate:")
-    print(f"  Model size: {model_size_gb:.1f} GB")
+    print(f"\n💾 Memory Breakdown:")
+    print(f"  Model parameters: {model_size_gb:.1f} GB")
+    print(f"  Estimated total usage: {estimated_memory_gb:.1f} GB")
     print(f"  Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    print(f"  Expected utilization: ~60-70%")
+    print(f"  Memory efficiency: {(estimated_memory_gb / 80) * 100:.1f}%")
 
     # Start training
-    print("\n" + "🚀 Starting optimized training...")
+    print("\n" + "🚀 Starting memory-optimized training...")
     print("🎯 Target: Beat validation loss of 3.0781")
     print("🔥 Expected: Achieve validation loss of 2.8-2.9")
-    print("🛡️  Enhanced compatibility mode for stability")
+    print("💾 Memory-optimized for stability and efficiency")
     print("-" * 80)
 
     try:
+        # Clear any cached memory before training
+        torch.cuda.empty_cache()
+
         final_metrics = trainer.train()
 
         # Print success/failure
@@ -310,6 +371,9 @@ def main():
         import traceback
 
         traceback.print_exc()
+
+        # Try to free memory for debugging
+        torch.cuda.empty_cache()
         sys.exit(1)
 
 
