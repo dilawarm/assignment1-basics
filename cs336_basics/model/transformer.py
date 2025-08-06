@@ -213,7 +213,7 @@ class TransformerLM(nn.Module):
                     attention_mask,
                     use_cache,
                     past_kv,
-                    use_reentrant=False,  # Better performance on newer PyTorch
+                    use_reentrant=True,  # More compatible with torch.compile()
                 )
             else:
                 h, present_kv = block(h, attention_mask, use_cache, past_kv)

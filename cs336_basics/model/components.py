@@ -44,6 +44,7 @@ class RotaryPositionEmbedding(nn.Module):
     """Rotary Position Embeddings (RoPE).
 
     Better sequence modeling than learned position embeddings.
+    Stateless implementation compatible with torch.compile() and gradient checkpointing.
     """
 
     def __init__(self, dim: int, max_seq_len: int = 2048, base: int = 10000):
@@ -55,22 +56,16 @@ class RotaryPositionEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
-        self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
-
-    def _update_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        """Update the cache for sin/cos values if needed."""
-        if seq_len > self._seq_len_cached:
-            self._seq_len_cached = seq_len
-
-            pos = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-
-            inv_freq = self.inv_freq.to(device)
-            freqs = torch.einsum("i,j->ij", pos, inv_freq)
-
-            self._cos_cached = freqs.cos().to(dtype)
-            self._sin_cached = freqs.sin().to(dtype)
+    def _compute_cos_sin(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """Compute sin/cos values for the given sequence length (stateless)."""
+        pos = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        
+        inv_freq = self.inv_freq.to(device)
+        freqs = torch.einsum("i,j->ij", pos, inv_freq)
+        # freqs has shape [seq_len, dim//2]
+        # For RoPE, we only need cos/sin for half the dimensions
+        
+        return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, seq_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply rotary embeddings to query and key tensors.
@@ -84,10 +79,9 @@ class RotaryPositionEmbedding(nn.Module):
             Tuple of rotated (q, k) tensors
         """
         seq_len = q.shape[seq_dim]
-        self._update_cache(seq_len, q.device, q.dtype)
-
-        cos = self._cos_cached[:seq_len]
-        sin = self._sin_cached[:seq_len]
+        
+        # Compute sin/cos on-the-fly (stateless, compile-friendly)
+        cos, sin = self._compute_cos_sin(seq_len, q.device, q.dtype)
 
         q_rot = self._apply_rotation(q, cos, sin, seq_dim)
         k_rot = self._apply_rotation(k, cos, sin, seq_dim)
@@ -96,15 +90,23 @@ class RotaryPositionEmbedding(nn.Module):
 
     def _apply_rotation(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, seq_dim: int) -> torch.Tensor:
         """Apply the rotation to a tensor."""
+        # x has shape [..., seq_len, n_heads, head_dim]
+        # cos, sin have shape [seq_len, head_dim//2]
+        
+        # Split x into two halves for rotation
+        x1, x2 = x.chunk(2, dim=-1)  # Each has shape [..., seq_len, n_heads, head_dim//2]
+        
+        # Reshape cos/sin to broadcast properly
         if seq_dim == 1:
-            cos = cos[:, None, :]
-            sin = sin[:, None, :]
+            # x: [..., seq_len, n_heads, head_dim//2]
+            cos = cos[:, None, :]  # [seq_len, 1, head_dim//2]
+            sin = sin[:, None, :]  # [seq_len, 1, head_dim//2]
         elif seq_dim == 0:
-            cos = cos[:, None, None, :]
-            sin = sin[:, None, None, :]
+            # x: [seq_len, ..., n_heads, head_dim//2]
+            cos = cos[:, None, None, :]  # [seq_len, 1, 1, head_dim//2]
+            sin = sin[:, None, None, :]  # [seq_len, 1, 1, head_dim//2]
 
-        x1, x2 = x.chunk(2, dim=-1)
-
+        # Apply rotation
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
