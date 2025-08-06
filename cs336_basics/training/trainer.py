@@ -116,7 +116,8 @@ class H100OptimizedTrainer:
             self._setup_fp8()
 
         # Compile model for maximum performance
-        if config.compile_model:
+        # Note: FP8 and torch.compile() have compatibility issues
+        if config.compile_model and not config.use_fp8:
             print("🔧 Compiling model with torch.compile...")
             self.model = torch.compile(
                 self.model,
@@ -124,6 +125,16 @@ class H100OptimizedTrainer:
                 fullgraph=True,  # Compile entire graph
                 backend="inductor",  # Use TorchInductor backend
             )
+        elif config.compile_model and config.use_fp8:
+            print("🔧 Compiling model with FP8-compatible settings...")
+            self.model = torch.compile(
+                self.model,
+                mode="default",       # Use default mode for FP8 compatibility
+                fullgraph=False,      # Don't force fullgraph with FP8
+                backend="inductor"
+            )
+        else:
+            print("🔧 Skipping model compilation (FP8 + compile can have issues)")
 
         # Setup optimizer with optimizations
         self.optimizer = self._create_optimizer()
