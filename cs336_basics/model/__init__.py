@@ -1,7 +1,7 @@
 """Model module for CS336 H100-optimized transformer."""
 
 from .components import RMSNorm, RotaryPositionEmbedding, SwiGLU
-from .transformer import MultiHeadAttention, TransformerBlock, TransformerLM, apply_torchao_optimizations
+from .transformer import MultiHeadAttention, TransformerBlock, TransformerLM, apply_selective_mixed_precision
 
 __all__ = [
     "RMSNorm",
@@ -10,5 +10,5 @@ __all__ = [
     "MultiHeadAttention",
     "TransformerBlock",
     "TransformerLM",
-    "apply_torchao_optimizations",
+    "apply_selective_mixed_precision",
 ]
