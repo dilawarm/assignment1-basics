@@ -1,175 +1,80 @@
-"""Transformer model for TorchAO FP8 training."""
+"""Main transformer model implementation with TorchAO FP8 support."""
 
 import math
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .components import RMSNorm, RotaryPositionEmbedding, SwiGLU
+# Try to import TorchAO for FP8
+try:
+    import torchao
 
+    TORCHAO_AVAILABLE = True
+except ImportError:
+    TORCHAO_AVAILABLE = False
 
-class MultiHeadAttention(nn.Module):
-    """Multi-head attention using standard PyTorch operations."""
-
-    def __init__(
-        self,
-        dim: int,
-        n_heads: int,
-        head_dim: int,
-        dropout: float = 0.0,
-        bias: bool = False,
-        use_flash: bool = True,
-        layer_idx: int = 0,
-        total_layers: int = 1,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.n_heads = n_heads
-        self.head_dim = head_dim
-        self.use_flash = use_flash
-        self.layer_idx = layer_idx
-        self.total_layers = total_layers
-
-        self.qkv_proj = nn.Linear(dim, 3 * n_heads * head_dim, bias=bias)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=bias)
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.rope = RotaryPositionEmbedding(head_dim)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights with scaled initialization."""
-        std = 0.02
-        nn.init.normal_(self.qkv_proj.weight, mean=0.0, std=std)
-        if self.qkv_proj.bias is not None:
-            nn.init.zeros_(self.qkv_proj.bias)
-
-        output_std = std / math.sqrt(2 * self.total_layers)
-        nn.init.normal_(self.o_proj.weight, mean=0.0, std=output_std)
-        if self.o_proj.bias is not None:
-            nn.init.zeros_(self.o_proj.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        use_cache: bool = False,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        batch_size, seq_len, _ = x.shape
-
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(self.n_heads * self.head_dim, dim=-1)
-
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim)
-
-        q, k = self.rope(q, k)
-
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            k = torch.cat([past_k, k], dim=1)
-            v = torch.cat([past_v, v], dim=1)
-
-        present_kv = (k, v) if use_cache else None
-
-        if self.use_flash:
-            try:
-                from flash_attn import flash_attn_func
-
-                attn_out = flash_attn_func(
-                    q,
-                    k,
-                    v,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    softmax_scale=1.0 / math.sqrt(self.head_dim),
-                    causal=True,
-                )
-            except ImportError:
-                attn_out = self._standard_attention(q, k, v, attention_mask)
-        else:
-            attn_out = self._standard_attention(q, k, v, attention_mask)
-
-        attn_out = attn_out.reshape(batch_size, seq_len, -1)
-
-        out = self.o_proj(attn_out)
-        out = self.dropout(out)
-
-        return out, present_kv
-
-    def _standard_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor | None
-    ) -> torch.Tensor:
-        """Standard scaled dot-product attention."""
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        if attention_mask is None:
-            seq_len = q.size(2)
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
-            scores.masked_fill_(causal_mask, float("-inf"))
-        else:
-            scores += attention_mask
-
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        attn_out = torch.matmul(attn_weights, v)
-
-        return attn_out.transpose(1, 2)
+from .attention import MultiHeadAttention
+from .components import RMSNorm, SwiGLU, scaled_init_
 
 
 class TransformerBlock(nn.Module):
-    """Standard transformer block."""
+    """Single transformer block with attention and feedforward."""
 
     def __init__(
         self,
-        dim: int,
-        n_heads: int,
-        head_dim: int,
-        intermediate_size: int,
+        dim: int = 1024,
+        n_heads: int = 16,
+        head_dim: int = 64,
+        intermediate_size: int = 4096,
         dropout: float = 0.0,
         use_flash: bool = True,
         layer_idx: int = 0,
-        total_layers: int = 1,
+        total_layers: int = 24,
     ):
         super().__init__()
+        self.dim = dim
+        self.layer_idx = layer_idx
+
+        # Layer normalization (RMSNorm is more efficient than LayerNorm)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+        # Multi-head attention
         self.attn = MultiHeadAttention(
             dim=dim,
             n_heads=n_heads,
             head_dim=head_dim,
             dropout=dropout,
-            bias=False,
             use_flash=use_flash,
             layer_idx=layer_idx,
             total_layers=total_layers,
         )
-        self.ffn = SwiGLU(dim_in=dim, dim_hidden=intermediate_size)
-        self.attention_norm = RMSNorm(dim)
-        self.ffn_norm = RMSNorm(dim)
-        self.dropout = nn.Dropout(dropout)
+
+        # Feedforward with SwiGLU
+        self.ffn = SwiGLU(dim, intermediate_size)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward pass for transformer block."""
+        # Self-attention with residual
         residual = x
-        x = self.attention_norm(x)
+        x = self.norm1(x)
         attn_out, present_kv = self.attn(x, attention_mask, use_cache, past_key_value)
         x = residual + self.dropout(attn_out)
 
+        # FFN with residual
         residual = x
-        x = self.ffn_norm(x)
+        x = self.norm2(x)
         ffn_out = self.ffn(x)
         x = residual + self.dropout(ffn_out)
 
@@ -177,11 +82,11 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerLM(nn.Module):
-    """Transformer Language Model for TorchAO FP8 training."""
+    """Transformer Language Model with exact 350M parameters."""
 
     def __init__(
         self,
-        vocab_size: int = 50257,
+        vocab_size: int = 50257,  # GPT-2 tokenizer size
         max_seq_len: int = 1024,
         dim: int = 1024,
         n_layers: int = 24,
@@ -201,8 +106,10 @@ class TransformerLM(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
+        # Token embeddings
         self.token_emb = nn.Embedding(vocab_size, dim)
 
+        # Transformer blocks
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -219,23 +126,31 @@ class TransformerLM(nn.Module):
             ]
         )
 
+        # Final layer norm
         self.ln_f = RMSNorm(dim)
 
+        # Language modeling head
         if tie_embeddings:
+            # Share weights between input and output embeddings
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
+        # Initialize weights
         self._init_weights()
 
+        # Print model size
         self._print_model_size()
 
     def _init_weights(self):
         """Initialize model weights with scaled initialization."""
+        # Token embeddings
         std = 0.02
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=std)
 
+        # LM head (if not tied)
         if self.lm_head is not None:
+            # Smaller initialization for output layer
             output_std = std / math.sqrt(2 * self.n_layers)
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=output_std)
 
@@ -250,16 +165,16 @@ class TransformerLM(nn.Module):
         return self.token_emb
 
     def get_output_embeddings(self):
-        return self.lm_head if not self.tie_embeddings else self.token_emb
+        return self.lm_head if self.lm_head is not None else self.token_emb
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
-    ) -> dict[str, torch.Tensor]:
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for language modeling.
 
@@ -273,15 +188,19 @@ class TransformerLM(nn.Module):
         Returns:
             Dictionary with 'logits' and optionally 'loss' and 'past_key_values'
         """
+        batch_size, seq_len = input_ids.shape
+
+        # Token embeddings
         h = self.token_emb(input_ids)
 
+        # Process through transformer blocks
         present_key_values = () if use_cache else None
 
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
 
             if self.use_gradient_checkpointing and self.training:
-
+                # Use gradient checkpointing to save memory
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(*inputs)
@@ -294,7 +213,7 @@ class TransformerLM(nn.Module):
                     attention_mask,
                     use_cache,
                     past_kv,
-                    use_reentrant=False,
+                    use_reentrant=False,  # Better performance on newer PyTorch
                 )
             else:
                 h, present_kv = block(h, attention_mask, use_cache, past_kv)
@@ -302,19 +221,26 @@ class TransformerLM(nn.Module):
             if use_cache:
                 present_key_values = present_key_values + (present_kv,)
 
+        # Final layer norm
         h = self.ln_f(h)
 
+        # Language modeling head
         if self.tie_embeddings:
+            # Use shared embeddings
             logits = F.linear(h, self.token_emb.weight)
         else:
             logits = self.lm_head(h)
 
+        # Prepare output
         output = {"logits": logits}
 
+        # Calculate loss if labels provided
         if labels is not None:
+            # Shift for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
+            # Flatten for loss calculation
             loss = F.cross_entropy(
                 shift_logits.view(-1, self.vocab_size),
                 shift_labels.view(-1),
@@ -333,31 +259,20 @@ class TransformerLM(nn.Module):
         input_ids: torch.Tensor,
         max_length: int = 100,
         temperature: float = 1.0,
-        top_k: int | None = None,
-        top_p: float | None = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> torch.Tensor:
-        """
-        Simple generation method for testing.
-
-        Args:
-            input_ids: Starting token IDs
-            max_length: Maximum sequence length to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-            top_p: Top-p (nucleus) sampling parameter
-
-        Returns:
-            Generated token IDs
-        """
+        """Simple generation method for testing."""
         self.eval()
-        generated = input_ids
 
         for _ in range(max_length - input_ids.shape[1]):
-            outputs = self.forward(generated)
+            # Forward pass
+            outputs = self(input_ids)
             logits = outputs["logits"][:, -1, :] / temperature
 
+            # Apply top-k/top-p filtering
             if top_k is not None:
-                indices_to_remove = logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
                 logits[indices_to_remove] = float("-inf")
 
             if top_p is not None:
@@ -366,11 +281,33 @@ class TransformerLM(nn.Module):
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[torch.arange(logits.shape[0]).unsqueeze(1), indices_to_remove] = float("-inf")
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = float("-inf")
 
+            # Sample
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat([generated, next_token], dim=1)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
 
-        return generated
+        return input_ids
+
+
+def apply_torchao_optimizations(model: nn.Module, device: torch.device) -> nn.Module:
+    """Apply TorchAO optimizations including FP8."""
+    if not TORCHAO_AVAILABLE:
+        print("Warning: TorchAO not available. Skipping FP8 optimizations.")
+        return model
+
+    try:
+        # Apply FP8 quantization using TorchAO
+        # This converts linear layers to use FP8 precision
+        from torchao.quantization import float8_dynamic_activation_float8_weight, quantize_
+
+        # Quantize the model to FP8
+        quantize_(model, float8_dynamic_activation_float8_weight())
+        print("✅ Applied TorchAO FP8 quantization")
+
+    except Exception as e:
+        print(f"Warning: Failed to apply TorchAO optimizations: {e}")
+
+    return model

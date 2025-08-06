@@ -1,85 +1,95 @@
-"""H100-optimized trainer with TorchAO FP8 support."""
+"""H100-optimized trainer with TorchAO FP8 support and maximum throughput."""
 
 import math
 import os
 import time
 from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+import wandb
+
+# Try to import TorchAO for FP8
+try:
+    import torchao
+    from torchao.quantization import float8_dynamic_activation_float8_weight, quantize_
+
+    TORCHAO_AVAILABLE = True
+except ImportError:
+    TORCHAO_AVAILABLE = False
+    print("Warning: TorchAO not available")
 
 try:
     import pynvml
 
     pynvml.nvmlInit()
-    PYNVML_AVAILABLE = True
-except (ImportError, pynvml.NVMLError):
-    PYNVML_AVAILABLE = False
-
-try:
-    import wandb
-
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
+    NVML_AVAILABLE = True
+except:
+    NVML_AVAILABLE = False
 
 
 @dataclass
 class TrainingConfig:
-    """Training configuration."""
+    """Training configuration optimized for H100."""
 
     # Model
-    model_name: str = "gpt-350m-h100"
+    model_name: str = "gpt-350m-h100-optimized"
 
-    # Optimization
-    learning_rate: float = 4e-4
-    min_learning_rate: float = 4e-5
+    # Optimization - Aggressive settings for H100
+    learning_rate: float = 6e-4  # Increased for faster convergence
+    min_learning_rate: float = 6e-5
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
     grad_clip: float = 1.0
 
-    # Training
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 16
-    max_steps: int | None = None
-    warmup_steps: int = 2000
+    # Training - Optimized for 80GB H100
+    batch_size: int = 32  # Increased significantly
+    gradient_accumulation_steps: int = 4  # Reduced since batch_size increased
+    max_steps: Optional[int] = None
+    warmup_steps: int = 1000  # Reduced for faster ramp-up
 
     # Evaluation
-    eval_interval: int = 1000
-    log_interval: int = 100
-    save_interval: int = 5000
+    eval_interval: int = 500  # More frequent evaluation
+    log_interval: int = 50  # More frequent logging
+    save_interval: int = 2000
 
     # Data
     max_length: int = 1024
-    num_workers: int = 4
+    num_workers: int = 8
+    prefetch_factor: int = 4
 
     # Precision
     use_fp8: bool = True
-    use_amp: bool = True
+    use_amp: bool = False  # Don't use both FP8 and AMP
 
-    # Hardware
+    # Hardware optimizations
     compile_model: bool = True
-    compile_mode: str = "max-autotune"  # Options: "default", "reduce-overhead", "max-autotune"
     use_flash_attn: bool = True
     gradient_checkpointing: bool = True
 
+    # Advanced optimizations
+    use_fused_adamw: bool = True
+    use_cuda_graphs: bool = True
+
     # Logging
     use_wandb: bool = True
-    project_name: str = "cs336-assignment1"
+    project_name: str = "cs336-h100-optimized"
 
     # Paths
     output_dir: str = "./checkpoints"
-    resume_from: str | None = None
+    resume_from: Optional[str] = None
 
 
-class Trainer:
-    """H100-optimized trainer with TorchAO FP8 and Flash Attention support."""
+class H100OptimizedTrainer:
+    """H100-optimized trainer with maximum throughput focus."""
 
     def __init__(
         self,
@@ -93,69 +103,86 @@ class Trainer:
         self.val_dataloader = val_dataloader
         self.config = config
 
+        # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type != "cuda":
-            print("Warning: CUDA not available, training will be slow!")
+            raise RuntimeError("H100 trainer requires CUDA!")
 
-        if not next(self.model.parameters()).is_cuda:
-            self.model = self.model.to(self.device)
+        # Move model to device
+        self.model = self.model.to(self.device)
 
-        if self.device.type == "cuda":
-            capability = torch.cuda.get_device_capability()
-            has_float8 = any("Float8" in module.__class__.__name__ for _, module in self.model.named_modules())
+        # Apply FP8 optimizations with TorchAO
+        if config.use_fp8 and TORCHAO_AVAILABLE:
+            self._setup_fp8()
 
-            if not has_float8:
-                if capability[0] >= 8:
-                    self.model = self.model.to(torch.bfloat16)
-                    self.dtype = torch.bfloat16
-                    print(f"Using bfloat16 precision on {torch.cuda.get_device_name()}")
-                else:
-                    self.model = self.model.to(torch.float16)
-                    self.dtype = torch.float16
-                    print(f"Using float16 precision on {torch.cuda.get_device_name()}")
-            else:
-                self.dtype = next(self.model.parameters()).dtype
-                print(f"Model already configured with FP8 (base dtype: {self.dtype})")
-        else:
-            self.dtype = torch.float32
-
-        self.fp8_enabled = False
-        if config.use_fp8:
-            has_float8 = any("Float8" in module.__class__.__name__ for _, module in self.model.named_modules())
-            if has_float8:
-                self.fp8_enabled = True
-                print("TorchAO FP8 mode enabled - model contains Float8 modules")
-            else:
-                print("FP8 not enabled - install TorchAO and convert model")
-
+        # Compile model for maximum performance
         if config.compile_model:
-            print(f"Compiling model with torch.compile(mode='{config.compile_mode}')...")
-            self.model = torch.compile(self.model, mode=config.compile_mode)
-            self.use_cuda_graphs = config.compile_mode == "reduce-overhead"
-            if self.use_cuda_graphs:
-                print("  Note: Using CUDA graphs with reduce-overhead mode")
-        else:
-            self.use_cuda_graphs = False
+            print("🔧 Compiling model with torch.compile...")
+            self.model = torch.compile(
+                self.model,
+                mode="max-autotune",  # Maximum optimization
+                fullgraph=True,  # Compile entire graph
+                backend="inductor",  # Use TorchInductor backend
+            )
 
+        # Setup optimizer with optimizations
         self.optimizer = self._create_optimizer()
 
-        self.scaler = GradScaler() if config.use_amp and not self.fp8_enabled else None
+        # Setup mixed precision (only if not using FP8)
+        self.scaler = None
+        if config.use_amp and not config.use_fp8:
+            self.scaler = GradScaler()
 
+        # Setup learning rate scheduler
         self.scheduler = self._create_scheduler()
 
+        # Training state
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float("inf")
 
-        if config.use_wandb and WANDB_AVAILABLE:
-            self._setup_wandb()
-        elif config.use_wandb and not WANDB_AVAILABLE:
-            print("Warning: wandb requested but not available. Install with: pip install wandb")
+        # Performance tracking
+        self.total_tokens = 0
+        self.start_time = time.time()
 
+        # Setup logging
+        if config.use_wandb:
+            self._setup_wandb()
+
+        # Create output directory
         os.makedirs(config.output_dir, exist_ok=True)
 
+        # CUDA optimizations
+        self._setup_cuda_optimizations()
+
+    def _setup_fp8(self):
+        """Setup FP8 training with TorchAO."""
+        print("🔧 Setting up FP8 training with TorchAO...")
+        try:
+            # Apply FP8 quantization to the model
+            quantize_(self.model, float8_dynamic_activation_float8_weight())
+            print("✅ Applied TorchAO FP8 quantization")
+        except Exception as e:
+            print(f"Warning: Failed to apply FP8 quantization: {e}")
+            self.config.use_fp8 = False
+
+    def _setup_cuda_optimizations(self):
+        """Setup CUDA-specific optimizations."""
+        # Enable TensorFloat-32 for maximum performance on H100
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # Enable Flash Attention optimizations
+        torch.backends.cuda.enable_flash_sdp(True)
+
+        # Optimize memory allocation
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+        print("✅ Enabled CUDA optimizations for H100")
+
     def _create_optimizer(self):
-        """Create AdamW optimizer with weight decay."""
+        """Create optimized AdamW optimizer."""
+        # Separate parameters for weight decay
         decay_params = []
         no_decay_params = []
 
@@ -171,23 +198,26 @@ class Trainer:
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
+        # Use fused AdamW for better performance
         optimizer = AdamW(
             optimizer_groups,
             lr=self.config.learning_rate,
             betas=(self.config.beta1, self.config.beta2),
             eps=self.config.eps,
-            fused=True,
+            fused=self.config.use_fused_adamw,
         )
 
         return optimizer
 
     def _create_scheduler(self):
-        """Create cosine learning rate scheduler with warmup."""
+        """Create optimized learning rate scheduler."""
 
         def lr_lambda(step):
+            # Warmup
             if step < self.config.warmup_steps:
                 return step / self.config.warmup_steps
 
+            # Cosine decay
             progress = (step - self.config.warmup_steps) / max(1, self.config.max_steps - self.config.warmup_steps)
             return self.config.min_learning_rate / self.config.learning_rate + (
                 1 - self.config.min_learning_rate / self.config.learning_rate
@@ -196,17 +226,16 @@ class Trainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def _setup_wandb(self):
-        if WANDB_AVAILABLE:
-            wandb.init(
-                project=self.config.project_name,
-                name=self.config.model_name,
-                config=self.config.__dict__,
-            )
-            wandb.watch(self.model, log="all", log_freq=1000)
+        """Setup Weights & Biases logging."""
+        wandb.init(
+            project=self.config.project_name,
+            name=self.config.model_name,
+            config=self.config.__dict__,
+        )
 
-    def _get_gpu_stats(self) -> dict[str, float]:
+    def _get_gpu_stats(self) -> Dict[str, float]:
         """Get GPU memory and utilization stats."""
-        if not PYNVML_AVAILABLE:
+        if not NVML_AVAILABLE:
             return {}
 
         try:
@@ -217,29 +246,57 @@ class Trainer:
             return {
                 "gpu_memory_used_gb": mem_info.used / 1e9,
                 "gpu_memory_total_gb": mem_info.total / 1e9,
+                "gpu_memory_percent": (mem_info.used / mem_info.total) * 100,
                 "gpu_utilization": util_info.gpu,
             }
         except:
             return {}
 
-    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
-        """Single training step."""
-        if self.use_cuda_graphs:
-            torch.compiler.cudagraph_mark_step_begin()
+    def _calculate_mfu(self, tokens_per_sec: float, batch_size: int, seq_len: int) -> float:
+        """Calculate Model FLOPS Utilization (MFU)."""
+        # Model parameters (350M)
+        model_params = 350e6
 
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device)
+        # FLOPs per token for transformer
+        # Forward: 6 * params (attention + mlp)
+        # Backward: 2 * forward (roughly)
+        flops_per_token = 6 * model_params * 3  # 3x for forward + backward
 
-        if self.scaler is not None and not self.fp8_enabled:
-            with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+        # Total FLOPs per second
+        model_flops_per_sec = tokens_per_sec * flops_per_token
+
+        # H100 peak FLOPs (theoretical)
+        # FP16: ~1000 TFLOPs/s, FP8: ~2000 TFLOPs/s
+        peak_flops = 2000e12 if self.config.use_fp8 else 1000e12
+
+        # MFU calculation
+        mfu = (model_flops_per_sec / peak_flops) * 100
+        return min(mfu, 100.0)  # Cap at 100%
+
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """Optimized training step."""
+        # Move batch to device efficiently
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        labels = batch["labels"].to(self.device, non_blocking=True)
+
+        # Forward pass
+        if self.config.use_fp8:
+            # FP8 forward pass
+            outputs = self.model(input_ids=input_ids, labels=labels)
+        elif self.scaler is not None:
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast():
                 outputs = self.model(input_ids=input_ids, labels=labels)
         else:
+            # Standard forward pass
             outputs = self.model(input_ids=input_ids, labels=labels)
 
         loss = outputs["loss"]
 
+        # Scale loss by gradient accumulation steps
         loss = loss / self.config.gradient_accumulation_steps
 
+        # Backward pass
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
         else:
@@ -248,45 +305,62 @@ class Trainer:
         return {"loss": loss.item() * self.config.gradient_accumulation_steps}
 
     @torch.no_grad()
-    def evaluate(self) -> dict[str, float]:
-        """Evaluate on validation set."""
+    def evaluate(self) -> Dict[str, float]:
+        """Fast evaluation on validation set."""
         self.model.eval()
 
         total_loss = 0
         total_tokens = 0
+        num_batches = 0
+        max_eval_batches = 200  # Limit evaluation time
 
-        for batch in tqdm(self.val_dataloader, desc="Evaluating"):
-            if self.use_cuda_graphs:
-                torch.compiler.cudagraph_mark_step_begin()
+        eval_iter = iter(self.val_dataloader)
 
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+        for _ in range(min(max_eval_batches, len(self.val_dataloader))):
+            try:
+                batch = next(eval_iter)
+            except StopIteration:
+                break
 
-            outputs = self.model(input_ids=input_ids, labels=labels)
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            labels = batch["labels"].to(self.device, non_blocking=True)
+
+            # Forward pass
+            if self.config.use_fp8:
+                outputs = self.model(input_ids=input_ids, labels=labels)
+            else:
+                outputs = self.model(input_ids=input_ids, labels=labels)
 
             loss = outputs["loss"]
 
             batch_size, seq_len = input_ids.shape
             total_loss += loss.item() * batch_size * seq_len
             total_tokens += batch_size * seq_len
+            num_batches += 1
 
-        avg_loss = total_loss / total_tokens
-        perplexity = math.exp(avg_loss)
+        avg_loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
+        perplexity = math.exp(min(avg_loss, 10))  # Cap for numerical stability
 
         self.model.train()
 
         return {
             "val_loss": avg_loss,
             "val_perplexity": perplexity,
+            "eval_batches": num_batches,
         }
 
-    def save_checkpoint(self, path: str | None = None):
+    def save_checkpoint(self, path: Optional[str] = None):
         """Save model checkpoint."""
         if path is None:
             path = os.path.join(self.config.output_dir, f"checkpoint-{self.global_step}.pt")
 
+        # Get raw model (unwrap compiled model if needed)
+        raw_model = self.model
+        if hasattr(self.model, "_orig_mod"):
+            raw_model = self.model._orig_mod
+
         checkpoint = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": raw_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "global_step": self.global_step,
@@ -296,63 +370,67 @@ class Trainer:
         }
 
         torch.save(checkpoint, path)
-        print(f"Saved checkpoint to {path}")
+        print(f"💾 Saved checkpoint to {path}")
 
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.global_step = checkpoint["global_step"]
-        self.epoch = checkpoint["epoch"]
-        self.best_val_loss = checkpoint["best_val_loss"]
-
-        print(f"Loaded checkpoint from {path}")
-        print(f"Resuming from step {self.global_step}, epoch {self.epoch}")
-
-    def train(self, max_steps: int | None = None):
-        """Main training loop."""
+    def train(self, max_steps: Optional[int] = None):
+        """Optimized training loop for H100."""
         if max_steps is not None:
             self.config.max_steps = max_steps
 
+        # Calculate total steps for 1.5 hours
         if self.config.max_steps is None:
-            steps_per_epoch = len(self.train_dataloader) // self.config.gradient_accumulation_steps
-            estimated_steps = int(
-                5e9 / (self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length)
-            )
-            self.config.max_steps = estimated_steps
+            # Target: 1.5 hours of training
+            # With optimizations, aim for 500K+ tokens/sec
+            estimated_tokens_per_sec = 500_000
+            total_seconds = 1.5 * 3600
+            total_tokens = estimated_tokens_per_sec * total_seconds
+            tokens_per_step = self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length
+            self.config.max_steps = int(total_tokens / tokens_per_step)
 
-        print(f"Starting training for {self.config.max_steps} steps...")
+        print(f"🚀 Starting training for {self.config.max_steps} steps...")
         print(
-            f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length} tokens"
+            f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length:,} tokens"
         )
 
+        # Training loop
         self.model.train()
-        start_time = time.time()
-        tokens_processed = 0
 
-        # Create progress bar
-        pbar = tqdm(
-            total=self.config.max_steps,
-            desc="Training",
-            initial=self.global_step,
-            unit="step",
-            dynamic_ncols=True,
-            leave=True,
-        )
+        # Warmup CUDA kernels
+        print("🔥 Warming up CUDA kernels...")
+        for i, batch in enumerate(self.train_dataloader):
+            if i >= 3:  # Just a few warmup steps
+                break
+            _ = self.train_step(batch)
+            if (i + 1) % self.config.gradient_accumulation_steps == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+        # Reset for actual training
+        self.optimizer.zero_grad()
+        self.global_step = 0
+        self.start_time = time.time()
+
+        print("✅ Warmup complete. Starting actual training...")
 
         while self.global_step < self.config.max_steps:
             for batch_idx, batch in enumerate(self.train_dataloader):
+                # Training step
+                step_start = time.time()
                 metrics = self.train_step(batch)
 
+                # Track tokens
+                batch_tokens = batch["input_ids"].numel()
+                self.total_tokens += batch_tokens
+
+                # Gradient accumulation
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                    # Gradient clipping
                     if self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
 
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
+                    # Optimizer step
                     if self.scaler is not None:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -363,97 +441,127 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                     self.global_step += 1
-                    tokens_processed += (
-                        self.config.batch_size * self.config.gradient_accumulation_steps * self.config.max_length
+
+                    # Performance calculations
+                    elapsed = time.time() - self.start_time
+                    tokens_per_sec = self.total_tokens / elapsed if elapsed > 0 else 0
+                    mfu = self._calculate_mfu(
+                        tokens_per_sec,
+                        self.config.batch_size * self.config.gradient_accumulation_steps,
+                        self.config.max_length,
                     )
 
-                    # Calculate performance metrics
-                    elapsed_time = time.time() - start_time
-                    tokens_per_sec = tokens_processed / elapsed_time if elapsed_time > 0 else 0
-
-                    # Update progress bar
-                    pbar.update(1)
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{metrics['loss']:.4f}",
-                            "tok/s": f"{tokens_per_sec:.0f}",
-                            "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
-                        }
-                    )
-
+                    # Logging
                     if self.global_step % self.config.log_interval == 0:
-                        # Calculate MFU (Model FLOPs Utilization) for performance monitoring
-                        model_params = sum(p.numel() for p in self.model.parameters()) / 1e6  # in millions
-                        flops_per_token = 6 * model_params * 1e6  # 6N FLOPs per token (approximate)
-                        flops_per_second = tokens_per_sec * flops_per_token
-                        tflops = flops_per_second / 1e12
-
-                        # MFU calculation (H100 BF16 peak: ~990 TFLOPS without sparsity)
-                        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
-                        if "H100" in gpu_name:
-                            h100_tflops_peak = 990  # Conservative H100 BF16 estimate
-                            mfu = (tflops / h100_tflops_peak) * 100
-                        else:
-                            mfu = 0  # MFU only meaningful for known GPU specs
-
                         log_metrics = {
                             "train_loss": metrics["loss"],
                             "learning_rate": self.scheduler.get_last_lr()[0],
                             "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                             "tokens_per_second": tokens_per_sec,
-                            "tflops": tflops,
                             "mfu_percent": mfu,
                             "global_step": self.global_step,
                         }
 
-                        log_metrics.update(self._get_gpu_stats())
+                        # Add GPU stats
+                        gpu_stats = self._get_gpu_stats()
+                        log_metrics.update(gpu_stats)
 
-                        if self.config.use_wandb and WANDB_AVAILABLE:
+                        # Log to wandb
+                        if self.config.use_wandb:
                             wandb.log(log_metrics)
 
-                        # Write to tqdm instead of print
-                        pbar.write(
+                        # Print progress
+                        print(
                             f"Step {self.global_step}: loss={metrics['loss']:.4f}, "
                             f"lr={log_metrics['learning_rate']:.2e}, "
                             f"tokens/sec={tokens_per_sec:.0f}, "
                             f"MFU={mfu:.1f}%"
                         )
 
+                    # Evaluation
                     if self.global_step % self.config.eval_interval == 0:
-                        pbar.write("🔍 Running evaluation...")
+                        print(f"\n🔍 Running evaluation at step {self.global_step}...")
+                        eval_start = time.time()
                         eval_metrics = self.evaluate()
+                        eval_time = time.time() - eval_start
 
-                        pbar.write(
-                            f"✅ Val loss: {eval_metrics['val_loss']:.4f} | Perplexity: {eval_metrics['val_perplexity']:.2f}"
+                        print(
+                            f"✅ Val loss: {eval_metrics['val_loss']:.4f} | "
+                            f"Perplexity: {eval_metrics['val_perplexity']:.2f}"
                         )
 
-                        if self.config.use_wandb and WANDB_AVAILABLE:
+                        # Log to wandb
+                        if self.config.use_wandb:
                             wandb.log(eval_metrics)
 
+                        # Save best model
                         if eval_metrics["val_loss"] < self.best_val_loss:
                             self.best_val_loss = eval_metrics["val_loss"]
-                            self.save_checkpoint(os.path.join(self.config.output_dir, "best_model.pt"))
-                            pbar.write(f"💾 New best model saved! Loss: {self.best_val_loss:.4f}")
+                            best_path = os.path.join(self.config.output_dir, "best_model.pt")
+                            self.save_checkpoint(best_path)
+                            print(f"💾 New best model saved! Loss: {self.best_val_loss:.4f}")
 
+                    # Save checkpoint
                     if self.global_step % self.config.save_interval == 0:
                         self.save_checkpoint()
 
+                    # Check target loss
+                    if hasattr(self, "best_val_loss") and self.best_val_loss < 3.0781:
+                        print(f"\n🎯 TARGET ACHIEVED! Validation loss {self.best_val_loss:.4f} < 3.0781")
+                        break
+
+                    # Check if done
                     if self.global_step >= self.config.max_steps:
                         break
 
             self.epoch += 1
 
-        # Close progress bar
-        pbar.close()
+            # Early exit if target achieved
+            if hasattr(self, "best_val_loss") and self.best_val_loss < 3.0781:
+                break
 
+        # Final evaluation
         print("\n🏁 Training complete! Running final evaluation...")
         final_metrics = self.evaluate()
-        print(f"📊 Final validation loss: {final_metrics['val_loss']:.4f}")
-        print(f"📊 Final validation perplexity: {final_metrics['val_perplexity']:.2f}")
 
-        self.save_checkpoint(os.path.join(self.config.output_dir, "final_model.pt"))
+        # Calculate final performance stats
+        total_time = time.time() - self.start_time
+        final_tokens_per_sec = self.total_tokens / total_time
+        final_mfu = self._calculate_mfu(
+            final_tokens_per_sec,
+            self.config.batch_size * self.config.gradient_accumulation_steps,
+            self.config.max_length,
+        )
 
-        if self.config.use_wandb and WANDB_AVAILABLE:
+        print(f"\n" + "=" * 80)
+        print("🏆 FINAL RESULTS")
+        print("=" * 80)
+        print(f"Final validation loss: {final_metrics['val_loss']:.4f}")
+        print(f"Final validation perplexity: {final_metrics['val_perplexity']:.2f}")
+        print(f"Best validation loss: {self.best_val_loss:.4f}")
+        print(f"Total training time: {total_time / 3600:.2f} hours")
+        print(f"Total tokens processed: {self.total_tokens:,}")
+        print(f"Average tokens/sec: {final_tokens_per_sec:.0f}")
+        print(f"Average MFU: {final_mfu:.1f}%")
+
+        target_achieved = self.best_val_loss < 3.0781
+        if target_achieved:
+            print(f"✅ SUCCESS! Beat target of 3.0781 by {3.0781 - self.best_val_loss:.4f}")
+        else:
+            print(f"❌ Target not achieved. Missed by {self.best_val_loss - 3.0781:.4f}")
+
+        print("=" * 80)
+
+        # Save final model
+        final_path = os.path.join(self.config.output_dir, "final_model.pt")
+        self.save_checkpoint(final_path)
+
+        # Close wandb
+        if self.config.use_wandb:
             wandb.finish()
 
         return final_metrics
+
+
+# Alias for backward compatibility
+Trainer = H100OptimizedTrainer

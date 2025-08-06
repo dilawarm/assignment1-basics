@@ -1,65 +1,120 @@
-"""Efficient data loading for OpenWebText dataset."""
+"""Highly optimized data loading for OpenWebText dataset on H100."""
+
+import os
+import random
+from functools import lru_cache
+from typing import Dict, Iterator, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
+from transformers import GPT2TokenizerFast
 
 
-class OpenWebTextDataset(Dataset):
-    """OpenWebText dataset loading from preprocessed numpy files."""
+class StreamingOpenWebTextDataset(IterableDataset):
+    """Streaming OpenWebText dataset for maximum throughput."""
 
     def __init__(
         self,
-        data_path: str,
+        split: str = "train",
+        tokenizer_name: str = "gpt2",
         max_length: int = 1024,
-        memmap: bool = True,
+        buffer_size: int = 10000,
+        seed: int = 42,
     ):
-        """
-        Initialize OpenWebText dataset from local numpy files.
-
-        Args:
-            data_path: Path to the .npy file (e.g., 'training_data/encoded/owt_train_tokens.npy')
-            max_length: Maximum sequence length
-            memmap: Whether to use memory mapping for efficient loading
-        """
-        self.data_path = data_path
+        self.split = split
         self.max_length = max_length
+        self.buffer_size = buffer_size
+        self.seed = seed
 
-        print(f"Loading data from {data_path}...")
-        if memmap:
-            self.tokens = np.load(data_path, mmap_mode="r")
+        # Initialize tokenizer
+        self.tokenizer = GPT2TokenizerFast.from_pretrained(tokenizer_name)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Load streaming dataset
+        self.dataset = load_dataset(
+            "openwebtext",
+            split="train",
+            streaming=True,
+        )
+
+        # Create train/val split
+        if split == "validation":
+            self.dataset = self.dataset.take(int(1e6))  # Take 1M examples for validation
         else:
-            self.tokens = np.load(data_path)
+            self.dataset = self.dataset.skip(int(1e6))  # Skip 1M examples for train
 
-        self.total_tokens = len(self.tokens)
-        self.num_sequences = self.total_tokens // max_length
+        # Shuffle dataset
+        self.dataset = self.dataset.shuffle(seed=seed, buffer_size=buffer_size)
 
-        print(f"Loaded {self.total_tokens:,} tokens ({self.num_sequences:,} sequences of length {max_length})")
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """Iterate over tokenized sequences."""
+        worker_info = torch.utils.data.get_worker_info()
 
-    def __len__(self):
-        return self.num_sequences
+        if worker_info is not None:
+            # Multi-worker setup: split data among workers
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            # Skip examples for this worker
+            dataset = self.dataset.skip(worker_id).take_every(num_workers)
+        else:
+            dataset = self.dataset
 
-    def __getitem__(self, idx):
-        start_idx = idx * self.max_length
-        end_idx = start_idx + self.max_length
+        # Buffer for concatenation
+        buffer = []
+        buffer_size = 0
 
-        input_ids = torch.from_numpy(self.tokens[start_idx:end_idx].astype(np.int64))
+        for example in dataset:
+            # Tokenize text
+            tokens = self.tokenizer(
+                example["text"],
+                return_tensors="pt",
+                truncation=False,
+                padding=False,
+            )["input_ids"].squeeze(0)
 
-        return {
-            "input_ids": input_ids,
-            "labels": input_ids.clone(),
-        }
+            # Add to buffer
+            buffer.append(tokens)
+            buffer_size += len(tokens)
+
+            # Yield sequences when buffer is large enough
+            while buffer_size >= self.max_length:
+                # Concatenate buffer
+                concat_tokens = torch.cat(buffer)
+
+                # Extract sequence
+                sequence = concat_tokens[: self.max_length]
+                remainder = concat_tokens[self.max_length :]
+
+                # Update buffer
+                if len(remainder) > 0:
+                    buffer = [remainder]
+                    buffer_size = len(remainder)
+                else:
+                    buffer = []
+                    buffer_size = 0
+
+                # Yield sequence
+                yield {
+                    "input_ids": sequence,
+                    "labels": sequence.clone(),
+                }
 
 
-class DataCollator:
-    """Custom data collator for language modeling."""
+class OptimizedDataCollator:
+    """Optimized data collator for maximum throughput."""
 
     def __init__(self, pad_token_id: int = 50256):
         self.pad_token_id = pad_token_id
 
     def __call__(self, examples):
-        input_ids = torch.stack([example["input_ids"] for example in examples])
+        # Pre-allocate tensors for better performance
+        batch_size = len(examples)
+        seq_len = examples[0]["input_ids"].shape[0]
 
+        # Stack input_ids efficiently
+        input_ids = torch.stack([example["input_ids"] for example in examples])
         labels = input_ids.clone()
 
         return {
@@ -69,73 +124,109 @@ class DataCollator:
 
 
 class OpenWebTextDataModule:
-    """Data module for OpenWebText with train/validation splits."""
+    """Optimized data module for maximum H100 throughput."""
 
     def __init__(
         self,
-        train_path: str = "training_data/encoded/owt_train_tokens.npy",
-        val_path: str = "training_data/encoded/owt_valid_tokens.npy",
-        batch_size: int = 8,
+        batch_size: int = 32,  # Increased for H100
         max_length: int = 1024,
-        num_workers: int = 4,
+        num_workers: int = 8,  # Increased for better throughput
+        prefetch_factor: int = 4,  # Increased prefetching
+        seed: int = 42,
     ):
         self.batch_size = batch_size
         self.max_length = max_length
         self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+        self.seed = seed
 
-        self.train_dataset = OpenWebTextDataset(
-            data_path=train_path,
+        # Create datasets
+        self.train_dataset = StreamingOpenWebTextDataset(
+            split="train",
             max_length=max_length,
-            memmap=True,
+            seed=seed,
         )
 
-        self.val_dataset = OpenWebTextDataset(
-            data_path=val_path,
+        self.val_dataset = StreamingOpenWebTextDataset(
+            split="validation",
             max_length=max_length,
-            memmap=True,
+            seed=seed,
         )
 
-        self.collator = DataCollator()
+        # Optimized data collator
+        self.collator = OptimizedDataCollator()
 
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self.collator,
-            persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=2 if self.num_workers > 0 else None,
+            persistent_workers=True,
+            prefetch_factor=self.prefetch_factor,
+            drop_last=True,  # For consistent batch sizes
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self.collator,
-            persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=2 if self.num_workers > 0 else None,
+            persistent_workers=True,
+            prefetch_factor=self.prefetch_factor,
+            drop_last=True,
         )
 
 
 def create_dataloaders(
-    batch_size: int = 8,
+    batch_size: int = 32,
     max_length: int = 1024,
-    num_workers: int = 4,
-    train_path: str = "training_data/encoded/owt_train_tokens.npy",
-    val_path: str = "training_data/encoded/owt_valid_tokens.npy",
-) -> tuple[DataLoader, DataLoader]:
-    """Create train and validation dataloaders from local numpy files."""
+    num_workers: int = 8,
+    prefetch_factor: int = 4,
+    seed: int = 42,
+) -> Tuple[DataLoader, DataLoader]:
+    """Create optimized train and validation dataloaders."""
     data_module = OpenWebTextDataModule(
-        train_path=train_path,
-        val_path=val_path,
         batch_size=batch_size,
         max_length=max_length,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        seed=seed,
     )
 
     return data_module.train_dataloader(), data_module.val_dataloader()
+
+
+# Alternative: Memory-mapped dataset for even better performance
+class MemoryMappedDataset(Dataset):
+    """Memory-mapped dataset for maximum I/O performance."""
+
+    def __init__(self, data_path: str, max_length: int = 1024):
+        self.max_length = max_length
+
+        # Load memory-mapped data
+        if os.path.exists(data_path):
+            self.data = np.memmap(data_path, dtype=np.int32, mode="r")
+            print(f"Loaded memory-mapped dataset: {len(self.data):,} tokens")
+        else:
+            raise FileNotFoundError(f"Data file not found: {data_path}")
+
+        # Calculate number of sequences
+        self.num_sequences = len(self.data) // max_length
+
+    def __len__(self):
+        return self.num_sequences
+
+    def __getitem__(self, idx):
+        start_idx = idx * self.max_length
+        end_idx = start_idx + self.max_length
+
+        sequence = torch.from_numpy(self.data[start_idx:end_idx].astype(np.int64))
+
+        return {
+            "input_ids": sequence,
+            "labels": sequence.clone(),
+        }
