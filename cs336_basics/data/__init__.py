@@ -1,9 +1,10 @@
-"""Data module for OpenWebText dataset handling."""
+"""Data module for local tokenized dataset handling."""
 
-from .dataloader import OpenWebTextDataModule, create_dataloaders
+from .dataloader import LocalDataModule, LocalTokenizedDataset, LocalTokenizedDatasetFixed, create_dataloaders
 
 __all__ = [
-    "OpenWebTextDataset",
-    "OpenWebTextDataModule",
+    "LocalTokenizedDataset",
+    "LocalTokenizedDatasetFixed", 
+    "LocalDataModule",
     "create_dataloaders",
 ]

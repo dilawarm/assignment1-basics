@@ -114,6 +114,10 @@ def main():
     parser.add_argument("--max_hours", type=float, default=1.5, help="Maximum training hours")
 
     # Data arguments
+    parser.add_argument("--train_data_path", type=str, default="training_data/owt_train_tokens.npy", 
+                       help="Path to training data .npy file")
+    parser.add_argument("--val_data_path", type=str, default="training_data/owt_valid_tokens.npy", 
+                       help="Path to validation data .npy file")
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of data workers")
     parser.add_argument("--prefetch_factor", type=int, default=4, help="Prefetch factor")
@@ -136,6 +140,17 @@ def main():
 
     # Print system information
     print_system_info()
+
+    # Check that data files exist
+    if not os.path.exists(args.train_data_path):
+        print(f"❌ Training data file not found: {args.train_data_path}")
+        sys.exit(1)
+    if not os.path.exists(args.val_data_path):
+        print(f"❌ Validation data file not found: {args.val_data_path}")
+        sys.exit(1)
+
+    print(f"✅ Found training data: {args.train_data_path}")
+    print(f"✅ Found validation data: {args.val_data_path}")
 
     # Calculate optimal batch size if not provided
     if args.batch_size is None:
@@ -180,8 +195,10 @@ def main():
             args.use_fp8 = False
 
     # Create optimized data loaders
-    print("📂 Creating optimized data loaders...")
+    print("📂 Creating optimized data loaders from local .npy files...")
     train_dataloader, val_dataloader = create_dataloaders(
+        train_data_path=args.train_data_path,
+        val_data_path=args.val_data_path,
         batch_size=args.batch_size,
         max_length=args.max_length,
         num_workers=args.num_workers,
