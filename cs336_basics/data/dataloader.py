@@ -35,13 +35,13 @@ class LocalTokenizedDataset(IterableDataset):
             del sample_array  # Free memory
         except:
             actual_dtype = np.uint16  # Default fallback
-            
-        self.tokens = np.memmap(data_path, dtype=actual_dtype, mode='r')
+
+        self.tokens = np.memmap(data_path, dtype=actual_dtype, mode="r")
         self.total_tokens = len(self.tokens)
-        
-        print(f"📁 Loaded {data_path}: {self.total_tokens:,} tokens ({self.total_tokens/1e9:.2f}B)")
-        print(f"📊 Data type: {actual_dtype}, file size: {os.path.getsize(data_path)/1e9:.2f}GB")
-        
+
+        print(f"📁 Loaded {data_path}: {self.total_tokens:,} tokens ({self.total_tokens / 1e9:.2f}B)")
+        print(f"📊 Data type: {actual_dtype}, file size: {os.path.getsize(data_path) / 1e9:.2f}GB")
+
         # Calculate number of sequences we can create
         self.num_sequences = self.total_tokens // max_length
         print(f"📊 Number of {max_length}-token sequences: {self.num_sequences:,}")
@@ -49,12 +49,12 @@ class LocalTokenizedDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Iterate over tokenized sequences with efficient random access."""
         worker_info = torch.utils.data.get_worker_info()
-        
+
         # Set up worker-specific data ranges
         if worker_info is not None:
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
-            
+
             # Each worker gets a portion of the sequences
             sequences_per_worker = self.num_sequences // num_workers
             start_seq = worker_id * sequences_per_worker
@@ -62,23 +62,23 @@ class LocalTokenizedDataset(IterableDataset):
         else:
             start_seq = 0
             end_seq = self.num_sequences
-        
+
         # Create shuffled sequence indices for this worker
         np.random.seed(self.seed + (worker_info.id if worker_info else 0))
         sequence_indices = np.arange(start_seq, end_seq)
         np.random.shuffle(sequence_indices)
-        
+
         # Yield sequences
         for seq_idx in sequence_indices:
             start_token_idx = seq_idx * self.max_length
             end_token_idx = start_token_idx + self.max_length
-            
+
             # Extract sequence from memory-mapped array
             sequence_tokens = self.tokens[start_token_idx:end_token_idx]
-            
+
             # Convert to torch tensor
             sequence = torch.from_numpy(sequence_tokens.astype(np.int64))
-            
+
             yield {
                 "input_ids": sequence,
                 "labels": sequence.clone(),
@@ -205,7 +205,7 @@ class LocalTokenizedDatasetFixed(Dataset):
                 del sample_array
             except:
                 actual_dtype = np.uint16  # Default fallback
-                
+
             self.data = np.memmap(data_path, dtype=actual_dtype, mode="r")
             print(f"📁 Loaded memory-mapped dataset: {len(self.data):,} tokens (dtype: {actual_dtype})")
         else:

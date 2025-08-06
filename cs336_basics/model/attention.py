@@ -146,22 +146,24 @@ class MultiHeadAttention(nn.Module):
                 attn_output = rearrange(attn_output, "b s h d -> b s (h d)")
         else:
             # Use PyTorch's scaled_dot_product_attention when available (torch >= 2.0)
-            if hasattr(F, 'scaled_dot_product_attention'):
+            if hasattr(F, "scaled_dot_product_attention"):
                 try:
                     # Reshape for SDPA: (batch, n_heads, seq_len, head_dim)
                     q_sdpa = rearrange(q, "b s h d -> b h s d")
                     k_sdpa = rearrange(k, "b s h d -> b h s d")
                     v_sdpa = rearrange(v, "b s h d -> b h s d")
-                    
+
                     # Use SDPA with automatic kernel selection
                     attn_output = F.scaled_dot_product_attention(
-                        q_sdpa, k_sdpa, v_sdpa,
+                        q_sdpa,
+                        k_sdpa,
+                        v_sdpa,
                         attn_mask=None,  # Use is_causal instead
                         dropout_p=self.dropout if self.training else 0.0,
                         is_causal=True,  # More stable than attention mask
-                        scale=self.scale
+                        scale=self.scale,
                     )
-                    
+
                     # Reshape back
                     attn_output = rearrange(attn_output, "b h s d -> b s (h d)")
                 except Exception as e:

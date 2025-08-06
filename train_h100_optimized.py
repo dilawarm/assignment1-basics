@@ -114,10 +114,18 @@ def main():
     parser.add_argument("--max_hours", type=float, default=1.5, help="Maximum training hours")
 
     # Data arguments
-    parser.add_argument("--train_data_path", type=str, default="training_data/owt_train_tokens.npy", 
-                       help="Path to training data .npy file")
-    parser.add_argument("--val_data_path", type=str, default="training_data/owt_valid_tokens.npy", 
-                       help="Path to validation data .npy file")
+    parser.add_argument(
+        "--train_data_path",
+        type=str,
+        default="training_data/owt_train_tokens.npy",
+        help="Path to training data .npy file",
+    )
+    parser.add_argument(
+        "--val_data_path",
+        type=str,
+        default="training_data/owt_valid_tokens.npy",
+        help="Path to validation data .npy file",
+    )
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of data workers")
     parser.add_argument("--prefetch_factor", type=int, default=4, help="Prefetch factor")

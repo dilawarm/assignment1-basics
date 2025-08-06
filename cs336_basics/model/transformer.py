@@ -303,19 +303,19 @@ def apply_torchao_optimizations(model: nn.Module, device: torch.device) -> nn.Mo
         if device.type != "cuda":
             print("Warning: FP8 requires CUDA device. Skipping.")
             return model
-            
+
         # Check GPU compute capability for FP8 support
         props = torch.cuda.get_device_properties(device)
         if props.major < 8 or (props.major == 8 and props.minor < 9):
             print(f"Warning: GPU compute capability {props.major}.{props.minor} doesn't support FP8. Skipping.")
             return model
-            
+
         # Apply FP8 quantization using TorchAO
         from torchao.quantization import float8_dynamic_activation_float8_weight, quantize_
 
         # Move model to device first
         model = model.to(device)
-        
+
         # Quantize the model to FP8 - be more selective about which layers
         print("🔧 Applying TorchAO FP8 quantization...")
         quantize_(model, float8_dynamic_activation_float8_weight())

@@ -59,12 +59,12 @@ class RotaryPositionEmbedding(nn.Module):
     def _compute_cos_sin(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         """Compute sin/cos values for the given sequence length (stateless)."""
         pos = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-        
+
         inv_freq = self.inv_freq.to(device)
         freqs = torch.einsum("i,j->ij", pos, inv_freq)
         # freqs has shape [seq_len, dim//2]
         # For RoPE, we only need cos/sin for half the dimensions
-        
+
         return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, seq_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
@@ -79,7 +79,7 @@ class RotaryPositionEmbedding(nn.Module):
             Tuple of rotated (q, k) tensors
         """
         seq_len = q.shape[seq_dim]
-        
+
         # Compute sin/cos on-the-fly (stateless, compile-friendly)
         cos, sin = self._compute_cos_sin(seq_len, q.device, q.dtype)
 
@@ -92,10 +92,10 @@ class RotaryPositionEmbedding(nn.Module):
         """Apply the rotation to a tensor."""
         # x has shape [..., seq_len, n_heads, head_dim]
         # cos, sin have shape [seq_len, head_dim//2]
-        
+
         # Split x into two halves for rotation
         x1, x2 = x.chunk(2, dim=-1)  # Each has shape [..., seq_len, n_heads, head_dim//2]
-        
+
         # Reshape cos/sin to broadcast properly
         if seq_dim == 1:
             # x: [..., seq_len, n_heads, head_dim//2]
