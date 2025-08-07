@@ -121,10 +121,22 @@ class OptimizedDataCollator:
             "labels": labels,
         }
 
-        # Pin memory for faster GPU transfer
+        # Pin memory for faster GPU transfer (with proper CUDA initialization check)
         if self.pin_memory and torch.cuda.is_available():
-            for key in batch:
-                batch[key] = batch[key].pin_memory()
+            try:
+                # Ensure CUDA is properly initialized
+                torch.cuda.init()
+                for key in batch:
+                    batch[key] = batch[key].pin_memory()
+            except RuntimeError as e:
+                # If CUDA initialization fails, continue without pinned memory
+                if "CUDA" in str(e):
+                    # Only warn once to avoid spam
+                    if not hasattr(self, "_cuda_warning_shown"):
+                        print(f"⚠️  CUDA pinning failed: {e}. Continuing without pinned memory.")
+                        self._cuda_warning_shown = True
+                else:
+                    raise e
 
         return batch
 
@@ -219,6 +231,7 @@ def create_optimized_dataloaders(
     data_dir: str = "training_data",
     seed: int = 42,
     use_memmap: bool = True,
+    pin_memory: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create optimized train and validation dataloaders using .npy files."""
     data_module = OptimizedNpyDataModule(
@@ -228,6 +241,7 @@ def create_optimized_dataloaders(
         data_dir=data_dir,
         seed=seed,
         use_memmap=use_memmap,
+        pin_memory=pin_memory,
     )
 
     return data_module.train_dataloader(), data_module.val_dataloader()

@@ -16,6 +16,17 @@ def test_npy_dataloader():
     """Test the .npy dataloader functionality."""
     print("🧪 Testing .npy dataloader...")
 
+    # Initialize CUDA if available
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.init()
+            print(f"🎯 CUDA initialized: {torch.cuda.get_device_name(0)}")
+        except RuntimeError as e:
+            print(f"⚠️  CUDA initialization failed: {e}")
+            print("📋 Testing will continue with CPU only")
+    else:
+        print("📋 CUDA not available, testing with CPU only")
+
     # Check if data files exist
     train_file = "training_data/owt_train_tokens.npy"
     val_file = "training_data/owt_valid_tokens.npy"
@@ -29,15 +40,37 @@ def test_npy_dataloader():
 
     print(f"✅ Found data files!")
 
-    # Create dataloaders
+    # Create dataloaders with appropriate settings
     try:
+        # Detect CUDA capabilities and adjust settings accordingly
+        use_pinned_memory = False
+        num_workers = 2
+
+        if torch.cuda.is_available():
+            try:
+                # Test if we can actually use CUDA and pinned memory
+                test_tensor = torch.tensor([1.0])
+                test_tensor.pin_memory()
+                # Also test GPU operations
+                if torch.cuda.device_count() > 0:
+                    test_gpu = test_tensor.cuda()
+                    del test_gpu
+                del test_tensor
+                use_pinned_memory = True
+                print("✅ CUDA operations working, enabling pinned memory")
+            except RuntimeError as e:
+                use_pinned_memory = False
+                num_workers = 0  # Disable multiprocessing if CUDA has issues
+                print(f"⚠️  CUDA issues detected ({e}), disabling pinned memory and workers")
+
         train_loader, val_loader = create_optimized_dataloaders(
             batch_size=4,
             max_length=1024,
-            num_workers=2,  # Reduced for testing
+            num_workers=num_workers,  # Dynamically set based on CUDA
             data_dir="training_data",
             seed=42,
             use_memmap=True,
+            pin_memory=use_pinned_memory,
         )
         print("✅ Created dataloaders successfully!")
 

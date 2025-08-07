@@ -256,6 +256,21 @@ def main():
 
     # Create optimized data loaders using .npy files
     print(f"\n📚 Creating optimized .npy data loaders...")
+
+    # Configure data loading based on CUDA availability
+    pin_memory = torch.cuda.is_available()
+    if torch.cuda.is_available():
+        try:
+            # Test CUDA functionality
+            torch.cuda.init()
+            test_tensor = torch.tensor([1.0]).pin_memory().cuda()
+            del test_tensor
+            print("✅ CUDA verified, using pinned memory")
+        except RuntimeError as e:
+            pin_memory = False
+            print(f"⚠️  CUDA issue detected: {e}")
+            print("⚠️  Disabling pinned memory for stability")
+
     train_dataloader, val_dataloader = create_optimized_dataloaders(
         batch_size=args.batch_size,
         max_length=args.max_length,
@@ -263,6 +278,7 @@ def main():
         data_dir=args.data_dir,
         seed=42,
         use_memmap=args.use_memmap,
+        pin_memory=pin_memory,
     )
 
     # Calculate training steps based on target performance
