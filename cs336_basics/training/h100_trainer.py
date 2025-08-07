@@ -70,7 +70,7 @@ class H100TrainingConfig:
     # Advanced optimizations
     use_fused_adamw: bool = True
     use_lr_warmup_cosine_decay: bool = True
-    use_weight_decay_schedule: bool = True
+    use_weight_decay_schedule: bool = False  # Disable for now to avoid complexity
 
     # Memory optimizations
     pin_memory: bool = True
@@ -231,16 +231,48 @@ class H100OptimizedTrainer:
         ]
 
         # Use fused AdamW for H100 performance
-        optimizer = AdamW(
-            optimizer_groups,
-            lr=self.config.learning_rate,
-            betas=(self.config.beta1, self.config.beta2),
-            eps=self.config.eps,
-            fused=self.config.use_fused_adamw,  # Fused kernels for H100
-            foreach=True,  # Use foreach implementation
-        )
+        # Note: fused and foreach cannot both be True simultaneously
+        optimizer_kwargs = {
+            "lr": self.config.learning_rate,
+            "betas": (self.config.beta1, self.config.beta2),
+            "eps": self.config.eps,
+        }
 
-        print(f"✅ Created AdamW optimizer (fused={self.config.use_fused_adamw})")
+        # Try optimizations in order of preference for H100
+        optimizer = None
+
+        if self.config.use_fused_adamw:
+            # First try: Fused AdamW (best for H100)
+            try:
+                optimizer = AdamW(
+                    optimizer_groups,
+                    fused=True,
+                    foreach=False,  # Must be False when fused=True
+                    **optimizer_kwargs,
+                )
+                print("✅ Using fused AdamW optimizer (optimal for H100)")
+            except RuntimeError as e:
+                print(f"⚠️  Fused AdamW failed: {e}")
+
+        if optimizer is None:
+            # Second try: Foreach AdamW (good fallback)
+            try:
+                optimizer = AdamW(optimizer_groups, fused=False, foreach=True, **optimizer_kwargs)
+                print("✅ Using foreach AdamW optimizer")
+            except RuntimeError as e:
+                print(f"⚠️  Foreach AdamW failed: {e}")
+
+        if optimizer is None:
+            # Final fallback: Standard AdamW (always works)
+            print("🔄 Using standard AdamW optimizer (no advanced optimizations)")
+            optimizer = AdamW(optimizer_groups, fused=False, foreach=False, **optimizer_kwargs)
+            print("✅ Using standard AdamW optimizer")
+
+        # Verify the optimizer was created successfully
+        if hasattr(optimizer, "param_groups"):
+            total_params = sum(p.numel() for group in optimizer.param_groups for p in group["params"])
+            print(f"✅ Created AdamW optimizer with {total_params:,} parameters")
+
         return optimizer
 
     def _create_advanced_scheduler(self):
